@@ -82,6 +82,9 @@ class JournalAuditor:
         f += self._i13_missing_fee_is_benign()
         f += self._i15_residual_boots_flatten_only()
         f += self._i16_runaway_caps_held()
+        f += self._i19_overnight_stress_proven()
+        f += self._i20_auditor_coverage_complete()
+        f += self._i21_startup_self_test_precedes_process()
         f += self._i22_halt_survives_restart()
         return sorted(f, key=lambda x: x.seq)
 
@@ -480,6 +483,82 @@ class JournalAuditor:
                 )
         return out
 
+    def _i19_overnight_stress_proven(self) -> list[Finding]:
+        """Every submitted intent carries recomputable overnight-loss evidence."""
+        out: list[Finding] = []
+        intents: dict[str, JournalEvent] = {}
+        for e in self.events:
+            if e.event_type is EventType.ORDER_INTENT_COMMITTED and e.intent_id:
+                intents[e.intent_id] = e
+            elif e.event_type is EventType.SEND_ATTEMPT_STARTED and e.intent_id:
+                intent = intents.get(e.intent_id)
+                if intent is None:
+                    continue  # invariant 2 reports the missing intent
+                evidence = intent.payload.get("risk_evidence")
+                if not isinstance(evidence, dict):
+                    out.append(Finding(19, e.seq, "submitted intent missing risk_evidence"))
+                    continue
+                try:
+                    resulting = int(evidence["resulting_position"])
+                    px = Decimal(str(evidence["reference_price"]))
+                    gap = Decimal(str(evidence["overnight_gap_stress_pct"]))
+                    recorded = Decimal(str(evidence["stressed_loss"]))
+                    budget = Decimal(str(evidence["max_overnight_loss"]))
+                    recomputed = abs(resulting) * px * gap
+                except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
+                    out.append(Finding(19, e.seq, f"invalid risk_evidence: {exc}"))
+                    continue
+                if recomputed != recorded:
+                    out.append(
+                        Finding(19, e.seq, f"stress evidence mismatch {recorded} != {recomputed}")
+                    )
+                if resulting != 0 and not bool(evidence.get("is_closing")) and px <= 0:
+                    out.append(Finding(19, e.seq, "risk-increasing exposure has no stress price"))
+                if recorded > budget:
+                    out.append(Finding(19, e.seq, f"stress loss {recorded} exceeds {budget}"))
+                if evidence.get("config_hash") != intent.payload.get("risk_config_hash"):
+                    out.append(Finding(19, e.seq, "stress evidence/config hash mismatch"))
+        return out
+
+    def _i20_auditor_coverage_complete(self) -> list[Finding]:
+        """Fail loudly if a future edit silently drops any invariant from the auditor."""
+        expected = set(range(1, 23))
+        actual = set(self.summary()["audited_invariants"])
+        if actual != expected:
+            return [
+                Finding(
+                    20,
+                    self.events[-1].seq if self.events else 0,
+                    f"auditor coverage mismatch missing={sorted(expected - actual)} "
+                    f"extra={sorted(actual - expected)}",
+                )
+            ]
+        return []
+
+    def _i21_startup_self_test_precedes_process(self) -> list[Finding]:
+        """Each PROCESS_STARTED must follow a matching config load and must-reject test."""
+        out: list[Finding] = []
+        loaded: set[str] = set()
+        proven: set[str] = set()
+        for e in self.events:
+            if e.event_type is EventType.RISK_CONFIG_LOADED:
+                config_hash = str(e.payload.get("config_hash", ""))
+                if config_hash:
+                    loaded.add(config_hash)
+            elif e.event_type is EventType.RISK_SELF_TEST_PASSED:
+                config_hash = str(e.payload.get("config_hash", ""))
+                if config_hash in loaded and e.payload.get("proven", e.payload.get("detail")):
+                    proven.add(config_hash)
+            elif e.event_type is EventType.PROCESS_STARTED and not proven:
+                out.append(Finding(21, e.seq, "process started before a matching risk self-test"))
+            elif e.event_type is EventType.ORDER_INTENT_COMMITTED:
+                config_hash = str(e.payload.get("risk_config_hash", ""))
+                if config_hash not in proven:
+                    out.append(
+                        Finding(21, e.seq, f"intent used config {config_hash!r} without self-test")
+                    )
+        return out
+
     def _i22_halt_survives_restart(self) -> list[Finding]:
         """
         A restart must not launder a HALT.
@@ -531,11 +610,8 @@ class JournalAuditor:
             "events": len(self.events),
             "by_type": dict(sorted(counts.items())),
             "decision_misses": dict(misses),
-            "audited_invariants": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 22],
-            # 19 (overnight sizing), 20 (three-way coverage) and 21 (self-test)
-            # are structural/config properties. They cannot be proven from an
-            # event log and are enforced at config-validation and startup instead.
-            "not_fully_audited": [19, 20, 21],
+            "audited_invariants": list(range(1, 23)),
+            "not_fully_audited": [],
         }
 
 

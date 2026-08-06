@@ -95,6 +95,15 @@ class Watchdog:
                 "CRITICAL",
             )
 
+        if status.get("fatal_shutdown_requested"):
+            return Verdict(
+                False,
+                f"engine requested fatal shutdown ({status.get('journal_failure', 'runtime fault')})",
+                should_alert=True,
+                should_kill=True,
+                severity="CRITICAL",
+            )
+
         # Healthy link but a state we should be told about.
         self._unhealthy_since = None
         mode = status.get("operating_mode")
@@ -134,13 +143,19 @@ class Watchdog:
     @staticmethod
     def _pid_start_ticks(pid: int) -> Optional[int]:
         """
-        Process start time from /proc, used as a PID identity check.
+        Process creation identity, used as a PID-reuse guard.
 
         PIDs are recycled. On a busy host the engine can die, its PID be reused
         by something unrelated, and a watchdog that trusts the number alone will
         SIGKILL an innocent process. The start time makes the identity unique:
         same pid AND same start time, or we refuse to signal.
+
+        Linux exposes field 22 in ``/proc/<pid>/stat``.  Windows has no /proc;
+        there we use ``GetProcessTimes`` and return the 64-bit creation FILETIME.
+        Both values are opaque identity tokens -- callers must only compare them.
         """
+        if os.name == "nt":
+            return Watchdog._windows_process_creation_time(pid)
         try:
             with open(f"/proc/{pid}/stat", "rb") as fh:
                 data = fh.read()
@@ -149,6 +164,78 @@ class Watchdog:
             return int(fields[19])          # starttime, field 22 overall
         except (OSError, IndexError, ValueError):
             return None
+
+    @staticmethod
+    def _windows_process_creation_time(pid: int) -> Optional[int]:
+        """Return Windows process creation FILETIME without a third-party dependency."""
+        if os.name != "nt":
+            return None
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            process_query_limited_information = 0x1000
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.GetProcessTimes.argtypes = [
+                wintypes.HANDLE,
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+            ]
+            kernel32.GetProcessTimes.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+
+            handle = kernel32.OpenProcess(process_query_limited_information, False, int(pid))
+            if not handle:
+                return None
+            try:
+                creation = wintypes.FILETIME()
+                exit_time = wintypes.FILETIME()
+                kernel = wintypes.FILETIME()
+                user = wintypes.FILETIME()
+                if not kernel32.GetProcessTimes(
+                    handle,
+                    ctypes.byref(creation),
+                    ctypes.byref(exit_time),
+                    ctypes.byref(kernel),
+                    ctypes.byref(user),
+                ):
+                    return None
+                return (int(creation.dwHighDateTime) << 32) | int(creation.dwLowDateTime)
+            finally:
+                kernel32.CloseHandle(handle)
+        except (AttributeError, OSError, ValueError):
+            return None
+
+    @staticmethod
+    def _force_kill(pid: int) -> None:
+        """Fence a process: SIGKILL on POSIX, TerminateProcess on Windows."""
+        if os.name != "nt":
+            os.kill(pid, signal.SIGKILL)
+            return
+
+        import ctypes
+        from ctypes import wintypes
+
+        process_terminate = 0x0001
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel32.TerminateProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel32.OpenProcess(process_terminate, False, int(pid))
+        if not handle:
+            raise ProcessLookupError(pid)
+        try:
+            if not kernel32.TerminateProcess(handle, 137):
+                raise OSError(ctypes.get_last_error(), "TerminateProcess failed")
+        finally:
+            kernel32.CloseHandle(handle)
 
     def kill_engine(self, status: Optional[dict]) -> bool:
         """
@@ -181,10 +268,16 @@ class Watchdog:
             return False
 
         try:
-            os.kill(int(pid), signal.SIGTERM)
-            time.sleep(5)
-            os.kill(int(pid), 0)          # still alive?
-            os.kill(int(pid), signal.SIGKILL)
+            if os.name == "nt":
+                # Windows has no targetable POSIX SIGTERM/SIGKILL pair.
+                # os.kill(pid, 0) is also not a harmless existence probe there;
+                # non-console signals map to TerminateProcess. Fence directly.
+                self._force_kill(int(pid))
+            else:
+                os.kill(int(pid), signal.SIGTERM)
+                time.sleep(5)
+                if self._pid_start_ticks(int(pid)) is not None:
+                    self._force_kill(int(pid))
         except ProcessLookupError:
             pass
         except Exception as exc:  # noqa: BLE001

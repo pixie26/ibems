@@ -12,8 +12,8 @@ dependencies = ["PyYAML>=6.0"]
 [project.optional-dependencies]
 # The state-machine core has no IB dependency. PyYAML is the only base runtime
 # dependency because production must load the exact checked risk configuration.
-ib = ["ib_async>=1.0"]
-dev = ["pytest>=8.0", "hypothesis>=6.100"]
+ib = ["ib_async>=1.0", "pyarrow>=15.0"]
+dev = ["pytest>=8.0", "hypothesis>=6.100", "pyarrow>=15.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -22,6 +22,10 @@ where = ["src"]
 testpaths = ["tests"]
 pythonpath = ["src", "tests"]
 addopts = "-q"
+markers = [
+    "property: generated property and lifecycle tests required by Gate B1",
+    "process_crash: subprocess force-kill crash-window evidence required by Gate B1",
+]
 
 [tool.ruff]
 line-length = 100

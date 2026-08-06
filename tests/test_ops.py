@@ -8,13 +8,20 @@ from __future__ import annotations
 
 import io
 import json
+import time
 from datetime import date
 
 import pytest
 
 from ib_execution.emergency_flatten import FlattenPlan, build_plan_from_snapshot, confirm
 from ib_execution.models import BrokerOrder, BrokerSnapshot, Side
-from ib_execution.quote_recorder import RawEventLog, RawTick, compute_health
+from ib_execution.quote_recorder import (
+    RawEventLog,
+    RawTick,
+    SubscriptionLimiter,
+    compute_health,
+    finalize_day,
+)
 from ib_execution.watchdog import Watchdog, WatchdogConfig, write_status
 
 
@@ -90,6 +97,19 @@ def test_halted_engine_is_reported_but_not_killed(wd):
                              "sync_state": "SYNCED"})
     assert v.healthy, "a HALTED engine is alive and behaving correctly"
     assert v.should_alert and not v.should_kill
+
+
+def test_fatal_shutdown_request_is_fenced_immediately(wd):
+    status = {
+        "heartbeat_mono": 999.0,
+        "operating_mode": "HALTED",
+        "sync_state": "UNVERIFIED",
+        "fatal_shutdown_requested": True,
+        "journal_failure": "database is full",
+    }
+    verdict = wd.evaluate(1000.0, status)
+    assert not verdict.healthy
+    assert verdict.should_alert and verdict.should_kill
 
 
 def test_status_write_is_atomic(tmp_path):
@@ -254,3 +274,51 @@ def test_same_day_recorder_restarts_use_unique_segment_names(tmp_path):
     b.append(_tick(1, 1_000_000_000), now_mono=0)
     b.close()
     assert len(a.segments()) == 2
+
+
+def test_recorder_finalizes_parquet_health_and_hash_manifest(tmp_path):
+    log = RawEventLog(tmp_path, session=date(2026, 8, 5))
+    bid = _tick(1, 0)
+    last = RawTick(
+        **{
+            **_tick(2, 1_000_000_000).__dict__,
+            "event_type": "ALL_LAST",
+            "last": 600.0,
+            "last_size": 10,
+        }
+    )
+    bar = RawTick(
+        **{
+            **_tick(3, 2_000_000_000).__dict__,
+            "event_type": "BAR_5S",
+            "open": 599.9,
+            "high": 600.1,
+            "low": 599.8,
+            "close": 600.0,
+            "volume": 1000,
+            "wap": 599.99,
+            "trade_count": 25,
+        }
+    )
+    for i, row in enumerate((bid, last, bar)):
+        log.append(row, now_mono=float(i))
+
+    manifest = finalize_day(log, session_seconds=2.0, clock_skew_seconds=0.1)
+    assert manifest["health_ok"] is True
+    assert manifest["rows"] == 3
+    assert (log.dir / "events.parquet").exists()
+    assert (log.dir / "health.json").exists()
+    assert (log.dir / "manifest.json").exists()
+    assert all(len(value) == 64 for value in manifest["files"].values())
+
+    import pyarrow.parquet as pq
+
+    assert pq.read_table(log.dir / "events.parquet").num_rows == 3
+
+
+def test_subscription_limiter_waits_when_bucket_is_empty():
+    limiter = SubscriptionLimiter(rate_per_second=1000, burst=1)
+    limiter.wait(lambda _: None)
+    sleeps: list[float] = []
+    limiter.wait(lambda delay: (sleeps.append(delay), time.sleep(delay)))
+    assert sleeps and sleeps[0] > 0

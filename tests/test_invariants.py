@@ -13,7 +13,6 @@ system which actually ran obeyed the spec on the day it ran.
 from __future__ import annotations
 
 from datetime import timedelta
-import os
 from decimal import Decimal
 
 import pytest
@@ -40,8 +39,9 @@ from conftest import SESSION_START
 
 
 
-GATE_CAMPAIGN = os.getenv("IB_GATE_B1_PROPERTY", "0") == "1"
-PROPERTY_EXAMPLES = 1500 if GATE_CAMPAIGN else 100
+pytestmark = pytest.mark.property
+
+GATE_CAMPAIGN = settings.get_current_profile_name() == "gate"
 PROPERTY_MAX_ACTIONS = 90 if GATE_CAMPAIGN else 40
 
 # Weighted deliberately. Uniform sampling spends most of its time disconnected
@@ -101,7 +101,6 @@ def _q(clock) -> Quote:
 
 
 @settings(
-    max_examples=PROPERTY_EXAMPLES,
     deadline=None,
     suppress_health_check=[HealthCheck.function_scoped_fixture],
 )
@@ -166,7 +165,7 @@ def test_no_sequence_violates_invariants(tmp_path_factory, actions, quantities, 
                 # explicit acknowledgement.
                 ctl.halt("injected by property test")
             elif a == "ack_halt":
-                active = find_unacknowledged_halt(journal.replay())
+                active = find_unacknowledged_halt(journal)
                 if active is not None:
                     journal.acknowledge_halt(
                         active["seq"], "property-test", "generated acknowledgement"
@@ -214,7 +213,6 @@ def test_no_sequence_violates_invariants(tmp_path_factory, actions, quantities, 
 
 
 @settings(
-    max_examples=PROPERTY_EXAMPLES,
     deadline=None,
     suppress_health_check=[HealthCheck.function_scoped_fixture],
 )

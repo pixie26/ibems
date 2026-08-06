@@ -1,51 +1,46 @@
 # Implementation status — v0.1.5.dev0
 
-## Reviewed IB-free core
-
-Implemented and reviewed:
-
-- event/state models, SQLite append-only journal and atomic decision/execution writes;
-- target-position controller with exact order ownership;
-- cancel-confirm-stable-reconcile-before-replace lifecycle;
-- explicit `BrokerSnapshot.is_stable` gate: an unstable snapshot can never restore `SYNCED`;
-- durable HALT causes and atomic exact-cause acknowledgement; acknowledgement does not resume the live process;
-- EOD lifecycle, missed/deferred decisions, restart-safe risk counters and strict config validation;
-- FakeBroker fault injection, async serialized bridge, watchdog PID identity guard;
-- journal auditor and deterministic randomized soak.
-
-Validation in the review environment:
+## 冻结标签
 
 ```text
-122 deterministic pytest cases: PASS
-5 Hypothesis-gated tests: NOT RUN (Hypothesis unavailable)
-deterministic soak 150 seeds x 100 actions: PASS
-compileall: PASS
-demo: PASS
-editable install: PASS
+Phase 0 reviewed baseline
+Specification frozen
+Gate B1 not passed
+DO NOT CONNECT THE TRADING ADAPTER TO IB PAPER OR LIVE
 ```
 
-A 300 x 150 soak was not completed within the execution limit and is not claimed as passed.
+## 已实现并在 Python 3.12.13 验证
+
+- event/state model、SQLite WAL journal、decision/exec 原子幂等；
+- target-position controller、exact broker identity、cancel → stable reconcile → replace；
+- unstable snapshot 不得恢复 `SYNCED`；
+- durable HALT + exact-cause CAS acknowledgement；connect/reconcile 前强制 journal restore；
+- async single-writer bridge、Windows/POSIX watchdog PID identity 与 fencing；
+- 22 条 invariant 的 P/R/A auditor 入口，包括 per-intent overnight stress 重算；
+- 138 个 non-property tests：PASS；
+- 5 个 property tests：默认 100-example profile PASS；
+- 正式 Gate profile：两个生成测试各 1,500 examples PASS，seed `2026080601`，source-tree hash 与 manifest 复算一致；
+- 7 个 subprocess force-kill crash windows：PASS；
+- SQLite locked、disk full、malformed WAL、fsync timeout、writer death、bridge death：fail-closed tests PASS；
+- read-only Full-RTH Recorder：订阅/存储/Parquet/health/hash 代码与本地测试 PASS。
 
 ## Gate B1 blockers
 
-- the Gate B1 Hypothesis campaign must actually run (`IB_GATE_B1_PROPERTY=1`);
-- process-level crash windows need real subprocess `SIGKILL` tests;
-- engine main/process lifecycle and journal-unavailable shutdown path remain incomplete;
-- invariant 19/20/21 evidence and all 22 P/R/A rows must be reviewed complete;
-- every generated journal must pass the offline auditor.
+- `fatal_shutdown_requested` 已形成 core contract，但真实 execution-engine 宿主退出码/监督器尚未集成；
+- OS/卷级 disk-full 与真实 WAL 损坏演练尚未替代确定性 fault injection；
+- `docs/INVARIANT_COVERAGE.md` 尚需正式评审签字。
 
-## Gate B2 blockers / unverified modules
+## Recorder deployment blockers
 
-- `IbAdapter.place_order` and `cancel_order`;
-- real IB callback/error mapping;
-- a measured IB stable-snapshot barrier across positions, open orders and executions;
-- quote-recorder subscriptions and isolation;
-- emergency-flatten broker calls;
-- broker-time preflight and documented-vs-observed matrix.
+- 本机未发现 4002/7497 Gateway/TWS listener；
+- 未发现 `config/paper.yml`；
+- SPY tick-by-tick LIVE entitlement、独立 paper username/Gateway 与首个 Full-RTH health report 未验证。
 
-## Safety label
+Recorder 可以在 Gate A/B1 之外独立上线，但只能保持 Read-Only API；它的通过不推导 trading adapter 可连接。
 
-```text
-DO NOT CONNECT TO IB PAPER OR LIVE YET
-Gate B1 not passed
-```
+## Gate B2 blockers
+
+- `IbAdapter.place_order/cancel_order` 和完整 callback/error mapping；
+- positions/open orders/executions 的 observed stable-snapshot protocol；
+- orderRef/permId/clientId、1100/1101/1102、fee delay/correction/cancel race/Gateway restart 的 documented-vs-observed matrix；
+- 人工 1–5 股 paper target/cancel（只能在 B1 正式通过后）。

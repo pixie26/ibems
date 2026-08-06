@@ -30,12 +30,16 @@ down underneath the execution engine. See ADR-005.
 from __future__ import annotations
 
 import gzip
+import hashlib
 import json
 import os
+import argparse
+import math
+import time
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 from uuid import uuid4
 
 
@@ -66,6 +70,13 @@ class RawTick:
     last_size: Optional[float] = None
     exchange: Optional[str] = None
     special_conditions: Optional[str] = None
+    open: Optional[float] = None
+    high: Optional[float] = None
+    low: Optional[float] = None
+    close: Optional[float] = None
+    volume: Optional[float] = None
+    wap: Optional[float] = None
+    trade_count: Optional[int] = None
 
 
 class RawEventLog:
@@ -79,19 +90,28 @@ class RawEventLog:
     """
 
     def __init__(self, root: str | Path, session: Optional[date] = None,
-                 roll_seconds: int = 300):
+                 roll_seconds: int = 300, sync_seconds: float = 1.0):
         self.root = Path(root)
         self.session = session or datetime.now(timezone.utc).date()
         self.dir = self.root / self.session.isoformat()
         self.dir.mkdir(parents=True, exist_ok=True)
         self.roll_seconds = roll_seconds
+        self.sync_seconds = sync_seconds
         self._fh = None
         self._current: Optional[Path] = None
         self._opened_at: Optional[float] = None
         self._seq = 0
         self._count = 0
+        self._last_sync: Optional[float] = None
         # A same-day process restart must not overwrite earlier segments.
         self.run_id = uuid4().hex[:10]
+        self._recover_crashed_segments()
+
+    def _recover_crashed_segments(self) -> None:
+        """Preserve abruptly-terminated gzip streams for best-effort row salvage."""
+        for partial in sorted(self.dir.glob(".partial-*.jsonl.gz")):
+            recovered = partial.with_name(partial.name.replace(".partial-", "crashed-"))
+            os.replace(partial, recovered)
 
     def _open_segment(self, now_mono: float) -> None:
         self._close_segment()
@@ -101,6 +121,7 @@ class RawEventLog:
         )
         self._fh = gzip.open(self._current, "wt", encoding="utf-8")
         self._opened_at = now_mono
+        self._last_sync = now_mono
         self._seq += 1
 
     def _close_segment(self) -> None:
@@ -120,18 +141,36 @@ class RawEventLog:
         assert self._fh is not None
         self._fh.write(json.dumps(asdict(tick), separators=(",", ":")) + "\n")
         self._count += 1
+        self._fh.flush()
+        if self._last_sync is None or now_mono - self._last_sync >= self.sync_seconds:
+            # Bound crash loss without forcing one fsync for every market tick.
+            raw = getattr(getattr(self._fh, "buffer", None), "fileobj", None)
+            if raw is not None:
+                os.fsync(raw.fileno())
+            self._last_sync = now_mono
 
     def close(self) -> None:
         self._close_segment()
 
     def segments(self) -> list[Path]:
-        return sorted(self.dir.glob("segment-*.jsonl.gz"))
+        return sorted(
+            list(self.dir.glob("segment-*.jsonl.gz"))
+            + list(self.dir.glob("crashed-*.jsonl.gz"))
+        )
 
     def read_all(self) -> Iterator[dict[str, Any]]:
         for seg in self.segments():
             with gzip.open(seg, "rt", encoding="utf-8") as fh:
-                for line in fh:
-                    yield json.loads(line)
+                try:
+                    for line in fh:
+                        try:
+                            yield json.loads(line)
+                        except json.JSONDecodeError:
+                            break
+                except (EOFError, OSError):
+                    # A forced kill can leave a valid prefix with no gzip footer.
+                    # The immutable crashed segment remains in the manifest.
+                    continue
 
     @property
     def count(self) -> int:
@@ -155,6 +194,9 @@ class DailyHealth:
     max_gap_seconds: float
     clock_skew_seconds: float
     disconnects: int
+    stream_rows: Optional[dict[str, int]] = None
+    file_hashes: Optional[dict[str, str]] = None
+    required_streams: tuple[str, ...] = ()
 
     def problems(self) -> list[str]:
         out = []
@@ -168,6 +210,10 @@ class DailyHealth:
             out.append(f"clock skew {self.clock_skew_seconds:.2f}s")
         if self.events == 0:
             out.append("no events recorded")
+        if self.stream_rows is not None and self.required_streams:
+            missing = [s for s in self.required_streams if not self.stream_rows.get(s)]
+            if missing:
+                out.append(f"missing required streams: {','.join(missing)}")
         return out
 
     def ok(self) -> bool:
@@ -186,6 +232,7 @@ def compute_health(
     data_types: set[str] = set()
     stamps: list[int] = []
     streams_seen: set[str] = set()
+    stream_rows: dict[str, int] = {}
     for row in log.read_all():
         events += 1
         event_type = row.get("event_type")
@@ -197,6 +244,7 @@ def compute_health(
                 disconnects += 1
             continue
         streams_seen.add(str(event_type))
+        stream_rows[str(event_type)] = stream_rows.get(str(event_type), 0) + 1
         data_types.add(str(row.get("market_data_type", "UNKNOWN")))
         stamps.append(int(row["local_wall_ns"]))
 
@@ -221,6 +269,8 @@ def compute_health(
         max_gap_seconds=max_gap,
         clock_skew_seconds=clock_skew_seconds,
         disconnects=disconnects,
+        stream_rows=stream_rows,
+        required_streams=required_streams,
     )
     missing = sorted(set(required_streams) - streams_seen)
     if missing:
@@ -228,6 +278,95 @@ def compute_health(
         # through a non-LIVE status that DailyHealth.problems already rejects.
         health.market_data_type = f"MISSING_STREAMS:{','.join(missing)}"
     return health
+
+
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for block in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def finalize_day(
+    log: RawEventLog,
+    *,
+    session_seconds: float,
+    clock_skew_seconds: float,
+) -> dict[str, Any]:
+    """Close raw capture, write atomic Parquet, health JSON and a hash manifest."""
+    log.close()
+    rows = list(log.read_all())
+    parquet = log.dir / "events.parquet"
+    parquet_tmp = log.dir / ".events.parquet.tmp"
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except ImportError as exc:  # pragma: no cover - packaging/preflight failure
+        raise RuntimeError("pyarrow is required to finalize recorder output") from exc
+    table = pa.Table.from_pylist(rows)
+    pq.write_table(table, parquet_tmp, compression="zstd")
+    os.replace(parquet_tmp, parquet)
+
+    hashes = {p.name: _sha256(p) for p in [*log.segments(), parquet]}
+    health = compute_health(
+        log,
+        session_seconds=session_seconds,
+        clock_skew_seconds=clock_skew_seconds,
+        required_streams=("BID_ASK", "ALL_LAST", "BAR_5S"),
+    )
+    health.file_hashes = hashes
+    health_path = log.dir / "health.json"
+    health_tmp = log.dir / ".health.json.tmp"
+    health_tmp.write_text(json.dumps(asdict(health), indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(health_tmp, health_path)
+
+    manifest = {
+        "schema_version": 1,
+        "session": log.session.isoformat(),
+        "rows": len(rows),
+        "health_ok": health.ok(),
+        "problems": health.problems(),
+        "files": {**hashes, health_path.name: _sha256(health_path)},
+    }
+    manifest_path = log.dir / "manifest.json"
+    manifest_tmp = log.dir / ".manifest.json.tmp"
+    manifest_tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(manifest_tmp, manifest_path)
+    return manifest
+
+
+class SubscriptionLimiter:
+    """Small token bucket for all recorder-originated IB requests."""
+
+    def __init__(self, rate_per_second: float = 2.0, burst: int = 4):
+        self.rate = rate_per_second
+        self.capacity = float(burst)
+        self.tokens = float(burst)
+        self.last = time.monotonic()
+
+    def wait(self, sleeper: Callable[[float], Any]) -> None:
+        while True:
+            now = time.monotonic()
+            self.tokens = min(self.capacity, self.tokens + (now - self.last) * self.rate)
+            self.last = now
+            if self.tokens >= 1:
+                self.tokens -= 1
+                return
+            sleeper(max(0.01, (1 - self.tokens) / self.rate))
+
+
+@dataclass(frozen=True)
+class RecorderConfig:
+    root: Path
+    symbol: str = "SPY"
+    host: str = "127.0.0.1"
+    port: int = 4002
+    client_id: int = 33
+    max_reconnects: int = 8
+    max_backoff_seconds: float = 60.0
+    wait_for_rth: bool = True
+    roll_seconds: int = 300
 
 
 class QuoteRecorder:
@@ -247,15 +386,266 @@ class QuoteRecorder:
     worthless dataset.
     """
 
-    def __init__(self, root: str | Path, symbol: str = "SPY"):
-        self.root = Path(root)
-        self.symbol = symbol
-        self.log: Optional[RawEventLog] = None
+    DATA_TYPE = {0: "UNKNOWN", 1: "LIVE", 2: "FROZEN", 3: "DELAYED", 4: "DELAYED_FROZEN"}
 
-    def run(self) -> None:  # pragma: no cover
-        raise NotImplementedError(
-            "Week 0 task. Requires ib_async connection with readonly=True, "
-            "reqTickByTickData(BidAsk), reqTickByTickData(AllLast), "
-            "reqRealTimeBars(TRADES), its own token bucket, bounded backoff, "
-            "and a daily health report pushed to phone."
+    def __init__(self, root: str | Path, symbol: str = "SPY", **kwargs):
+        self.config = RecorderConfig(root=Path(root), symbol=symbol, **kwargs)
+        self.root = self.config.root
+        self.symbol = self.config.symbol
+        self.log: Optional[RawEventLog] = None
+        self._event_id = 0
+        self._receive_sequence = 0
+        self._connection_epoch = 0
+        self._market_data_type = "UNKNOWN"
+        self._clock_skew_seconds = math.nan
+        self._resubscribe = False
+        self._limiter = SubscriptionLimiter()
+        self._ticker_types = None
+
+    def _append(self, event_type: str, broker_ts: datetime | str, **values: Any) -> None:
+        if self.log is None:
+            return
+        self._event_id += 1
+        self._receive_sequence += 1
+        now_wall = time.time_ns()
+        now_mono = time.monotonic_ns()
+        if isinstance(broker_ts, datetime):
+            broker_text = broker_ts.astimezone(timezone.utc).isoformat()
+        else:
+            broker_text = str(broker_ts)
+        tick = RawTick(
+            event_id=self._event_id,
+            connection_epoch=self._connection_epoch,
+            contract_id=int(values.pop("contract_id", 0)),
+            event_type=event_type,
+            broker_timestamp=broker_text,
+            local_wall_ns=now_wall,
+            local_monotonic_ns=now_mono,
+            market_data_type=self._market_data_type,
+            receive_sequence=self._receive_sequence,
+            **values,
         )
+        self.log.append(tick, now_mono=now_mono / 1e9)
+
+    @staticmethod
+    def _session(details, now: datetime):
+        sessions = sorted(details.liquidSessions(), key=lambda s: s.start)
+        for session in sessions:
+            if session.end >= now:
+                return session
+        raise RuntimeError("IB contract details contain no current/future liquid session")
+
+    def _wire_ticker(self, ticker) -> None:
+        from ib_async.objects import TickByTickAllLast, TickByTickBidAsk
+        self._ticker_types = (TickByTickAllLast, TickByTickBidAsk)
+
+        def on_update(updated) -> None:
+            for tick in updated.tickByTicks:
+                if isinstance(tick, TickByTickBidAsk):
+                    self._append(
+                        "BID_ASK", tick.time, contract_id=updated.contract.conId,
+                        bid=float(tick.bidPrice), ask=float(tick.askPrice),
+                        bid_size=float(tick.bidSize), ask_size=float(tick.askSize),
+                        special_conditions=(
+                            f"bidPastLow={tick.tickAttribBidAsk.bidPastLow};"
+                            f"askPastHigh={tick.tickAttribBidAsk.askPastHigh}"
+                        ),
+                    )
+                elif isinstance(tick, TickByTickAllLast):
+                    self._append(
+                        "ALL_LAST", tick.time, contract_id=updated.contract.conId,
+                        last=float(tick.price), last_size=float(tick.size),
+                        exchange=tick.exchange, special_conditions=tick.specialConditions,
+                    )
+
+        ticker.updateEvent += on_update
+
+    def _wire_bars(self, bars) -> None:
+        def on_bar(updated, has_new_bar) -> None:
+            if not has_new_bar or not updated:
+                return
+            bar = updated[-1]
+            self._append(
+                "BAR_5S", bar.time, contract_id=updated.contract.conId,
+                open=float(bar.open_), high=float(bar.high), low=float(bar.low),
+                close=float(bar.close), volume=float(bar.volume), wap=float(bar.wap),
+                trade_count=int(bar.count),
+            )
+
+        bars.updateEvent += on_bar
+
+    def _subscribe(self, ib, contract):
+        self._limiter.wait(ib.sleep)
+        probe = ib.reqMktData(contract, "", False, False)
+        probe.marketDataType = 0  # distinguish an actual callback from ib_async's default
+        deadline = time.monotonic() + 10.0
+        while int(probe.marketDataType) == 0 and time.monotonic() < deadline:
+            ib.sleep(0.10)
+        observed = int(probe.marketDataType)
+        self._market_data_type = self.DATA_TYPE.get(observed, f"UNKNOWN:{observed}")
+        self._append(
+            "SYSTEM", datetime.now(timezone.utc), contract_id=contract.conId,
+            special_conditions=f"MARKET_DATA_TYPE:{self._market_data_type}",
+        )
+        if observed != 1:
+            raise RuntimeError(
+                f"Recorder requires an explicit LIVE marketDataType callback; observed "
+                f"{self._market_data_type}. Tick-by-tick delayed data is unsupported."
+            )
+        self._limiter.wait(ib.sleep)
+        ticker = ib.reqTickByTickData(contract, "BidAsk", 0, False)
+        self._limiter.wait(ib.sleep)
+        ib.reqTickByTickData(contract, "AllLast", 0, False)
+        self._limiter.wait(ib.sleep)
+        bars = ib.reqRealTimeBars(contract, 5, "TRADES", True)
+        self._wire_ticker(ticker)
+        self._wire_bars(bars)
+        return probe, ticker, bars
+
+    def run(self) -> dict[str, Any]:  # pragma: no cover - requires a real Gateway/session
+        from ib_async import IB, StartupFetchNONE, Stock
+
+        cfg = self.config
+        attempts = 0
+        session = None
+        while attempts <= cfg.max_reconnects:
+            ib = IB()
+            try:
+                ib.connect(
+                    cfg.host, cfg.port, clientId=cfg.client_id, timeout=10,
+                    readonly=True, fetchFields=StartupFetchNONE,
+                )
+                self._connection_epoch += 1
+                contract = Stock(cfg.symbol, "SMART", "USD", primaryExchange="ARCA")
+                qualified = ib.qualifyContracts(contract)
+                if len(qualified) != 1:
+                    raise RuntimeError(f"could not uniquely qualify {cfg.symbol}: {qualified}")
+                contract = qualified[0]
+                details_list = ib.reqContractDetails(contract)
+                if not details_list:
+                    raise RuntimeError("IB returned no contract details/liquid hours")
+                server_now = ib.reqCurrentTime()
+                session = self._session(details_list[0], server_now)
+                if self.log is None:
+                    self.log = RawEventLog(
+                        cfg.root, session=session.start.date(), roll_seconds=cfg.roll_seconds
+                    )
+                self._clock_skew_seconds = (datetime.now(timezone.utc) - server_now).total_seconds()
+                self._append(
+                    "SYSTEM", server_now, contract_id=contract.conId,
+                    special_conditions="CONNECTED;READ_ONLY=true;SERVER_TIME",
+                )
+
+                def on_error(req_id, code, message, error_contract):
+                    self._append(
+                        "SYSTEM", datetime.now(timezone.utc),
+                        contract_id=getattr(error_contract, "conId", 0) or 0,
+                        special_conditions=f"IB_ERROR:{code}:{req_id}:{message}",
+                    )
+                    if code in {1101, 10225}:
+                        self._resubscribe = True
+
+                def on_disconnect():
+                    self._append(
+                        "SYSTEM", datetime.now(timezone.utc), contract_id=contract.conId,
+                        special_conditions="DISCONNECT",
+                    )
+
+                ib.errorEvent += on_error
+                ib.disconnectedEvent += on_disconnect
+
+                while datetime.now(session.start.tzinfo) < session.start:
+                    if not cfg.wait_for_rth:
+                        raise RuntimeError("RTH has not started and wait_for_rth is false")
+                    ib.sleep(min(1.0, (session.start - datetime.now(session.start.tzinfo)).total_seconds()))
+
+                probe, ticker, bars = self._subscribe(ib, contract)
+                last_mdt = None
+                last_server_probe = time.monotonic()
+                while datetime.now(session.end.tzinfo) < session.end:
+                    if not ib.isConnected():
+                        raise ConnectionError("IB disconnected during RTH")
+                    ib.sleep(0.25)
+                    mdt = int(probe.marketDataType)
+                    if mdt != last_mdt:
+                        self._market_data_type = self.DATA_TYPE.get(mdt, f"UNKNOWN:{mdt}")
+                        self._append(
+                            "SYSTEM", datetime.now(timezone.utc), contract_id=contract.conId,
+                            special_conditions=f"MARKET_DATA_TYPE:{self._market_data_type}",
+                        )
+                        last_mdt = mdt
+                    if self._resubscribe:
+                        self._append(
+                            "SYSTEM", datetime.now(timezone.utc), contract_id=contract.conId,
+                            special_conditions="RESUBSCRIBE_REQUIRED",
+                        )
+                        raise ConnectionError("subscription reset required")
+                    if time.monotonic() - last_server_probe >= 60:
+                        server_probe = ib.reqCurrentTime()
+                        self._clock_skew_seconds = (
+                            datetime.now(timezone.utc) - server_probe
+                        ).total_seconds()
+                        self._append(
+                            "SYSTEM", server_probe, contract_id=contract.conId,
+                            special_conditions="SERVER_TIME",
+                        )
+                        last_server_probe = time.monotonic()
+
+                ib.cancelTickByTickData(contract, "BidAsk")
+                ib.cancelTickByTickData(contract, "AllLast")
+                ib.cancelRealTimeBars(bars)
+                ib.cancelMktData(contract)
+                ib.disconnect()
+                assert self.log is not None and session is not None
+                return finalize_day(
+                    self.log,
+                    session_seconds=(session.end - session.start).total_seconds(),
+                    clock_skew_seconds=self._clock_skew_seconds,
+                )
+            except Exception as exc:
+                self._append(
+                    "SYSTEM", datetime.now(timezone.utc),
+                    special_conditions=f"RECORDER_ERROR:{type(exc).__name__}:{exc}",
+                )
+                if ib.isConnected():
+                    ib.disconnect()
+                attempts += 1
+                if attempts > cfg.max_reconnects:
+                    if self.log is not None and session is not None:
+                        return finalize_day(
+                            self.log,
+                            session_seconds=(session.end - session.start).total_seconds(),
+                            clock_skew_seconds=self._clock_skew_seconds,
+                        )
+                    raise
+                delay = min(cfg.max_backoff_seconds, 2 ** (attempts - 1))
+                time.sleep(delay)
+                self._resubscribe = False
+        raise RuntimeError("unreachable")
+
+
+def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - operator CLI
+    ap = argparse.ArgumentParser(description="Read-only Full-RTH IB recorder")
+    ap.add_argument("--root", default="data/recordings")
+    ap.add_argument("--symbol", default="SPY")
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=4002)
+    ap.add_argument("--client-id", type=int, default=33)
+    ap.add_argument("--max-reconnects", type=int, default=8)
+    ap.add_argument("--no-wait", action="store_true")
+    args = ap.parse_args(argv)
+    manifest = QuoteRecorder(
+        args.root,
+        args.symbol,
+        host=args.host,
+        port=args.port,
+        client_id=args.client_id,
+        max_reconnects=args.max_reconnects,
+        wait_for_rth=not args.no_wait,
+    ).run()
+    print(json.dumps(manifest, indent=2, sort_keys=True))
+    return 0 if manifest.get("health_ok") else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

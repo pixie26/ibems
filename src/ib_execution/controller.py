@@ -48,7 +48,7 @@ from .models import (
     TargetPosition,
     stable_hash,
 )
-from .risk import RiskEngine
+from .risk import RiskEngine, run_self_test
 
 
 @dataclass
@@ -128,9 +128,27 @@ class Controller:
         self._booked_execs: set[str] = set()
         self._fees_pending: set[str] = set()
         self.violations: list[InvariantViolation] = []
+        self.journal_failure: Optional[str] = None
+        self.fatal_shutdown_requested = False
         # (session_date, strategy_id, symbol) already recorded as an EOD residual
         self._eod_residual_recorded: set[tuple] = set()
+        self._journal_restored = False
+        self._restored_positions: dict[str, int] = {}
 
+        # Invariant 21 is enforced in the actual controller construction path,
+        # not only by a separate preflight command that an operator could skip.
+        proven = run_self_test(self.risk.config, self.clock)
+        self.journal.commit(
+            EventType.RISK_CONFIG_LOADED,
+            {
+                "config_hash": self.risk.config_hash,
+                "limits": self.risk.snapshot(),
+            },
+        )
+        self.journal.commit(
+            EventType.RISK_SELF_TEST_PASSED,
+            {"config_hash": self.risk.config_hash, "proven": proven},
+        )
         broker.register(self)
 
     # ------------------------------------------------------------------
@@ -217,6 +235,12 @@ class Controller:
 
     def _can_write(self, closing: bool) -> tuple[bool, Optional[MissReason]]:
         """The single gate every broker write passes through."""
+        if self.journal_failure is not None or not self.journal.is_healthy():
+            self._fail_closed_journal(
+                "broker write gate",
+                JournalUnavailable(str(self.journal.failure or "writer unavailable")),
+            )
+            return False, MissReason.MODE_BLOCKED
         if self.link_state is not LinkState.CONNECTED:
             return False, MissReason.DISCONNECTED
         if self.sync_state is not SyncState.SYNCED:
@@ -235,6 +259,13 @@ class Controller:
     # ------------------------------------------------------------------
 
     def submit_target(self, target: TargetPosition) -> bool:
+        try:
+            return self._submit_target_impl(target)
+        except JournalUnavailable as exc:
+            self._fail_closed_journal("submit_target", exc)
+            raise
+
+    def _submit_target_impl(self, target: TargetPosition) -> bool:
         """
         The only thing a strategy may call. Returns True if we acted.
 
@@ -430,7 +461,7 @@ class Controller:
         )
 
         try:
-            self.risk.check(
+            risk_evidence = self.risk.check(
                 intent,
                 current_position=leg.position,
                 quote=self.quotes.get(leg.symbol),
@@ -456,9 +487,11 @@ class Controller:
 
         # ---- ORDER MATTERS FROM HERE ----------------------------------
         # 1. intent durable
+        intent_payload = intent.to_payload()
+        intent_payload["risk_evidence"] = risk_evidence
         self.journal.commit(
             EventType.ORDER_INTENT_COMMITTED,
-            intent.to_payload(),
+            intent_payload,
             strategy_id=leg.strategy_id,
             symbol=leg.symbol,
             decision_id=target.decision_id,
@@ -589,6 +622,13 @@ class Controller:
     # ------------------------------------------------------------------
 
     def tick(self) -> None:
+        try:
+            self._tick_impl()
+        except JournalUnavailable as exc:
+            self._fail_closed_journal("tick", exc)
+            raise
+
+    def _tick_impl(self) -> None:
         """
         Called periodically. Two independent triggers live here.
 
@@ -795,6 +835,14 @@ class Controller:
     # ------------------------------------------------------------------
 
     def reconcile(self, *, evaluate_targets: bool = True) -> bool:
+        try:
+            return self._reconcile_impl(evaluate_targets=evaluate_targets)
+        except JournalUnavailable as exc:
+            self._fail_closed_journal("reconcile", exc)
+            raise
+
+    def _reconcile_impl(self, *, evaluate_targets: bool = True) -> bool:
+        self.restore_from_journal()
         self.journal.commit(EventType.RECONCILIATION_STARTED, {})
         self._set_sync(SyncState.SYNCING, "reconcile begin")
         try:
@@ -1105,6 +1153,8 @@ class Controller:
 
     def restore_from_journal(self) -> dict[str, int]:
         """Boot step 1: replay before touching the broker (invariant 10)."""
+        if self._journal_restored:
+            return dict(self._restored_positions)
         events = list(self.journal.replay())
         self.risk.restore_from_events(events)
         pos = self._expected_positions()
@@ -1146,6 +1196,8 @@ class Controller:
                 "active_halt_seq": halt["seq"] if halt is not None else None,
             },
         )
+        self._restored_positions = dict(pos)
+        self._journal_restored = True
         return pos
 
     def _last_eod_residual(self) -> dict[str, int]:
@@ -1229,9 +1281,7 @@ class Controller:
         except InvariantViolation:
             raise
         except JournalUnavailable as exc:
-            self.link_state = LinkState.DEGRADED
-            self.operating_mode = OperatingMode.HALTED
-            self.alert("CRITICAL", f"journal unavailable in {name}: {exc}")
+            self._fail_closed_journal(name, exc)
         except Exception as exc:  # noqa: BLE001
             tb = traceback.format_exc(limit=6)
             try:
@@ -1242,8 +1292,41 @@ class Controller:
                 pass
             self.halt(f"callback {name} raised: {exc}")
 
+    def _fail_closed_journal(self, context: str, exc: BaseException) -> None:
+        """
+        Fence all future broker writes without trying to journal the failure.
+
+        The journal is the unavailable component, so attempting another event
+        here would either block again or create false confidence.  The in-memory
+        state and out-of-band alert are the last reliable controls; the process
+        supervisor/watchdog must then terminate the engine.
+        """
+        detail = f"{context}: {exc}"
+        already_reported = self.journal_failure is not None
+        self.journal_failure = detail
+        self._fail_closed_runtime(
+            f"journal unavailable; no further broker writes: {detail}",
+            already_reported=already_reported,
+        )
+
+    def _fail_closed_runtime(self, detail: str, *, already_reported: bool = False) -> None:
+        """Out-of-band fatal fence for components whose durable path is unavailable."""
+        self.fatal_shutdown_requested = True
+        self.link_state = LinkState.DEGRADED
+        self.sync_state = SyncState.UNVERIFIED
+        self.operating_mode = OperatingMode.HALTED
+        if not already_reported:
+            self.alert(
+                "CRITICAL",
+                f"engine fenced HALTED; process shutdown required: {detail}",
+            )
+
     def on_connected(self, connection_epoch: int) -> None:
         def _do() -> None:
+            # Enforce the boot contract even if an application forgot to call
+            # restore_from_journal explicitly. Broker connectivity may not
+            # launder a durable HALT or residual.
+            self.restore_from_journal()
             self.connection_epoch = connection_epoch
             self._set_link(LinkState.CONNECTED, f"epoch={connection_epoch}")
             # A socket coming back is not the account being trustworthy.
@@ -1589,6 +1672,8 @@ class Controller:
             },
             "fees_pending": len(self._fees_pending),
             "violations": [str(v) for v in self.violations],
+            "fatal_shutdown_requested": self.fatal_shutdown_requested,
+            "journal_failure": self.journal_failure,
             "risk": self.risk.snapshot(),
             "fsync": self.journal.fsync_stats(),
         }

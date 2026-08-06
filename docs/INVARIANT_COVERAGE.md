@@ -1,42 +1,40 @@
-# Invariant coverage matrix — v0.1.5.dev0 Phase 0 review
+# Invariant coverage matrix — v0.1.5.dev0
 
-`COMPLETE` requires all three reviewed layers:
+`COMPLETE` 要求三层同时存在：Property/adversarial test（P）、runtime assertion/structural enforcement（R）、offline journal auditor（A）。P/R/A 完整不等于 Gate B1 已通过；正式 campaign、进程退出集成和评审结论仍是独立退出条件。
 
-- **P**: property/adversarial test;
-- **R**: runtime assertion or structural enforcement;
-- **A**: offline journal auditor.
+| # | 简述 | P | R | A | 当前证据 |
+|---|---|---|---|---|---|
+| 1 | decision id once | yes | DB PK + atomic accept | yes | complete |
+| 2 | durable before broker write | yes | commit-before-call | yes | subprocess force-kill: before/after WAL |
+| 3 | one live intent per leg | yes | state gate | yes | generated restart lifecycle |
+| 4 | no second send pending ACK | yes | state gate | yes | generated lifecycle |
+| 5 | no replacement pending cancel | yes | state gate | yes | cancel crash window |
+| 6 | write only CONNECTED+SYNCED | yes | write-boundary assertion | yes | complete |
+| 7 | opening only NORMAL | yes | `_can_write` | yes | complete |
+| 8 | FLATTEN_ONLY only target zero | yes | `_evaluate` | yes | complete |
+| 9 | resolve working before flatten | yes | cancel/reconcile gate | yes | complete |
+| 10 | restart reconcile before send | yes | forced restore before connect/reconcile | yes | real IB barrier remains Gate B2 |
+| 11 | expired target never sent | yes | `_evaluate` | yes | complete |
+| 12 | exec id once/corrections append-only | yes | atomic book transaction | yes | partial-fill force-kill window |
+| 13 | missing fee is benign | yes | structural | yes | complete |
+| 14 | unknown broker fact halts | yes | exact identity + HALT | yes | observed permId matrix remains B2 |
+| 15 | explained residual -> FLATTEN_ONLY | yes | restore fold | yes | complete |
+| 16 | order/share/notional/position caps | yes | RiskEngine + restart restore | yes | evidence carries frozen limits |
+| 17 | intent stores config hash | yes | intent construction | yes | complete |
+| 18 | callback/bridge failure fail-closed | yes | guarded callbacks + bridge liveness | yes | real adapter handlers remain B2 |
+| 19 | overnight survivability | yes | numeric stress | yes | auditor recomputes per-intent evidence |
+| 20 | every invariant has P/R/A | yes | coverage contract | yes | auditor fails on missing row |
+| 21 | startup must-reject self-test | yes | Controller construction path | yes | matching config hash must precede start/intent |
+| 22 | restart cannot clear HALT | yes | forced restore + exact CAS ack | yes | subprocess kill after durable HALT |
 
-A deterministic test is not automatically a process-crash proof. The package remains **not Gate B1 complete**.
+## Gate B1 仍未通过
 
-| # | Short description | P | R | A | Current status / next evidence |
-|---|---|---:|---:|---:|---|
-| 1 | decision id once | yes | atomic DB constraint | yes | COMPLETE for current process model |
-| 2 | durable before broker write | partial | structural ordering | yes | add real subprocess kill after WAL/before send |
-| 3 | one live intent per leg | yes | state gate | yes | generated restart cases present; rerun with Hypothesis |
-| 4 | no second send pending ack | yes | state gate | yes | COMPLETE for current event model |
-| 5 | no replacement pending cancel | yes | state gate | yes | COMPLETE for current event model |
-| 6 | write only CONNECTED+SYNCED | yes | write-boundary `_require` | yes | COMPLETE for controller writes |
-| 7 | opening only NORMAL | yes | `_can_write` | yes | COMPLETE |
-| 8 | FLATTEN_ONLY only target zero | yes | `_evaluate` | yes | COMPLETE |
-| 9 | resolve working before flatten | yes | zero-target convergence + cancel gate | yes | clean cancel now forces reconciliation |
-| 10 | restart reconcile before send | partial | sync starts UNVERIFIED; unstable snapshot cannot sync | yes | add real process restart fixture and prove real IB snapshot barrier |
-| 11 | expired target never sent | yes | `_evaluate` | yes | COMPLETE |
-| 12 | exec id once/corrections append-only | partial | atomic DB transaction | yes | add transaction/process crash test |
-| 13 | missing fee is benign | yes | structural | yes | auditor uses word-boundary match; no `verify` false positive |
-| 14 | unknown broker fact halts | yes | exact identity + durable HALT cause | yes | add explicit permId mismatch matrix in Gate B2 |
-| 15 | explained residual -> FLATTEN_ONLY | yes | restore path | yes | includes position=0 + working exposure |
-| 16 | order/share/notional caps | yes | RiskEngine + restart restore | yes | auditor must receive the actual frozen session limits |
-| 17 | intent stores risk config hash | yes | intent constructor | yes | COMPLETE |
-| 18 | callback exception fail-closed | yes | `_guarded` | yes | adapter/bridge integration still unverified |
-| 19 | overnight survivability | yes | numeric stress check | no | persist applied stress inputs/result, audit against frozen config |
-| 20 | every invariant has P/R/A | meta | no | no | **NOT COMPLETE — blocks Gate B1; matrix now covers all 22 rows** |
-| 21 | startup must-reject self-test | yes | preflight | partial | event emitted; audit ordering before engine start/send |
-| 22 | restart cannot clear HALT; exact acknowledgement only | yes | atomic latest-cause CAS; no in-process resume | yes | COMPLETE for current process model; real process restart fixture still supports invariant 10 |
+正式 Hypothesis campaign 已通过：Python 3.12.13、seed `2026080601`、两个生成测试各 1,500 passing examples、source-tree SHA-256 `4990d57cddc05d21924a3b3b1d01050ecc2d9e6a8f4b36a19969b1809f0f67ba`。证据见 `artifacts/gate_b1/20260806T142435Z/manifest.json`。
 
-## Gate B1 exit rule
+截至 2026-08-06，以下任一项未完成都必须维持 `Gate B1 not passed`：
 
-1. no row may remain `partial` or `no`;
-2. Hypothesis-generated lifecycle sequences must run;
-3. every generated journal must pass the auditor;
-4. process-level crash fixtures must cover durable-before-send and execution-booking windows;
-5. README/manifest may claim Gate B1 only after this matrix is reviewed COMPLETE.
+- `fatal_shutdown_requested` 已测试，但真正 execution-engine 宿主进程的退出码/监督器行为尚未集成；
+- OS/卷级真实 disk-full 与 SQLite/WAL 损坏演练尚未取代当前确定性故障注入；
+- 本矩阵尚需正式评审签字，不能由测试数量自动升级 Gate。
+
+Gate B2 的 IB stable-snapshot、permId、1101/1102 和 callback observed matrix 不倒灌进 B1，也不因 B1 的 FakeBroker 证据而预判通过。

@@ -16,10 +16,15 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
+from .journal import JournalUnavailable
 from .models import Execution, Quote, TargetPosition
 
 
 class BridgeNotStarted(RuntimeError):
+    pass
+
+
+class BridgeUnavailable(RuntimeError):
     pass
 
 
@@ -80,8 +85,7 @@ class AsyncControllerBridge:
 
     def _post(self, method: str, *args: Any) -> None:
         """Thread-safe callback ingress. Never calls Controller on the IB loop."""
-        if self._loop is None or self._queue is None or self._closed:
-            raise BridgeNotStarted("AsyncControllerBridge.start() must run before callbacks")
+        self._require_queue()
 
         def put() -> None:
             assert self._queue is not None
@@ -112,6 +116,10 @@ class AsyncControllerBridge:
                 value = await loop.run_in_executor(self._executor, fn, *item.args)
                 if item.result is not None and not item.result.done():
                     item.result.set_result(value)
+            except JournalUnavailable as exc:
+                self.controller._fail_closed_journal(item.method, exc)
+                if item.result is not None and not item.result.done():
+                    item.result.set_exception(exc)
             except BaseException as exc:  # propagate command failures; callbacks fail closed inside controller
                 if item.result is not None and not item.result.done():
                     item.result.set_exception(exc)
@@ -121,6 +129,10 @@ class AsyncControllerBridge:
     def _require_queue(self) -> asyncio.Queue[_Item]:
         if self._queue is None or self._closed:
             raise BridgeNotStarted("bridge is not running")
+        if self._consumer is None or self._consumer.done():
+            exc = BridgeUnavailable("controller bridge consumer is not alive")
+            self.controller._fail_closed_runtime(str(exc))
+            raise exc
         return self._queue
 
     # BrokerCallbacks protocol. These are intentionally tiny and non-blocking.

@@ -1,8 +1,9 @@
 # ib-execution-platform v0.1.5.dev0 — Phase 0 reviewed
 
-> **`DO NOT CONNECT TO IB PAPER OR LIVE YET.`**
-> The IB adapter, recorder subscription and emergency-flatten broker calls remain
-> unimplemented. This package is an IB-free execution core, not a trading system.
+> **`DO NOT CONNECT THE TRADING ADAPTER TO IB PAPER OR LIVE YET.`**
+> The trading IB adapter and emergency-flatten broker calls remain unimplemented.
+> The read-only recorder is implemented but has not connected to a Gateway. This
+> package is not yet a trading system.
 
 **v0.1.5 accepts v0.1.4's central fix — HALT must survive restart — and closes
 two additional safety gaps found during review:** HALT acknowledgement is now an
@@ -29,16 +30,19 @@ Operations: [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
 
 | Component | Status |
 |---|---|
-| IB-free core | **Reviewed prototype.** 122 deterministic pytest cases pass in the review environment. Gate B1 is **not** passed because process-crash evidence and complete P/R/A coverage remain open. |
-| Hypothesis-gated module | 5 tests present, including 2 generated lifecycle tests. The source supports a Gate B1 profile of 1,500 examples and up to 90 actions, but Hypothesis was unavailable in the review environment and was not executed. |
-| `ib_adapter`, live recorder subscriptions, emergency-flatten broker calls | **UNVERIFIED skeletons.** Never connected to a Gateway. |
+| IB-free core | **Reviewed prototype.** 138 non-property tests pass on Python 3.12.13, including seven subprocess force-kill windows and six journal/queue failures. Gate B1 remains **not passed**; see the explicit blockers in `docs/INVARIANT_COVERAGE.md`. |
+| Hypothesis module | 5 tests pass under both the default profile and the formal `gate` profile. The two generated tests each passed 1,500 examples with seed `2026080601`; manifest: `artifacts/gate_b1/20260806T142435Z/manifest.json`. |
+| Read-only recorder | Subscription, raw storage, Parquet, health and hash pipeline implemented and locally tested; **never connected to a Gateway**. |
+| Trading `ib_adapter`, emergency-flatten broker calls | **UNVERIFIED skeletons.** Never connected to a Gateway. |
 
-**Safety label: DO NOT CONNECT TO IB PAPER OR LIVE YET.**
+**Safety label: do not connect the trading adapter. The isolated Read-Only Recorder may connect after its Gateway/entitlement preflight.**
 
 ```bash
 pip install -e ".[dev]"
-pytest
-IB_GATE_B1_PROPERTY=1 pytest tests/test_invariants.py -q
+pytest -q
+pytest -q -m property --hypothesis-profile=gate
+python scripts/run_gate_b1.py
+python -m ib_execution.quote_recorder --root data/recordings --port 4002
 python scripts/demo.py
 python scripts/deterministic_soak.py --seeds 150 --actions 100
 ```

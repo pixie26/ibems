@@ -309,12 +309,15 @@ Modeled size/capacity costs
 ## 12. 当前代码状态
 
 ```text
-122 deterministic tests PASS
-5 Hypothesis-gated tests present (2 generated), not run in review environment
-deterministic soak 20 x 50 PASS
-editable install PASS
+138 non-property tests PASS (Python 3.12.13)
+5 Hypothesis tests default 100-example profile PASS
+Gate profile: 2 generated tests x 1,500 examples PASS (seed 2026080601)
+7 subprocess force-kill crash windows PASS
+6 journal/queue fail-closed scenarios PASS
+read-only Recorder implemented and locally tested; no Gateway session observed
 Gate B1 NOT PASSED
-DO NOT CONNECT TO IB PAPER OR LIVE YET
+DO NOT CONNECT THE TRADING ADAPTER TO IB PAPER OR LIVE YET
+READ-ONLY RECORDER MAY CONNECT AFTER RECORDER PREFLIGHT
 ```
 
 当前包的正确用途：继续 Phase 0 的证据补全。错误用途：因为测试全绿就开始接 Gateway。
@@ -336,5 +339,6 @@ cause 已经出现时，确认必须失败。确认只说明原因已由指定�
 
 ### 3. 此后停止增加 Phase 0 功能
 
-下一步只补证据：Hypothesis Gate campaign、真实 subprocess kill、P/R/A 审计闭环和
-IB Paper 的 documented-vs-observed snapshot protocol。未经 Gate B1，不写 live 交易功能。
+下一步只补证据：宿主进程退出/OS 级 storage fault、
+P/R/A 正式评审，以及 Gate B2 的 IB Paper documented-vs-observed snapshot protocol。
+未经 Gate B1，不写 live 交易功能。

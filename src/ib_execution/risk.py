@@ -174,8 +174,8 @@ class RiskEngine:
         current_position: int,
         quote: Optional[Quote],
         is_closing: bool = False,
-    ) -> None:
-        """Raise RiskRejection on any failure. Silence means approved."""
+    ) -> dict:
+        """Raise on rejection; otherwise return durable, auditor-recomputable evidence."""
         now = self.clock.now()
         self._counters.roll(now)
         c = self.config
@@ -250,6 +250,25 @@ class RiskEngine:
                     "overnight_stress",
                     f"stress loss {stressed_loss} > budget {c.max_overnight_loss}",
                 )
+
+        reference_price = quote.mid if quote is not None else Decimal(0)
+        stressed_loss = abs(resulting) * reference_price * c.overnight_gap_stress_pct
+        return {
+            "config_hash": self.config_hash,
+            "is_closing": bool(is_closing),
+            "resulting_position": resulting,
+            "reference_price": str(reference_price),
+            "overnight_gap_stress_pct": str(c.overnight_gap_stress_pct),
+            "stressed_loss": str(stressed_loss),
+            "max_overnight_loss": str(c.max_overnight_loss),
+            "max_position_shares": c.max_position_shares,
+            "max_order_shares": c.max_order_shares,
+            "max_order_notional": str(c.max_order_notional),
+            "max_orders_per_minute": c.max_orders_per_minute,
+            "max_orders_per_day": c.max_orders_per_day,
+            "max_daily_shares": c.max_daily_shares,
+            "max_daily_notional": str(c.max_daily_notional),
+        }
 
     def record_sent(self, intent: OrderIntent, price: Decimal) -> None:
         now = self.clock.now()

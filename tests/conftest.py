@@ -7,6 +7,19 @@ from pathlib import Path
 
 import pytest
 
+try:
+    from hypothesis import HealthCheck, settings
+except ImportError:  # deterministic-only developer environments remain usable
+    pass
+else:
+    settings.register_profile(
+        "gate",
+        max_examples=1500,
+        deadline=None,
+        print_blob=True,
+        suppress_health_check=[HealthCheck.function_scoped_fixture],
+    )
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from ib_execution.calendar import TradingCalendar  # noqa: E402

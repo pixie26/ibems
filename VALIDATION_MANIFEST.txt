@@ -1,28 +1,37 @@
-ib-execution-platform v0.1.5.dev0 — Phase 0 reviewed
+ib-execution-platform v0.1.5.dev0 — Phase 0 reviewed baseline
 Validation date: 2026-08-06
-Review runtime: Python 3.13.5 (production target remains Python 3.12.x)
+Runtime: Python 3.12.13 / pytest 9.0.3 / Hypothesis 6.155.3 / Windows 11
 
 Safety label:
-  DO NOT CONNECT TO IB PAPER OR LIVE YET
+  DO NOT CONNECT THE TRADING ADAPTER TO IB PAPER OR LIVE
+  Read-Only Recorder may connect only after recorder Gateway/entitlement preflight
   Gate B1 not passed
 
-Completed in review environment:
-  - 122 deterministic pytest cases: PASS
-  - python -m compileall src tests scripts: PASS
-  - scripts/demo.py: PASS
-  - editable install, no index/no dependencies: PASS
-  - deterministic soak 150 seeds x 100 actions: PASS during review
-  - final post-document-change soak 50 seeds x 100 actions: PASS
+Completed:
+  - compileall src tests scripts: PASS
+  - non-property pytest: 138 passed, 0 failed, 0 errors, 0 skipped
+  - default Hypothesis profile: 5 passed; 2 generated tests x 100 examples
+  - formal Gate profile: 5 passed; 2 generated tests x 1,500 examples
+  - formal seed: 2026080601
+  - formal source-tree SHA-256:
+      4990d57cddc05d21924a3b3b1d01050ecc2d9e6a8f4b36a19969b1809f0f67ba
+  - subprocess force-kill windows: 7 passed
+  - journal/queue fail-closed scenarios: 6 passed
+  - editable install in isolated Python 3.12 environment: PASS
+  - quote recorder storage/Parquet/health/hash tests: PASS
+
+Formal evidence (ignored, reproducible runtime artifact):
+  artifacts/gate_b1/20260806T142435Z/manifest.json
+  deterministic.txt  30e27af7ad972ca05f2a2ca91616214f8077a2f13d2b7d6acb151ae502d1f72a
+  deterministic.xml  4a1236469dedf6b7732775698a006aee39363892ce353d8e0a05d2b9559d7985
+  property_gate.txt  3329a8dc9f01470d9ca42e7240691a3a215f4471920d3ffcd769f2dc73ee589e
+  property_gate.xml  5a48458a723ed99d7d070f2a2b0f22b6c8a433022fbe52afe0116d5afca3c609
 
 Not completed / not claimed:
-  - 5 Hypothesis-gated tests were not run because Hypothesis was unavailable
-  - Gate profile source supports 1,500 examples and up to 90 actions
-  - 300 seeds x 150 actions did not finish within the review execution limit; no pass claim
-  - no IB Gateway, Paper or Live connection was attempted
-
-Load-bearing v0.1.5 changes:
-  - exact atomic acknowledgement of latest durable HALT cause
-  - acknowledgement does not resume the running process
-  - repeated HALT causes remain durable and advance the acknowledgement token
-  - unstable broker snapshots cannot restore SYNCED
-  - FakeBroker exposes pending position/order callbacks as an unstable snapshot
+  - execution-engine host exit-code/supervisor integration after fatal journal failure
+  - OS/volume-level real disk-full and real WAL-corruption drill
+  - formal reviewer sign-off for Gate B1
+  - no IB Gateway/TWS listener was present on ports 4002/7497
+  - no live SPY market-data entitlement or Full-RTH recorder session was observed
+  - no IB trading adapter Paper or Live connection was attempted
+  - Gate B2 stable-snapshot/documented-vs-observed protocol is not run

@@ -215,17 +215,13 @@ def test_auditor_now_proves_the_runaway_breaker(tmp_path, clock):
 
 def test_auditor_reports_honest_coverage(ctl, journal, broker, clock):
     """
-    Coverage claims must be checkable.
-
-    19/20/21 are structural: overnight sizing, three-way implementation, and the
-    startup self-test cannot be proven from an event log. Saying so plainly is
-    better than a coverage number that quietly rounds up.
+    Coverage claims must be checkable and may not quietly omit structural rows.
     """
     ctl.submit_target(target(3, clock))
     broker.pump()
     s = JournalAuditor(journal.replay()).summary()
-    assert set(s["audited_invariants"]) == set(range(1, 19)) | {22}
-    assert set(s["not_fully_audited"]) == {19, 20, 21}
+    assert set(s["audited_invariants"]) == set(range(1, 23))
+    assert s["not_fully_audited"] == []
 
 
 def test_clean_session_still_audits_clean(ctl, journal, broker, clock):
@@ -261,7 +257,7 @@ def test_watchdog_refuses_to_kill_a_recycled_pid(tmp_path):
         alert=lambda lvl, msg: alerts.append((lvl, msg)),
     )
     real = Watchdog._pid_start_ticks(os.getpid())
-    assert real is not None, "/proc not available; guard cannot function"
+    assert real is not None, "platform process-creation identity unavailable"
 
     stale = {"pid": os.getpid(), "pid_start_ticks": real + 999_999}
     assert w.kill_engine(stale) is False

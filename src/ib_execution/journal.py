@@ -125,9 +125,20 @@ class JournalUnavailable(RuntimeError):
 
 
 class Journal:
-    def __init__(self, path: str | Path, clock=None):
+    def __init__(
+        self,
+        path: str | Path,
+        clock=None,
+        *,
+        write_timeout_seconds: float = 30.0,
+        sqlite_timeout_seconds: float = 5.0,
+    ):
         self.path = str(path)
         self._clock = clock
+        self._write_timeout_seconds = float(write_timeout_seconds)
+        self._sqlite_timeout_seconds = float(sqlite_timeout_seconds)
+        if self._write_timeout_seconds <= 0 or self._sqlite_timeout_seconds <= 0:
+            raise ValueError("journal timeouts must be positive")
         self._q: "queue.Queue[Optional[_WriteRequest]]" = queue.Queue()
         self._fsync_samples: list[float] = []
         self._lock = threading.Lock()
@@ -136,7 +147,7 @@ class Journal:
 
         # Bootstrap schema on the calling thread, then hand the connection to
         # the writer thread which owns it exclusively from then on.
-        conn = sqlite3.connect(self.path)
+        conn = sqlite3.connect(self.path, timeout=self._sqlite_timeout_seconds)
         conn.executescript(SCHEMA)
         conn.commit()
         conn.close()
@@ -149,10 +160,11 @@ class Journal:
     # -- writer thread ----------------------------------------------------
 
     def _writer_loop(self) -> None:
-        conn = sqlite3.connect(self.path)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=FULL")
+        conn: Optional[sqlite3.Connection] = None
         try:
+            conn = sqlite3.connect(self.path, timeout=self._sqlite_timeout_seconds)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=FULL")
             while True:
                 req = self._q.get()
                 if req is None:
@@ -169,8 +181,20 @@ class Journal:
                         if len(self._fsync_samples) > 10_000:
                             del self._fsync_samples[:5_000]
                     req.done.set()
+        except BaseException as exc:  # an unexpected writer death poisons the journal
+            with self._lock:
+                self._failed = exc
+            while True:
+                try:
+                    pending = self._q.get_nowait()
+                except queue.Empty:
+                    break
+                if pending is not None:
+                    pending.error = exc
+                    pending.done.set()
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
 
     def _apply(self, conn: sqlite3.Connection, req: _WriteRequest) -> Any:
         if req.kind == "append":
@@ -341,11 +365,15 @@ class Journal:
 
     # -- caller side ------------------------------------------------------
 
-    def _submit(self, kind: str, args: tuple, timeout: float = 30.0) -> Any:
+    def _submit(self, kind: str, args: tuple, timeout: Optional[float] = None) -> Any:
         if self._failed is not None:
             raise JournalUnavailable(f"journal already failed: {self._failed}")
         if self._closed:
             raise JournalUnavailable("journal is closed")
+        if not self._thread.is_alive():
+            self._failed = RuntimeError("journal writer thread is not alive")
+            raise JournalUnavailable(str(self._failed))
+        timeout = self._write_timeout_seconds if timeout is None else float(timeout)
         req = _WriteRequest(kind, args)
         self._q.put(req)
         if not req.done.wait(timeout):
@@ -360,6 +388,14 @@ class Journal:
             self._failed = req.error
             raise JournalUnavailable(f"journal write failed: {req.error}") from req.error
         return req.result
+
+    def is_healthy(self) -> bool:
+        """Cheap write-boundary health check; a successful commit remains the proof."""
+        return not self._closed and self._failed is None and self._thread.is_alive()
+
+    @property
+    def failure(self) -> Optional[BaseException]:
+        return self._failed
 
     def _event_dict(
         self,
