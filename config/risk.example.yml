@@ -1,0 +1,34 @@
+# Risk limits. Copy to risk.yml (gitignored) and edit.
+#
+# Hard ceilings are compiled into risk.py. Config may LOWER them, never raise.
+# A fat-fingered YAML must not be able to authorise a position the platform was
+# never designed to survive.
+
+symbol_whitelist: ["SPY"]
+strategy_whitelist: ["manual_test", "intraday_momentum_spy"]
+
+# INVARIANT 19: this number must be survivable OVERNIGHT, not merely intraday.
+# The watchdog does not auto-flatten (ADR-004); that design depends entirely on
+# this limit. Changing it means revisiting ADR-004 in the same commit.
+max_position_shares: 5
+max_order_shares: 10          # must be >= 2 x max_position_shares (reversal needs 2N)
+max_order_notional: 5000
+
+# Runaway breakers. The disaster case for an automated system is not one bad
+# order, it is a loop emitting ten thousand. These two matter more than every
+# other check combined.
+max_orders_per_minute: 4
+max_orders_per_day: 50
+max_daily_shares: 200
+max_daily_notional: 100000
+
+allow_short: true
+
+max_quote_age_seconds: 5.0
+max_spread_bps: 25.0
+max_limit_deviation_bps: 30.0
+
+# Numeric invariant 19. Every risk-increasing order is stressed against this
+# gap and rejected if the loss exceeds the budget.
+overnight_gap_stress_pct: 0.15
+max_overnight_loss: 500

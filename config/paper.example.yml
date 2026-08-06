@@ -1,0 +1,40 @@
+# Connection settings. Copy to paper.yml (gitignored).
+#
+# NO CREDENTIALS HERE, EVER. IB Gateway authenticates at the Gateway process,
+# not through the API. This platform never sees a username or password.
+# See docs/RUNBOOK.md section 0.
+
+host: "127.0.0.1"
+port: 4002              # 4002 paper gateway, 4001 live gateway
+
+client_ids:
+  execution: 31
+  emergency: 32
+  recorder: 33
+  # Never 0 for trading. clientId 0 binds orders placed manually in TWS, and
+  # binding can trigger cancel/resubmit, costing queue position on an order we
+  # did not create.
+
+account: "${IB_ACCOUNT}"   # from the environment
+
+journal_path: "data/journal.db"
+status_path: "data/status.json"
+recording_root: "data/recordings"
+
+execution_policy:
+  initial_collar_bps: 2.0
+  collar_step_bps: 3.0
+  max_attempts: 3               # bounded ladder; unbounded repricing is chasing
+  ack_timeout_seconds: 10
+  order_timeout_seconds: 20
+  cancel_timeout_seconds: 10
+  closing_collar_multiplier: 4.0
+
+calendar:
+  flatten_lead_minutes: 20
+  flatten_hard_minutes: 3
+  escalation_minutes: 15        # past this, unresolved state pages a human
+
+health:
+  max_clock_skew_seconds: 2.0
+  fsync_p99_ms_stop_new: 250

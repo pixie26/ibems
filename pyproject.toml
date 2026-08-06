@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ib-execution-platform"
+version = "0.1.5.dev0"
+description = "Thin single-account IBKR execution platform. Strategy-agnostic by construction."
+requires-python = ">=3.12"
+dependencies = ["PyYAML>=6.0"]
+
+[project.optional-dependencies]
+# The state-machine core has no IB dependency. PyYAML is the only base runtime
+# dependency because production must load the exact checked risk configuration.
+ib = ["ib_async>=1.0"]
+dev = ["pytest>=8.0", "hypothesis>=6.100"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

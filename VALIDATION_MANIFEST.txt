@@ -1,0 +1,28 @@
+ib-execution-platform v0.1.5.dev0 — Phase 0 reviewed
+Validation date: 2026-08-06
+Review runtime: Python 3.13.5 (production target remains Python 3.12.x)
+
+Safety label:
+  DO NOT CONNECT TO IB PAPER OR LIVE YET
+  Gate B1 not passed
+
+Completed in review environment:
+  - 122 deterministic pytest cases: PASS
+  - python -m compileall src tests scripts: PASS
+  - scripts/demo.py: PASS
+  - editable install, no index/no dependencies: PASS
+  - deterministic soak 150 seeds x 100 actions: PASS during review
+  - final post-document-change soak 50 seeds x 100 actions: PASS
+
+Not completed / not claimed:
+  - 5 Hypothesis-gated tests were not run because Hypothesis was unavailable
+  - Gate profile source supports 1,500 examples and up to 90 actions
+  - 300 seeds x 150 actions did not finish within the review execution limit; no pass claim
+  - no IB Gateway, Paper or Live connection was attempted
+
+Load-bearing v0.1.5 changes:
+  - exact atomic acknowledgement of latest durable HALT cause
+  - acknowledgement does not resume the running process
+  - repeated HALT causes remain durable and advance the acknowledgement token
+  - unstable broker snapshots cannot restore SYNCED
+  - FakeBroker exposes pending position/order callbacks as an unstable snapshot
