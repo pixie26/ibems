@@ -1,15 +1,16 @@
 ib-execution-platform v0.1.5.dev0 — Phase 0 reviewed baseline
-Validation date: 2026-08-06
+Validation date: 2026-08-07
 Runtime: Python 3.12.13 / pytest 9.0.3 / Hypothesis 6.155.3 / Windows 11
 
 Safety label:
   DO NOT CONNECT THE TRADING ADAPTER TO IB PAPER OR LIVE
-  Read-Only Recorder may connect only after recorder Gateway/entitlement preflight
+  Read-Only Recorder preflight may connect; Full-RTH requires verified LIVE entitlement
   Gate B1 not passed
 
 Completed:
   - compileall src tests scripts: PASS
-  - non-property pytest: 138 passed, 0 failed, 0 errors, 0 skipped
+  - current-worktree pytest: 149 passed, 0 failed, 0 errors, 0 skipped
+  - non-property pytest: 144 passed, 0 failed, 0 errors, 0 skipped
   - default Hypothesis profile: 5 passed; 2 generated tests x 100 examples
   - formal Gate profile: 5 passed; 2 generated tests x 1,500 examples
   - formal seed: 2026080601
@@ -19,19 +20,36 @@ Completed:
   - journal/queue fail-closed scenarios: 6 passed
   - editable install in isolated Python 3.12 environment: PASS
   - quote recorder storage/Parquet/health/hash tests: PASS
+  - read-only Gateway handshake on 127.0.0.1:4002: PASS
+  - server time and SPY conId 756733 qualification: PASS
+  - three sequential positions/open-orders/executions snapshots: two stable pairs observed
+      counts per round: positions 22 / open orders 3 / executions 0
+  - SPY API LIVE entitlement: FAIL, IB error 10089 (delayed data only)
+  - recorder entitlement failure behavior: PASS
+      fail-fast 1.6 seconds / exit code 2 / reconnect count 0
+      append-only raw + Parquet + health + manifest emitted
+      health recorded fatal 10089 and intentional close did not increment disconnects
 
 Formal evidence (ignored, reproducible runtime artifact):
+  The 1,500-example campaign identifies the committed Phase 0 baseline before
+  the 2026-08-07 recorder-only integration fixes. Current-worktree regression
+  is recorded separately above; rerun the formal campaign before a new B1 sign-off.
   artifacts/gate_b1/20260806T142435Z/manifest.json
   deterministic.txt  30e27af7ad972ca05f2a2ca91616214f8077a2f13d2b7d6acb151ae502d1f72a
   deterministic.xml  4a1236469dedf6b7732775698a006aee39363892ce353d8e0a05d2b9559d7985
   property_gate.txt  3329a8dc9f01470d9ca42e7240691a3a215f4471920d3ffcd769f2dc73ee589e
   property_gate.xml  5a48458a723ed99d7d070f2a2b0f22b6c8a433022fbe52afe0116d5afca3c609
 
+Read-only IB evidence (ignored runtime artifacts):
+  artifacts/ib_preflight/20260806T163601Z/report.json
+      e5eea737adadaa0f4ec88355778b45588327d5206bbd3316c5948e468a98c9e1
+  artifacts/recorder_live_preflight_final/2026-08-06/manifest.json
+      e9065db25273ab675b2ad0493966b17dd2f6799cfd535b0fd5864bcb33ad34f6
+
 Not completed / not claimed:
   - execution-engine host exit-code/supervisor integration after fatal journal failure
   - OS/volume-level real disk-full and real WAL-corruption drill
   - formal reviewer sign-off for Gate B1
-  - no IB Gateway/TWS listener was present on ports 4002/7497
-  - no live SPY market-data entitlement or Full-RTH recorder session was observed
+  - no live SPY market-data entitlement or successful Full-RTH recorder session was observed
   - no IB trading adapter Paper or Live connection was attempted
-  - Gate B2 stable-snapshot/documented-vs-observed protocol is not run
+  - Gate B2 dynamic stable-snapshot/documented-vs-observed protocol is not complete

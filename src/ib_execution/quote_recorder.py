@@ -2,8 +2,8 @@
 Read-only market data recorder.
 
     ####################################################################
-    #  STATUS: UNVERIFIED skeleton. Storage layer and daily health     #
-    #  report are implemented and tested; the IB subscription is not.  #
+    #  STATUS: READ-ONLY API HANDSHAKE VERIFIED. Full-RTH capture is   #
+    #  blocked until the account has SPY API live-data entitlement.    #
     ####################################################################
 
 WHY THIS IS WEEK 0 AND NOT LATER
@@ -197,6 +197,7 @@ class DailyHealth:
     stream_rows: Optional[dict[str, int]] = None
     file_hashes: Optional[dict[str, str]] = None
     required_streams: tuple[str, ...] = ()
+    fatal_errors: Optional[list[str]] = None
 
     def problems(self) -> list[str]:
         out = []
@@ -210,6 +211,8 @@ class DailyHealth:
             out.append(f"clock skew {self.clock_skew_seconds:.2f}s")
         if self.events == 0:
             out.append("no events recorded")
+        if self.fatal_errors:
+            out.extend(f"fatal recorder error: {error}" for error in self.fatal_errors)
         if self.stream_rows is not None and self.required_streams:
             missing = [s for s in self.required_streams if not self.stream_rows.get(s)]
             if missing:
@@ -233,6 +236,7 @@ def compute_health(
     stamps: list[int] = []
     streams_seen: set[str] = set()
     stream_rows: dict[str, int] = {}
+    fatal_errors: list[str] = []
     for row in log.read_all():
         events += 1
         event_type = row.get("event_type")
@@ -242,6 +246,8 @@ def compute_health(
             condition = str(row.get("special_conditions") or "").upper()
             if any(token in condition for token in ("DISCONNECT", "1100", "1101")):
                 disconnects += 1
+            if condition.startswith("RECORDER_ERROR:"):
+                fatal_errors.append(str(row.get("special_conditions")))
             continue
         streams_seen.add(str(event_type))
         stream_rows[str(event_type)] = stream_rows.get(str(event_type), 0) + 1
@@ -271,6 +277,7 @@ def compute_health(
         disconnects=disconnects,
         stream_rows=stream_rows,
         required_streams=required_streams,
+        fatal_errors=fatal_errors,
     )
     missing = sorted(set(required_streams) - streams_seen)
     if missing:
@@ -356,6 +363,10 @@ class SubscriptionLimiter:
             sleeper(max(0.01, (1 - self.tokens) / self.rate))
 
 
+class RecorderPrerequisiteError(RuntimeError):
+    """A configuration/entitlement defect that reconnecting cannot repair."""
+
+
 @dataclass(frozen=True)
 class RecorderConfig:
     root: Path
@@ -371,7 +382,7 @@ class RecorderConfig:
 
 class QuoteRecorder:
     """
-    UNVERIFIED. Subscribes read-only and writes RawTicks.
+    Subscribes read-only and writes RawTicks.
 
     Subscribe to all three, deliberately:
       tick-by-tick BidAsk   -> quoted spread, arrival benchmark
@@ -399,8 +410,18 @@ class QuoteRecorder:
         self._market_data_type = "UNKNOWN"
         self._clock_skew_seconds = math.nan
         self._resubscribe = False
+        self._fatal_prerequisite_error: Optional[str] = None
+        self._intentional_disconnect = False
         self._limiter = SubscriptionLimiter()
         self._ticker_types = None
+
+    @staticmethod
+    def _is_fatal_market_data_error(code: int, message: str) -> bool:
+        """Recognize entitlement failures across IB's localized messages."""
+        if code in {354, 10089, 10189}:
+            return True
+        text = message.casefold()
+        return code == 420 and "market data permissions" in text
 
     def _append(self, event_type: str, broker_ts: datetime | str, **values: Any) -> None:
         if self.log is None:
@@ -480,7 +501,11 @@ class QuoteRecorder:
         probe.marketDataType = 0  # distinguish an actual callback from ib_async's default
         deadline = time.monotonic() + 10.0
         while int(probe.marketDataType) == 0 and time.monotonic() < deadline:
+            if self._fatal_prerequisite_error:
+                raise RecorderPrerequisiteError(self._fatal_prerequisite_error)
             ib.sleep(0.10)
+        if self._fatal_prerequisite_error:
+            raise RecorderPrerequisiteError(self._fatal_prerequisite_error)
         observed = int(probe.marketDataType)
         self._market_data_type = self.DATA_TYPE.get(observed, f"UNKNOWN:{observed}")
         self._append(
@@ -510,6 +535,8 @@ class QuoteRecorder:
         session = None
         while attempts <= cfg.max_reconnects:
             ib = IB()
+            self._fatal_prerequisite_error = None
+            self._intentional_disconnect = False
             try:
                 ib.connect(
                     cfg.host, cfg.port, clientId=cfg.client_id, timeout=10,
@@ -544,11 +571,19 @@ class QuoteRecorder:
                     )
                     if code in {1101, 10225}:
                         self._resubscribe = True
+                    if self._is_fatal_market_data_error(code, message):
+                        self._fatal_prerequisite_error = (
+                            f"IB market-data prerequisite failed ({code}): {message}"
+                        )
 
                 def on_disconnect():
                     self._append(
                         "SYSTEM", datetime.now(timezone.utc), contract_id=contract.conId,
-                        special_conditions="DISCONNECT",
+                        special_conditions=(
+                            "CONNECTION_CLOSED_INTENTIONAL"
+                            if self._intentional_disconnect
+                            else "DISCONNECT"
+                        ),
                     )
 
                 ib.errorEvent += on_error
@@ -595,6 +630,7 @@ class QuoteRecorder:
                 ib.cancelTickByTickData(contract, "AllLast")
                 ib.cancelRealTimeBars(bars)
                 ib.cancelMktData(contract)
+                self._intentional_disconnect = True
                 ib.disconnect()
                 assert self.log is not None and session is not None
                 return finalize_day(
@@ -602,12 +638,28 @@ class QuoteRecorder:
                     session_seconds=(session.end - session.start).total_seconds(),
                     clock_skew_seconds=self._clock_skew_seconds,
                 )
+            except RecorderPrerequisiteError as exc:
+                self._append(
+                    "SYSTEM", datetime.now(timezone.utc),
+                    special_conditions=f"RECORDER_ERROR:{type(exc).__name__}:{exc}",
+                )
+                if ib.isConnected():
+                    self._intentional_disconnect = True
+                    ib.disconnect()
+                if self.log is not None and session is not None:
+                    return finalize_day(
+                        self.log,
+                        session_seconds=(session.end - session.start).total_seconds(),
+                        clock_skew_seconds=self._clock_skew_seconds,
+                    )
+                raise
             except Exception as exc:
                 self._append(
                     "SYSTEM", datetime.now(timezone.utc),
                     special_conditions=f"RECORDER_ERROR:{type(exc).__name__}:{exc}",
                 )
                 if ib.isConnected():
+                    self._intentional_disconnect = True
                     ib.disconnect()
                 attempts += 1
                 if attempts > cfg.max_reconnects:

@@ -309,15 +309,16 @@ Modeled size/capacity costs
 ## 12. 当前代码状态
 
 ```text
-138 non-property tests PASS (Python 3.12.13)
+144 non-property tests PASS (Python 3.12.13)
 5 Hypothesis tests default 100-example profile PASS
 Gate profile: 2 generated tests x 1,500 examples PASS (seed 2026080601)
 7 subprocess force-kill crash windows PASS
 6 journal/queue fail-closed scenarios PASS
-read-only Recorder implemented and locally tested; no Gateway session observed
+read-only Gateway handshake and static three-round snapshot observed
+SPY API live-data entitlement blocked by IB 10089; no Full-RTH session passed
 Gate B1 NOT PASSED
 DO NOT CONNECT THE TRADING ADAPTER TO IB PAPER OR LIVE YET
-READ-ONLY RECORDER MAY CONNECT AFTER RECORDER PREFLIGHT
+READ-ONLY RECORDER PREFLIGHT MAY CONNECT; FULL-RTH REQUIRES LIVE ENTITLEMENT
 ```
 
 当前包的正确用途：继续 Phase 0 的证据补全。错误用途：因为测试全绿就开始接 Gateway。

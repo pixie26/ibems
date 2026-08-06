@@ -16,6 +16,7 @@ import pytest
 from ib_execution.emergency_flatten import FlattenPlan, build_plan_from_snapshot, confirm
 from ib_execution.models import BrokerOrder, BrokerSnapshot, Side
 from ib_execution.quote_recorder import (
+    QuoteRecorder,
     RawEventLog,
     RawTick,
     SubscriptionLimiter,
@@ -265,6 +266,41 @@ def test_system_events_cannot_mask_market_data_gap(tmp_path):
     assert not h.ok()
 
 
+def test_health_surfaces_fatal_recorder_error(tmp_path):
+    log = RawEventLog(tmp_path, session=date(2026, 8, 5))
+    event = _tick(0, 0)
+    log.append(
+        RawTick(
+            **{
+                **event.__dict__,
+                "event_type": "SYSTEM",
+                "special_conditions": "RECORDER_ERROR:RecorderPrerequisiteError:10089",
+            }
+        ),
+        now_mono=0,
+    )
+    log.close()
+    health = compute_health(log, session_seconds=1.0)
+    assert any("10089" in problem for problem in health.problems())
+
+
+def test_health_does_not_count_intentional_close_as_disconnect(tmp_path):
+    log = RawEventLog(tmp_path, session=date(2026, 8, 5))
+    event = _tick(0, 0)
+    log.append(
+        RawTick(
+            **{
+                **event.__dict__,
+                "event_type": "SYSTEM",
+                "special_conditions": "CONNECTION_CLOSED_INTENTIONAL",
+            }
+        ),
+        now_mono=0,
+    )
+    log.close()
+    assert compute_health(log, session_seconds=1.0).disconnects == 0
+
+
 def test_same_day_recorder_restarts_use_unique_segment_names(tmp_path):
     d = date(2026, 8, 5)
     a = RawEventLog(tmp_path, session=d)
@@ -322,3 +358,15 @@ def test_subscription_limiter_waits_when_bucket_is_empty():
     sleeps: list[float] = []
     limiter.wait(lambda delay: (sleeps.append(delay), time.sleep(delay)))
     assert sleeps and sleeps[0] > 0
+
+
+@pytest.mark.parametrize("code", [354, 10089, 10189])
+def test_recorder_classifies_entitlement_errors_as_non_retryable(code):
+    assert QuoteRecorder._is_fatal_market_data_error(code, "localized message")
+
+
+def test_recorder_classifies_permission_specific_realtime_bar_error_as_non_retryable():
+    assert QuoteRecorder._is_fatal_market_data_error(
+        420, "No market data permissions for AMEX STK"
+    )
+    assert not QuoteRecorder._is_fatal_market_data_error(420, "generic pacing error")

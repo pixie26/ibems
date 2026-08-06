@@ -50,14 +50,14 @@
 
 ## 当前不能声称完成的事项
 
-- 本机当前没有 4002/7497 Gateway/TWS listener，也没有 `config/paper.yml`，因此 Recorder 代码已可运行但尚未产生真实 SPY RTH 数据；
-- 没有真实 IB 会话就不能做 B2 stable snapshot、market-data entitlement 或 1101/1102 observed matrix；
+- 2026-08-07 已在 4002 完成 broker-write-free Gateway 握手；SPY 合约与 server time 正常，但 IB `10089` 明确显示缺少 `SPY ARCA/TOP/ALL` API LIVE entitlement，因此尚未产生真实 SPY RTH 数据；
+- positions、all-open-orders、executions 已做三轮顺序读取并观察到两对 canonical hash 相等；该结果只覆盖静态时段，不覆盖成交并发、重连、1101/1102 或 late callback，不能据此判定 B2 stable snapshot 已通过；
 - Gate A 应在策略研究仓库独立完成，本仓库只保存经济 Gate 的接口和晋级规则，不复制策略研究代码或结果；
 - 正式 Gate profile 已通过并保存：两个生成测试各 1,500 examples、seed `2026080601`、source-tree hash 与 artifact hashes 复核一致；Gate B1 仍按 `docs/INVARIANT_COVERAGE.md` 的其余条件保持未通过。
 
 ## 下一步顺序
 
-1. 配置独立 paper Gateway/username、Read-Only API、实时 SPY entitlement；在 RTH 前启动 Recorder，连续检查首日健康报告。
+1. 为当前或独立 recorder paper 会话开通 SPY API 实时行情权限；再次运行 `scripts/run_ib_readonly_preflight.py`，三路 sample 非零后再启动 Full-RTH Recorder。
 2. 保留已完成的 1,500-example Gate campaign；随后做 OS/卷级 disk-full 与宿主进程退出演练。
 3. Gate A 独立给出 `GO_TO_DATA_VALIDATION / NO_GO / INSUFFICIENT_EVIDENCE`。
 4. 只有 B1 正式签字、且 Gate A/第二消费者支持继续投入时，才进入 B2 的只连接/只读 snapshot protocol；最后才做人为 1 股 target/cancel。
