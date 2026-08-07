@@ -4,6 +4,24 @@ This script deliberately has no order placement/cancellation path.  It verifies
 the API handshake, reads three account-truth streams repeatedly, and probes the
 SPY market-data entitlement.  Raw account identifiers and positions never enter
 the report; only counts and canonical hashes are persisted.
+
+TICKS ARE COUNTED AS THEY ARRIVE
+--------------------------------
+The 2026-08-07 run of this script slept for twenty seconds and then read
+``Ticker.tickByTicks``.  ib_async clears that buffer between network updates,
+so what it actually measured was "ticks in the final flush", not "ticks during
+the window".  It reported ``AllLast=0`` and that number was mistaken for
+evidence that IB was not delivering trades.  It was not evidence of anything.
+``bars_5s`` was correct in the same run only by accident: ``reqRealTimeBars``
+returns a ``RealTimeBarList``, which accumulates.
+
+Counting now happens in event handlers, and inter-arrival statistics are
+reported alongside the totals so a low count can be distinguished from a dead
+subscription without running the script again.
+
+Note what this still cannot tell you: ``reqRealTimeBars`` and
+``reqTickByTickData`` are different request paths, so a healthy bar stream is
+not evidence about the tick stream.  Each stream is reported on its own terms.
 """
 
 from __future__ import annotations
@@ -12,6 +30,7 @@ import argparse
 import hashlib
 import json
 import platform
+import statistics
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,8 +39,64 @@ from typing import Any
 from ib_async import IB, StartupFetchNONE, Stock
 from ib_async.objects import TickByTickAllLast, TickByTickBidAsk
 
+# 10197 ("no market data during competing session") is fatal for the same
+# reason as the entitlement codes: a live and a paper login contending for one
+# subscription is fixed by a human closing one, never by retrying.
+ENTITLEMENT_CODES = {354, 10089, 10189, 10197}
 
-ENTITLEMENT_CODES = {354, 10089, 10189}
+# The health verdict uses a median because IB's server clock is quantized to
+# whole seconds and a single sample cannot separate drift from quantization.
+CLOCK_SKEW_SAMPLES = 7
+MAX_MEDIAN_CLOCK_SKEW_SECONDS = 2.0
+
+
+class StreamCounter:
+    """Accumulates arrivals for one stream, and enough to explain a low count."""
+
+    def __init__(self, name: str):
+        self.name = name
+        self.count = 0
+        self.first_mono: float | None = None
+        self.last_mono: float | None = None
+        self._gaps: list[float] = []
+
+    def record(self, now_mono: float | None = None) -> None:
+        now = time.monotonic() if now_mono is None else now_mono
+        self.count += 1
+        if self.first_mono is None:
+            self.first_mono = now
+        else:
+            assert self.last_mono is not None
+            self._gaps.append(now - self.last_mono)
+        self.last_mono = now
+
+    def report(self, window_seconds: float) -> dict[str, Any]:
+        ordered = sorted(self._gaps)
+        return {
+            "count": self.count,
+            "per_second": (self.count / window_seconds) if window_seconds else 0.0,
+            "first_offset_seconds": self.first_mono,
+            "last_offset_seconds": self.last_mono,
+            "max_inter_arrival_seconds": max(ordered) if ordered else None,
+            "median_inter_arrival_seconds": statistics.median(ordered) if ordered else None,
+        }
+
+
+def measure_clock_skew(ib: IB, samples: int = CLOCK_SKEW_SAMPLES) -> list[float]:
+    """Round-trip-compensated skew samples; see quote_recorder.measure_clock_skew."""
+    out: list[float] = []
+    for index in range(samples):
+        t0 = time.time()
+        server = ib.reqCurrentTime()
+        t1 = time.time()
+        if server is None:
+            continue
+        if server.tzinfo is None:
+            server = server.replace(tzinfo=timezone.utc)
+        out.append(((t0 + t1) / 2.0) - server.timestamp())
+        if index + 1 < samples:
+            ib.sleep(0.2)
+    return out
 
 
 def _digest(value: Any) -> str:
@@ -111,7 +186,7 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     ib = IB()
     errors: list[dict[str, Any]] = []
     report: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "started_utc": datetime.now(timezone.utc).isoformat(),
         "host": args.host,
         "port": args.port,
@@ -143,13 +218,22 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             fetchFields=StartupFetchNONE,
         )
         server_time = ib.reqCurrentTime().astimezone(timezone.utc)
+        skew_samples = measure_clock_skew(ib)
+        skew_median = statistics.median(skew_samples) if skew_samples else float("nan")
         report["connection"] = {
             "connected": ib.isConnected(),
             "server_version": ib.client.serverVersion(),
             "server_time_utc": server_time.isoformat(),
-            "clock_skew_seconds": (
-                datetime.now(timezone.utc) - server_time
-            ).total_seconds(),
+            "clock_skew": {
+                "samples": len(skew_samples),
+                "median_seconds": skew_median,
+                "max_abs_seconds": max((abs(v) for v in skew_samples), default=None),
+                "raw_seconds": skew_samples,
+                "note": (
+                    "round-trip compensated; IB's server clock is quantized to whole "
+                    "seconds, so a single sample cannot separate drift from quantization"
+                ),
+            },
             "account_count": len(ib.managedAccounts()),
         }
 
@@ -201,31 +285,66 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 break
             ib.sleep(0.1)
         market_type = int(probe.marketDataType)
-        sample_counts = {"bid_ask": 0, "all_last": 0, "bars_5s": 0}
+        counters = {
+            name: StreamCounter(name) for name in ("bid_ask", "all_last", "bars_5s")
+        }
+        window = 0.0
         if market_type == 1:
+            # Each request's Ticker handle is kept explicitly. ib_async returns
+            # one Ticker per contract object today, so these are currently the
+            # same object -- which is exactly why the handler is attached once
+            # per distinct object rather than once per request: two handlers on
+            # one buffer would double-count every tick.
             bidask = ib.reqTickByTickData(contract, "BidAsk", 0, False)
             alllast = ib.reqTickByTickData(contract, "AllLast", 0, False)
             bars = ib.reqRealTimeBars(contract, 5, "TRADES", True)
+
             started = time.monotonic()
+
+            def on_ticker_update(ticker) -> None:
+                for tick in ticker.tickByTicks:
+                    if isinstance(tick, TickByTickBidAsk):
+                        counters["bid_ask"].record(time.monotonic() - started)
+                    elif isinstance(tick, TickByTickAllLast):
+                        counters["all_last"].record(time.monotonic() - started)
+
+            def on_bar(updated, has_new_bar) -> None:
+                if has_new_bar:
+                    counters["bars_5s"].record(time.monotonic() - started)
+
+            for ticker in {id(t): t for t in (bidask, alllast)}.values():
+                ticker.updateEvent += on_ticker_update
+            bars.updateEvent += on_bar
+
             while time.monotonic() - started < args.sample_seconds:
+                if any(_fatal_entitlement_error(error) for error in errors):
+                    break
                 ib.sleep(0.25)
-            unique_ticks = {
-                id(tick): tick for tick in [*bidask.tickByTicks, *alllast.tickByTicks]
-            }.values()
-            sample_counts = {
-                "bid_ask": sum(isinstance(tick, TickByTickBidAsk) for tick in unique_ticks),
-                "all_last": sum(isinstance(tick, TickByTickAllLast) for tick in unique_ticks),
-                "bars_5s": len(bars),
-            }
+            window = time.monotonic() - started
+
+        samples = {name: counter.report(window) for name, counter in counters.items()}
+        sample_counts = {name: counter.count for name, counter in counters.items()}
         report["market_data"] = {
             "market_data_type": market_type,
             "live": market_type == 1,
-            "sample_seconds": args.sample_seconds if market_type == 1 else 0,
+            "sample_seconds": window,
             "sample_counts": sample_counts,
+            "samples": samples,
+            "measurement": (
+                "counted in updateEvent handlers as ticks arrive; Ticker.tickByTicks "
+                "is a per-update buffer and is never polled"
+            ),
             "entitlement_blocked": any(_fatal_entitlement_error(error) for error in errors),
         }
         report["errors"] = errors
-        report["passed"] = stable and market_type == 1 and all(sample_counts.values())
+        clock_ok = bool(skew_samples) and abs(skew_median) <= MAX_MEDIAN_CLOCK_SKEW_SECONDS
+        report["checks"] = {
+            "stable_snapshot": stable,
+            "live_market_data": market_type == 1,
+            "all_streams_nonzero": all(sample_counts.values()),
+            "clock_skew_within_threshold": clock_ok,
+        }
+        report["passed"] = all(report["checks"].values())
         return report, 0 if report["passed"] else 2
     finally:
         if ib.isConnected():
@@ -250,7 +369,7 @@ def main() -> int:
     parser.add_argument("--snapshot-rounds", type=int, default=3)
     parser.add_argument("--snapshot-interval", type=float, default=1.0)
     parser.add_argument("--market-data-timeout", type=float, default=10.0)
-    parser.add_argument("--sample-seconds", type=float, default=20.0)
+    parser.add_argument("--sample-seconds", type=float, default=90.0)
     parser.add_argument("--output")
     args = parser.parse_args()
     if args.snapshot_rounds < 2:

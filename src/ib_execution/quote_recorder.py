@@ -2,8 +2,11 @@
 Read-only market data recorder.
 
     ####################################################################
-    #  STATUS: READ-ONLY API HANDSHAKE VERIFIED. Full-RTH capture is   #
-    #  blocked until the account has SPY API live-data entitlement.    #
+    #  STATUS: READ-ONLY API HANDSHAKE VERIFIED. No qualifying         #
+    #  Full-RTH session has been captured yet. Live entitlement was    #
+    #  confirmed on 2026-08-07 (marketDataType=1); the AllLast         #
+    #  subscription path has no valid observation yet -- see           #
+    #  "MEASUREMENT" below.                                            #
     ####################################################################
 
 WHY THIS IS WEEK 0 AND NOT LATER
@@ -25,22 +28,63 @@ Gateway with the execution engine only if that Gateway is separate from the
 trading one, or it gets its own token bucket and bounded backoff. A recorder
 crash-looping its subscriptions can trip pacing limits and take the Gateway
 down underneath the execution engine. See ADR-005.
+
+MEASUREMENT
+-----------
+A recorder that cannot measure itself is not evidence, it is a hope. Two
+lessons are built into this file because both were learned the expensive way
+on 2026-08-07:
+
+1.  ``Ticker.tickByTicks`` is a per-update buffer that ib_async clears between
+    network updates. Sleeping and then reading it counts "whatever arrived in
+    the last flush", not "what arrived during the window". The preflight did
+    exactly that and reported ``AllLast=0``; that number was never evidence
+    about the subscription. Ticks are consumed in an event handler here, and
+    nowhere is a tick buffer polled.
+
+2.  ``datetime.now() - reqCurrentTime()`` measures skew plus one round trip,
+    against a server clock with one-second granularity. A single sample of it
+    decided a whole day's health verdict. Skew is now a round-trip-compensated
+    median over many samples, and the distribution is reported, because
+    failing a tail day on quantization noise is unrecoverable.
+
+The 5-second TRADES stream exists as an independent checksum against the
+tick-by-tick trade stream, and that comparison is now actually computed --
+see ``CrossStreamDiagnostics``. It reports distributions and does not judge:
+the transform between the two streams (units, trade-condition filtering) is
+an IB behaviour that has to be measured before it can be asserted, and a
+validator built on an assumed constant would be worse than none.
 """
 
 from __future__ import annotations
 
+import argparse
 import gzip
 import hashlib
 import json
-import os
-import argparse
 import math
+import os
+import statistics
 import time
-from dataclasses import asdict, dataclass
-from datetime import date, datetime, timezone
+from dataclasses import asdict, dataclass, field, fields
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterator, Optional
+from typing import Any, Callable, Iterable, Iterator, Optional
 from uuid import uuid4
+
+from .processlock import ProcessLock, ProcessLockUnavailable
+
+# Market-data failures that reconnecting cannot repair. 10197 belongs here and
+# was missing: "no market data during competing session" is what a live and a
+# paper login contending for one live subscription looks like, and retrying it
+# just produces the same error at a slower rate.
+FATAL_MARKET_DATA_CODES = frozenset({354, 10089, 10189, 10197})
+
+MARKET_STREAMS = ("BID_ASK", "ALL_LAST", "BAR_5S")
+
+# Per-stream gap thresholds. One number cannot serve all three: 5-second bars
+# arrive on a fixed cadence, quotes arrive continuously, prints do not.
+DEFAULT_GAP_THRESHOLDS = {"BID_ASK": 5.0, "ALL_LAST": 30.0, "BAR_5S": 15.0}
 
 
 @dataclass(frozen=True)
@@ -51,9 +95,16 @@ class RawTick:
     Both timestamps are mandatory. Later we must be able to separate "when the
     market did something" from "when we found out", and that distinction is
     unrecoverable if only one is stored.
+
+    Row identity is ``(session, recorder_run_id, receive_sequence)``.
+    ``event_id`` alone is not an identity: it restarts at 1 in every process,
+    and ``finalize_day`` folds every run of a given session into one Parquet
+    file, so a same-day restart used to produce two rows claiming to be the
+    same event.
     """
 
     event_id: int
+    recorder_run_id: str
     connection_epoch: int
     contract_id: int
     event_type: str                  # BID_ASK | ALL_LAST | BAR_5S | SYSTEM
@@ -79,18 +130,75 @@ class RawTick:
     trade_count: Optional[int] = None
 
 
+# Column types are declared, never inferred. pyarrow infers a `null`-typed
+# column when every value in a day is None, so the first day whose AllLast
+# stream dies produces a Parquet file that will not concatenate with any other
+# day -- the failure corrupts the shape of the archive, not just that day's
+# completeness, and multi-day concatenation is precisely what L2/L3 needs.
+PARQUET_FIELD_TYPES: dict[str, str] = {
+    "event_id": "int64",
+    "recorder_run_id": "string",
+    "connection_epoch": "int64",
+    "contract_id": "int64",
+    "event_type": "string",
+    "broker_timestamp": "string",
+    "local_wall_ns": "int64",
+    "local_monotonic_ns": "int64",
+    "market_data_type": "string",
+    "receive_sequence": "int64",
+    "bid": "float64",
+    "ask": "float64",
+    "bid_size": "float64",
+    "ask_size": "float64",
+    "last": "float64",
+    "last_size": "float64",
+    "exchange": "string",
+    "special_conditions": "string",
+    "open": "float64",
+    "high": "float64",
+    "low": "float64",
+    "close": "float64",
+    "volume": "float64",
+    "wap": "float64",
+    "trade_count": "int64",
+}
+
+
+def parquet_schema():
+    """The explicit Arrow schema. Import-time-free so core tests need no pyarrow."""
+    import pyarrow as pa
+
+    mapping = {"int64": pa.int64(), "float64": pa.float64(), "string": pa.string()}
+    declared = [f.name for f in fields(RawTick)]
+    missing = [name for name in declared if name not in PARQUET_FIELD_TYPES]
+    extra = [name for name in PARQUET_FIELD_TYPES if name not in declared]
+    if missing or extra:
+        raise RuntimeError(
+            f"PARQUET_FIELD_TYPES is out of sync with RawTick: missing={missing} extra={extra}"
+        )
+    return pa.schema([(name, mapping[PARQUET_FIELD_TYPES[name]]) for name in declared])
+
+
 class RawEventLog:
     """
-    Append-only rolling event log.
+    Append-only rolling event log for exactly one exchange session.
 
     Never hold one Parquet file open all session: a crash at 15:45 costs the
     whole day. Roll every few minutes, atomic-rename on completion, compact to
     Parquet after the close. Raw logs are never modified in place -- derived
     tables are built beside them, and the manifest records hashes.
+
+    A session directory is owned by one live process at a time. The lock is
+    not there to stop a same-day restart -- that is normal and supported, the
+    successor simply takes a new ``run_id`` and keeps recording the same
+    session. It is there because ``_recover_crashed_segments`` renames every
+    partial segment it can see, and without the lock a second recorder would
+    rename the file the first one is still writing to.
     """
 
     def __init__(self, root: str | Path, session: Optional[date] = None,
-                 roll_seconds: int = 300, sync_seconds: float = 1.0):
+                 roll_seconds: int = 300, sync_seconds: float = 1.0,
+                 run_id: Optional[str] = None, lock: bool = True):
         self.root = Path(root)
         self.session = session or datetime.now(timezone.utc).date()
         self.dir = self.root / self.session.isoformat()
@@ -104,11 +212,19 @@ class RawEventLog:
         self._count = 0
         self._last_sync: Optional[float] = None
         # A same-day process restart must not overwrite earlier segments.
-        self.run_id = uuid4().hex[:10]
+        self.run_id = run_id or uuid4().hex[:10]
+        self._lock: Optional[ProcessLock] = None
+        if lock:
+            self._lock = ProcessLock(self.dir / ".recorder.lock")
+            self._lock.acquire(note=f"session={self.session.isoformat()} run={self.run_id}")
         self._recover_crashed_segments()
 
     def _recover_crashed_segments(self) -> None:
-        """Preserve abruptly-terminated gzip streams for best-effort row salvage."""
+        """Preserve abruptly-terminated gzip streams for best-effort row salvage.
+
+        Only safe because the session lock is already held: every ``.partial-``
+        file visible here belongs to a process that is no longer running.
+        """
         for partial in sorted(self.dir.glob(".partial-*.jsonl.gz")):
             recovered = partial.with_name(partial.name.replace(".partial-", "crashed-"))
             os.replace(partial, recovered)
@@ -151,6 +267,9 @@ class RawEventLog:
 
     def close(self) -> None:
         self._close_segment()
+        if self._lock is not None:
+            self._lock.release()
+            self._lock = None
 
     def segments(self) -> list[Path]:
         return sorted(
@@ -177,6 +296,256 @@ class RawEventLog:
         return self._count
 
 
+# ----------------------------------------------------------------------------
+# health
+# ----------------------------------------------------------------------------
+
+
+@dataclass
+class StreamHealth:
+    """One row of the per-stream table.
+
+    Whole-session aggregates cannot express the failure that matters. Quotes
+    arrive orders of magnitude more often than prints, so a single pooled
+    ``max_gap`` is dominated by the quote stream and stays small even after
+    the trade stream has been dead for hours; a single pooled coverage number
+    is ~100% for the same reason. Every number here is per stream.
+    """
+
+    stream: str
+    rows: int
+    first_utc: Optional[str]
+    last_utc: Optional[str]
+    max_gap_seconds: float
+    gap_threshold_seconds: float
+    gaps_over_threshold: int
+    missing_seconds: float
+    coverage_fraction: float
+
+    def problems(self, min_coverage: float) -> list[str]:
+        if self.rows == 0:
+            return [f"{self.stream}: no rows"]
+        out = []
+        if self.coverage_fraction < min_coverage:
+            out.append(f"{self.stream}: coverage {self.coverage_fraction:.3%}")
+        if self.gaps_over_threshold:
+            out.append(
+                f"{self.stream}: {self.gaps_over_threshold} gaps over "
+                f"{self.gap_threshold_seconds:.0f}s, worst {self.max_gap_seconds:.0f}s"
+            )
+        return out
+
+
+def _stream_health(
+    stamps_ns: list[int],
+    stream: str,
+    session_open_ns: int,
+    session_close_ns: int,
+    gap_threshold: float,
+) -> StreamHealth:
+    """True coverage, anchored to the session window rather than to the data.
+
+    ``(last - first) / session_seconds`` -- what this used to compute -- is a
+    span, not a coverage: a recorder that ran 09:30 to 16:00 with a two-hour
+    hole in the middle scores ~100%. Missing time is measured against the
+    session boundaries, and an internal gap past the threshold counts in full
+    rather than only its excess, because a five-minute hole is five minutes of
+    missing market, not four and a half.
+    """
+    session_seconds = max((session_close_ns - session_open_ns) / 1e9, 0.0)
+    if not stamps_ns:
+        return StreamHealth(
+            stream=stream, rows=0, first_utc=None, last_utc=None,
+            max_gap_seconds=session_seconds, gap_threshold_seconds=gap_threshold,
+            gaps_over_threshold=1 if session_seconds else 0,
+            missing_seconds=session_seconds, coverage_fraction=0.0,
+        )
+
+    ordered = sorted(stamps_ns)
+    clipped = [min(max(ts, session_open_ns), session_close_ns) for ts in ordered]
+    opening_gap = max((clipped[0] - session_open_ns) / 1e9, 0.0)
+    closing_gap = max((session_close_ns - clipped[-1]) / 1e9, 0.0)
+
+    max_gap = 0.0
+    internal_missing = 0.0
+    over = 0
+    for a, b in zip(clipped, clipped[1:]):
+        gap = (b - a) / 1e9
+        max_gap = max(max_gap, gap)
+        if gap > gap_threshold:
+            over += 1
+            internal_missing += gap
+
+    if opening_gap > gap_threshold:
+        over += 1
+        max_gap = max(max_gap, opening_gap)
+    if closing_gap > gap_threshold:
+        over += 1
+        max_gap = max(max_gap, closing_gap)
+
+    missing = opening_gap + closing_gap + internal_missing
+    coverage = 1.0 - (missing / session_seconds) if session_seconds else 0.0
+    return StreamHealth(
+        stream=stream,
+        rows=len(ordered),
+        first_utc=datetime.fromtimestamp(ordered[0] / 1e9, timezone.utc).isoformat(),
+        last_utc=datetime.fromtimestamp(ordered[-1] / 1e9, timezone.utc).isoformat(),
+        max_gap_seconds=max_gap,
+        gap_threshold_seconds=gap_threshold,
+        gaps_over_threshold=over,
+        missing_seconds=missing,
+        coverage_fraction=max(0.0, min(1.0, coverage)),
+    )
+
+
+@dataclass
+class ClockSkew:
+    """Round-trip-compensated skew samples, reported as a distribution.
+
+    IB's server clock has one-second granularity, so a single uncompensated
+    sample cannot distinguish real drift from quantization. The health verdict
+    uses the median; the tails are recorded so a marginal day can be judged by
+    a human instead of by one unlucky reading taken at 15:59.
+    """
+
+    samples: int = 0
+    median_seconds: float = math.nan
+    p95_seconds: float = math.nan
+    max_abs_seconds: float = math.nan
+
+    @classmethod
+    def from_samples(cls, values: Iterable[float]) -> "ClockSkew":
+        data = [v for v in values if not math.isnan(v)]
+        if not data:
+            return cls()
+        ordered = sorted(data)
+        idx = min(len(ordered) - 1, int(round(0.95 * (len(ordered) - 1))))
+        return cls(
+            samples=len(ordered),
+            median_seconds=statistics.median(ordered),
+            p95_seconds=ordered[idx],
+            max_abs_seconds=max(abs(v) for v in ordered),
+        )
+
+
+@dataclass
+class CrossStreamDiagnostics:
+    """5-second TRADES bars measured against tick-by-tick AllLast.
+
+    OBSERVATION ONLY. This deliberately does not decide anything.
+
+    The two streams are not guaranteed to agree: their volume units and their
+    trade-condition filtering are IB behaviours, not documented constants, and
+    a validator built on an assumed transform (``bar.volume * 100``, say) can
+    be confidently wrong in both directions. So day one measures the ratio
+    distribution, and the transform and tolerance get frozen only once the
+    distribution has been seen. What is worth noticing immediately is the
+    shape: a stable mode means the streams agree up to a unit, and no mode at
+    all means they are filtering different trades.
+
+    Once calibrated this is a far stronger control than per-stream row counts,
+    because it catches dropped ticks, duplicated ticks and a silently dying
+    stream, none of which change a row count in any recognisable way.
+    """
+
+    bars: int = 0
+    bars_with_trades: int = 0
+    bars_with_volume_but_no_ticks: int = 0
+    bars_with_ticks_but_no_volume: int = 0
+    volume_ratio_median: Optional[float] = None
+    volume_ratio_p10: Optional[float] = None
+    volume_ratio_p90: Optional[float] = None
+    count_ratio_median: Optional[float] = None
+    price_containment_fraction: Optional[float] = None
+    calibrated: bool = False
+    note: str = (
+        "observation only; the bar/tick transform is unmeasured, so no "
+        "PASS/FAIL is derived from these numbers"
+    )
+
+
+def _quantile(ordered: list[float], q: float) -> float:
+    idx = min(len(ordered) - 1, max(0, int(round(q * (len(ordered) - 1)))))
+    return ordered[idx]
+
+
+def _parse_broker_ts(text: str) -> Optional[float]:
+    try:
+        parsed = datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def compute_cross_stream_diagnostics(
+    rows: Iterable[dict[str, Any]], bar_seconds: float = 5.0
+) -> CrossStreamDiagnostics:
+    bars: list[dict[str, Any]] = []
+    trades: list[tuple[float, float, float]] = []   # (ts, size, price)
+    for row in rows:
+        kind = row.get("event_type")
+        if kind == "BAR_5S":
+            ts = _parse_broker_ts(str(row.get("broker_timestamp", "")))
+            if ts is not None:
+                bars.append({"ts": ts, "row": row})
+        elif kind == "ALL_LAST":
+            ts = _parse_broker_ts(str(row.get("broker_timestamp", "")))
+            if ts is not None:
+                trades.append((ts, float(row.get("last_size") or 0.0), float(row.get("last") or 0.0)))
+
+    if not bars:
+        return CrossStreamDiagnostics()
+
+    trades.sort()
+    trade_ts = [t[0] for t in trades]
+    import bisect
+
+    diag = CrossStreamDiagnostics(bars=len(bars))
+    volume_ratios: list[float] = []
+    count_ratios: list[float] = []
+    contained = 0
+    considered = 0
+
+    for entry in sorted(bars, key=lambda b: b["ts"]):
+        start = entry["ts"]
+        row = entry["row"]
+        lo = bisect.bisect_left(trade_ts, start)
+        hi = bisect.bisect_left(trade_ts, start + bar_seconds)
+        bucket = trades[lo:hi]
+        bar_volume = float(row.get("volume") or 0.0)
+        bar_count = float(row.get("trade_count") or 0.0)
+        tick_volume = sum(size for _, size, _ in bucket)
+        if bucket:
+            diag.bars_with_trades += 1
+        if bar_volume > 0 and not bucket:
+            diag.bars_with_volume_but_no_ticks += 1
+        if bucket and bar_volume <= 0:
+            diag.bars_with_ticks_but_no_volume += 1
+        if tick_volume > 0 and bar_volume > 0:
+            volume_ratios.append(bar_volume / tick_volume)
+        if bucket and bar_count > 0:
+            count_ratios.append(bar_count / len(bucket))
+        low, high = row.get("low"), row.get("high")
+        if bucket and low is not None and high is not None:
+            for _, _, price in bucket:
+                considered += 1
+                if float(low) <= price <= float(high):
+                    contained += 1
+
+    if volume_ratios:
+        ordered = sorted(volume_ratios)
+        diag.volume_ratio_median = statistics.median(ordered)
+        diag.volume_ratio_p10 = _quantile(ordered, 0.10)
+        diag.volume_ratio_p90 = _quantile(ordered, 0.90)
+    if count_ratios:
+        diag.count_ratio_median = statistics.median(sorted(count_ratios))
+    if considered:
+        diag.price_containment_fraction = contained / considered
+    return diag
+
+
 @dataclass
 class DailyHealth:
     """
@@ -190,56 +559,85 @@ class DailyHealth:
     session: str
     events: int
     market_data_type: str
-    coverage_fraction: float
-    max_gap_seconds: float
-    clock_skew_seconds: float
+    clock_skew: ClockSkew
     disconnects: int
-    stream_rows: Optional[dict[str, int]] = None
+    recorder_run_ids: list[str] = field(default_factory=list)
+    streams: dict[str, StreamHealth] = field(default_factory=dict)
+    cross_stream: CrossStreamDiagnostics = field(default_factory=CrossStreamDiagnostics)
     file_hashes: Optional[dict[str, str]] = None
     required_streams: tuple[str, ...] = ()
     fatal_errors: Optional[list[str]] = None
+    min_coverage: float = 0.99
+    max_median_skew_seconds: float = 2.0
 
     def problems(self) -> list[str]:
         out = []
         if self.market_data_type != "LIVE":
             out.append(f"market_data_type is {self.market_data_type}, not LIVE")
-        if self.coverage_fraction < 0.99:
-            out.append(f"session coverage only {self.coverage_fraction:.3%}")
-        if self.max_gap_seconds > 30:
-            out.append(f"largest data gap {self.max_gap_seconds:.0f}s")
-        if abs(self.clock_skew_seconds) > 2:
-            out.append(f"clock skew {self.clock_skew_seconds:.2f}s")
         if self.events == 0:
             out.append("no events recorded")
+        skew = self.clock_skew.median_seconds
+        if math.isnan(skew):
+            out.append("clock skew was never measured")
+        elif abs(skew) > self.max_median_skew_seconds:
+            out.append(f"median clock skew {skew:.2f}s over {self.clock_skew.samples} samples")
+        for name in self.required_streams:
+            health = self.streams.get(name)
+            if health is None:
+                out.append(f"{name}: stream absent")
+            else:
+                out.extend(health.problems(self.min_coverage))
         if self.fatal_errors:
             out.extend(f"fatal recorder error: {error}" for error in self.fatal_errors)
-        if self.stream_rows is not None and self.required_streams:
-            missing = [s for s in self.required_streams if not self.stream_rows.get(s)]
-            if missing:
-                out.append(f"missing required streams: {','.join(missing)}")
         return out
 
     def ok(self) -> bool:
         return not self.problems()
 
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "session": self.session,
+            "events": self.events,
+            "market_data_type": self.market_data_type,
+            "clock_skew": asdict(self.clock_skew),
+            "disconnects": self.disconnects,
+            "recorder_run_ids": sorted(self.recorder_run_ids),
+            "streams": {name: asdict(h) for name, h in sorted(self.streams.items())},
+            "cross_stream": asdict(self.cross_stream),
+            "file_hashes": self.file_hashes,
+            "required_streams": list(self.required_streams),
+            "fatal_errors": self.fatal_errors or [],
+            "min_coverage": self.min_coverage,
+            "max_median_skew_seconds": self.max_median_skew_seconds,
+            "problems": self.problems(),
+            "ok": self.ok(),
+        }
+
 
 def compute_health(
     log: RawEventLog,
-    session_seconds: float,
-    clock_skew_seconds: float = 0.0,
-    required_streams: tuple[str, ...] = (),
+    session_open: datetime,
+    session_close: datetime,
+    clock_skew_samples: Iterable[float] = (),
+    required_streams: tuple[str, ...] = MARKET_STREAMS,
+    gap_thresholds: Optional[dict[str, float]] = None,
 ) -> DailyHealth:
     """Compute health from market events only; SYSTEM heartbeats cannot mask gaps."""
+    thresholds = {**DEFAULT_GAP_THRESHOLDS, **(gap_thresholds or {})}
     events = 0
     disconnects = 0
     data_types: set[str] = set()
-    stamps: list[int] = []
-    streams_seen: set[str] = set()
-    stream_rows: dict[str, int] = {}
     fatal_errors: list[str] = []
+    run_ids: set[str] = set()
+    per_stream: dict[str, list[int]] = {name: [] for name in required_streams}
+    rows: list[dict[str, Any]] = []
+
     for row in log.read_all():
         events += 1
-        event_type = row.get("event_type")
+        run_id = row.get("recorder_run_id")
+        if run_id:
+            run_ids.add(str(run_id))
+        event_type = str(row.get("event_type"))
         if event_type == "SYSTEM":
             # Only explicit disconnect-like system events count. Generic
             # heartbeat rows must not fabricate availability.
@@ -249,16 +647,9 @@ def compute_health(
             if condition.startswith("RECORDER_ERROR:"):
                 fatal_errors.append(str(row.get("special_conditions")))
             continue
-        streams_seen.add(str(event_type))
-        stream_rows[str(event_type)] = stream_rows.get(str(event_type), 0) + 1
+        rows.append(row)
+        per_stream.setdefault(event_type, []).append(int(row["local_wall_ns"]))
         data_types.add(str(row.get("market_data_type", "UNKNOWN")))
-        stamps.append(int(row["local_wall_ns"]))
-
-    stamps.sort()
-    max_gap = 0.0
-    for a, b in zip(stamps, stamps[1:]):
-        max_gap = max(max_gap, (b - a) / 1e9)
-    covered = ((stamps[-1] - stamps[0]) / 1e9) if len(stamps) >= 2 else 0.0
 
     if data_types == {"LIVE"}:
         mdt = "LIVE"
@@ -267,24 +658,27 @@ def compute_health(
     else:
         mdt = "MIXED:" + ",".join(sorted(data_types))
 
-    health = DailyHealth(
+    open_ns = int(session_open.timestamp() * 1e9)
+    close_ns = int(session_close.timestamp() * 1e9)
+    streams = {
+        name: _stream_health(
+            stamps, name, open_ns, close_ns, thresholds.get(name, 30.0)
+        )
+        for name, stamps in per_stream.items()
+    }
+
+    return DailyHealth(
         session=log.session.isoformat(),
         events=events,
         market_data_type=mdt,
-        coverage_fraction=(covered / session_seconds) if session_seconds else 0.0,
-        max_gap_seconds=max_gap,
-        clock_skew_seconds=clock_skew_seconds,
+        clock_skew=ClockSkew.from_samples(clock_skew_samples),
         disconnects=disconnects,
-        stream_rows=stream_rows,
+        recorder_run_ids=sorted(run_ids),
+        streams=streams,
+        cross_stream=compute_cross_stream_diagnostics(rows),
         required_streams=required_streams,
         fatal_errors=fatal_errors,
     )
-    missing = sorted(set(required_streams) - streams_seen)
-    if missing:
-        # Preserve the compact public dataclass while making the failure visible
-        # through a non-LIVE status that DailyHealth.problems already rejects.
-        health.market_data_type = f"MISSING_STREAMS:{','.join(missing)}"
-    return health
 
 
 def _sha256(path: Path) -> str:
@@ -295,13 +689,24 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+class ParquetVerificationError(RuntimeError):
+    """The Parquet file on disk does not match the rows we meant to write."""
+
+
 def finalize_day(
     log: RawEventLog,
     *,
-    session_seconds: float,
-    clock_skew_seconds: float,
+    session_open: datetime,
+    session_close: datetime,
+    clock_skew_samples: Iterable[float] = (),
 ) -> dict[str, Any]:
-    """Close raw capture, write atomic Parquet, health JSON and a hash manifest."""
+    """Close raw capture, write atomic Parquet, health JSON and a hash manifest.
+
+    Reads every segment in the session directory, including ones written by an
+    earlier run of the same day. That is intended -- one session is one Parquet
+    file -- and it is only correct because ``recorder_run_id`` makes rows from
+    different runs distinguishable.
+    """
     log.close()
     rows = list(log.read_all())
     parquet = log.dir / "events.parquet"
@@ -311,27 +716,44 @@ def finalize_day(
         import pyarrow.parquet as pq
     except ImportError as exc:  # pragma: no cover - packaging/preflight failure
         raise RuntimeError("pyarrow is required to finalize recorder output") from exc
-    table = pa.Table.from_pylist(rows)
+
+    schema = parquet_schema()
+    table = pa.Table.from_pylist(rows, schema=schema)
     pq.write_table(table, parquet_tmp, compression="zstd")
     os.replace(parquet_tmp, parquet)
+
+    # Verify what is on disk, not what we handed to the writer. The point of
+    # this whole subsystem is a dataset someone will trust months from now.
+    readback = pq.read_table(parquet)
+    if readback.num_rows != len(rows):
+        raise ParquetVerificationError(
+            f"{parquet} holds {readback.num_rows} rows, expected {len(rows)}"
+        )
+    if readback.schema != schema:
+        raise ParquetVerificationError(f"{parquet} schema differs from the declared schema")
 
     hashes = {p.name: _sha256(p) for p in [*log.segments(), parquet]}
     health = compute_health(
         log,
-        session_seconds=session_seconds,
-        clock_skew_seconds=clock_skew_seconds,
-        required_streams=("BID_ASK", "ALL_LAST", "BAR_5S"),
+        session_open=session_open,
+        session_close=session_close,
+        clock_skew_samples=clock_skew_samples,
+        required_streams=MARKET_STREAMS,
     )
     health.file_hashes = hashes
     health_path = log.dir / "health.json"
     health_tmp = log.dir / ".health.json.tmp"
-    health_tmp.write_text(json.dumps(asdict(health), indent=2, sort_keys=True), encoding="utf-8")
+    health_tmp.write_text(
+        json.dumps(health.as_dict(), indent=2, sort_keys=True), encoding="utf-8"
+    )
     os.replace(health_tmp, health_path)
 
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "session": log.session.isoformat(),
         "rows": len(rows),
+        "parquet_rows_verified": readback.num_rows,
+        "recorder_run_ids": sorted(health.recorder_run_ids),
         "health_ok": health.ok(),
         "problems": health.problems(),
         "files": {**hashes, health_path.name: _sha256(health_path)},
@@ -341,6 +763,11 @@ def finalize_day(
     manifest_tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
     os.replace(manifest_tmp, manifest_path)
     return manifest
+
+
+# ----------------------------------------------------------------------------
+# runtime
+# ----------------------------------------------------------------------------
 
 
 class SubscriptionLimiter:
@@ -363,8 +790,85 @@ class SubscriptionLimiter:
             sleeper(max(0.01, (1 - self.tokens) / self.rate))
 
 
+class ReconnectBudgetExhausted(RuntimeError):
+    """Too many reconnects; the fault is not transient."""
+
+
+class ReconnectBudget:
+    """A rolling budget, not a session-long running total.
+
+    A monotonically increasing counter capped at 8 means eight ordinary blips
+    spread across a normal day retire the recorder at 10:30 and finalize half
+    a session. A burst is what indicates a real fault, so the short window is
+    what should stop a crash loop; the session cap is the backstop for a slow
+    bleed that never bursts.
+    """
+
+    def __init__(
+        self,
+        short_window_seconds: float = 900.0,
+        short_limit: int = 5,
+        session_limit: int = 20,
+        now: Callable[[], float] = time.monotonic,
+    ):
+        self.short_window_seconds = short_window_seconds
+        self.short_limit = short_limit
+        self.session_limit = session_limit
+        self._now = now
+        self._recent: list[float] = []
+        self.session_total = 0
+
+    def record(self) -> None:
+        now = self._now()
+        self._recent = [t for t in self._recent if now - t < self.short_window_seconds]
+        self._recent.append(now)
+        self.session_total += 1
+        if len(self._recent) > self.short_limit:
+            raise ReconnectBudgetExhausted(
+                f"{len(self._recent)} reconnects within "
+                f"{self.short_window_seconds:.0f}s (limit {self.short_limit})"
+            )
+        if self.session_total > self.session_limit:
+            raise ReconnectBudgetExhausted(
+                f"{self.session_total} reconnects this session (limit {self.session_limit})"
+            )
+
+    @property
+    def recent(self) -> int:
+        now = self._now()
+        return len([t for t in self._recent if now - t < self.short_window_seconds])
+
+
 class RecorderPrerequisiteError(RuntimeError):
     """A configuration/entitlement defect that reconnecting cannot repair."""
+
+
+class SessionRolloverError(RuntimeError):
+    """The exchange session changed underneath a running recorder."""
+
+
+def measure_clock_skew(ib, samples: int = 5, pause: float = 0.2) -> list[float]:
+    """Round-trip-compensated skew samples.
+
+    ``local_midpoint - server_time``, where the midpoint of the local clock
+    readings either side of the call removes the round trip that a naive
+    ``now() - reqCurrentTime()`` folds into the estimate. IB's one-second
+    granularity remains, which is exactly why the caller keeps every sample
+    and reports a median instead of trusting any one of them.
+    """
+    out: list[float] = []
+    for index in range(samples):
+        t0 = time.time()
+        server = ib.reqCurrentTime()
+        t1 = time.time()
+        if server is None:
+            continue
+        if server.tzinfo is None:
+            server = server.replace(tzinfo=timezone.utc)
+        out.append(((t0 + t1) / 2.0) - server.timestamp())
+        if index + 1 < samples:
+            ib.sleep(pause)
+    return out
 
 
 @dataclass(frozen=True)
@@ -374,10 +878,12 @@ class RecorderConfig:
     host: str = "127.0.0.1"
     port: int = 4002
     client_id: int = 33
-    max_reconnects: int = 8
     max_backoff_seconds: float = 60.0
     wait_for_rth: bool = True
     roll_seconds: int = 300
+    short_window_seconds: float = 900.0
+    short_reconnect_limit: int = 5
+    session_reconnect_limit: int = 20
 
 
 class QuoteRecorder:
@@ -392,9 +898,11 @@ class QuoteRecorder:
     Connect with the API in read-only mode. The recorder must be structurally
     incapable of placing an order.
 
-    Prerequisite to verify before Week 0 ships: live L1 market data entitlement
-    for SPY. Tick-by-tick needs it, and delayed data silently produces a
-    worthless dataset.
+    ONE PROCESS RECORDS ONE SESSION. If a reconnect lands in a different
+    exchange session the recorder finalizes what it has and exits rather than
+    writing tomorrow's ticks into today's log. Daemon-style rollover buys
+    nothing a scheduler does not already provide, and costs a whole class of
+    date-attribution bugs.
     """
 
     DATA_TYPE = {0: "UNKNOWN", 1: "LIVE", 2: "FROZEN", 3: "DELAYED", 4: "DELAYED_FROZEN"}
@@ -404,21 +912,28 @@ class QuoteRecorder:
         self.root = self.config.root
         self.symbol = self.config.symbol
         self.log: Optional[RawEventLog] = None
+        self.run_id = uuid4().hex[:10]
         self._event_id = 0
         self._receive_sequence = 0
         self._connection_epoch = 0
         self._market_data_type = "UNKNOWN"
-        self._clock_skew_seconds = math.nan
+        self._clock_skew_samples: list[float] = []
         self._resubscribe = False
         self._fatal_prerequisite_error: Optional[str] = None
         self._intentional_disconnect = False
         self._limiter = SubscriptionLimiter()
-        self._ticker_types = None
+        self._budget = ReconnectBudget(
+            short_window_seconds=self.config.short_window_seconds,
+            short_limit=self.config.short_reconnect_limit,
+            session_limit=self.config.session_reconnect_limit,
+        )
+        self._session_key: Optional[str] = None
+        self._wired: set[int] = set()
 
     @staticmethod
     def _is_fatal_market_data_error(code: int, message: str) -> bool:
         """Recognize entitlement failures across IB's localized messages."""
-        if code in {354, 10089, 10189}:
+        if code in FATAL_MARKET_DATA_CODES:
             return True
         text = message.casefold()
         return code == 420 and "market data permissions" in text
@@ -436,6 +951,7 @@ class QuoteRecorder:
             broker_text = str(broker_ts)
         tick = RawTick(
             event_id=self._event_id,
+            recorder_run_id=self.run_id,
             connection_epoch=self._connection_epoch,
             contract_id=int(values.pop("contract_id", 0)),
             event_type=event_type,
@@ -456,9 +972,26 @@ class QuoteRecorder:
                 return session
         raise RuntimeError("IB contract details contain no current/future liquid session")
 
+    @staticmethod
+    def _session_id(session) -> str:
+        return f"{session.start.isoformat()}/{session.end.isoformat()}"
+
     def _wire_ticker(self, ticker) -> None:
+        """Drain each ticker's buffer from exactly one handler.
+
+        ib_async returns one Ticker per contract object, so the BidAsk and
+        AllLast requests below currently hand back the same object. That is a
+        library implementation detail and not a contract the recorder should
+        depend on either way: the handles are kept explicitly, and identity
+        dedupe here means the code is correct whether one Ticker or two comes
+        back -- and never attaches two handlers that would drain one buffer
+        twice.
+        """
+        if ticker is None or id(ticker) in self._wired:
+            return
+        self._wired.add(id(ticker))
+
         from ib_async.objects import TickByTickAllLast, TickByTickBidAsk
-        self._ticker_types = (TickByTickAllLast, TickByTickBidAsk)
 
         def on_update(updated) -> None:
             for tick in updated.tickByTicks:
@@ -496,6 +1029,7 @@ class QuoteRecorder:
         bars.updateEvent += on_bar
 
     def _subscribe(self, ib, contract):
+        self._wired.clear()
         self._limiter.wait(ib.sleep)
         probe = ib.reqMktData(contract, "", False, False)
         probe.marketDataType = 0  # distinguish an actual callback from ib_async's default
@@ -513,27 +1047,36 @@ class QuoteRecorder:
             special_conditions=f"MARKET_DATA_TYPE:{self._market_data_type}",
         )
         if observed != 1:
-            raise RuntimeError(
+            raise RecorderPrerequisiteError(
                 f"Recorder requires an explicit LIVE marketDataType callback; observed "
                 f"{self._market_data_type}. Tick-by-tick delayed data is unsupported."
             )
         self._limiter.wait(ib.sleep)
-        ticker = ib.reqTickByTickData(contract, "BidAsk", 0, False)
+        bidask_ticker = ib.reqTickByTickData(contract, "BidAsk", 0, False)
         self._limiter.wait(ib.sleep)
-        ib.reqTickByTickData(contract, "AllLast", 0, False)
+        alllast_ticker = ib.reqTickByTickData(contract, "AllLast", 0, False)
         self._limiter.wait(ib.sleep)
         bars = ib.reqRealTimeBars(contract, 5, "TRADES", True)
-        self._wire_ticker(ticker)
+        self._wire_ticker(bidask_ticker)
+        self._wire_ticker(alllast_ticker)
         self._wire_bars(bars)
-        return probe, ticker, bars
+        return probe, (bidask_ticker, alllast_ticker), bars
+
+    def _finalize(self, session) -> dict[str, Any]:
+        assert self.log is not None
+        return finalize_day(
+            self.log,
+            session_open=session.start,
+            session_close=session.end,
+            clock_skew_samples=self._clock_skew_samples,
+        )
 
     def run(self) -> dict[str, Any]:  # pragma: no cover - requires a real Gateway/session
         from ib_async import IB, StartupFetchNONE, Stock
 
         cfg = self.config
-        attempts = 0
         session = None
-        while attempts <= cfg.max_reconnects:
+        while True:
             ib = IB()
             self._fatal_prerequisite_error = None
             self._intentional_disconnect = False
@@ -553,11 +1096,23 @@ class QuoteRecorder:
                     raise RuntimeError("IB returned no contract details/liquid hours")
                 server_now = ib.reqCurrentTime()
                 session = self._session(details_list[0], server_now)
+                session_key = self._session_id(session)
+
+                if self._session_key is None:
+                    self._session_key = session_key
+                elif session_key != self._session_key:
+                    # One process records one session. Hand the next one to the
+                    # scheduler rather than writing it into today's directory.
+                    raise SessionRolloverError(
+                        f"session rolled over from {self._session_key} to {session_key}"
+                    )
+
                 if self.log is None:
                     self.log = RawEventLog(
-                        cfg.root, session=session.start.date(), roll_seconds=cfg.roll_seconds
+                        cfg.root, session=session.start.date(),
+                        roll_seconds=cfg.roll_seconds, run_id=self.run_id,
                     )
-                self._clock_skew_seconds = (datetime.now(timezone.utc) - server_now).total_seconds()
+                self._clock_skew_samples.extend(measure_clock_skew(ib))
                 self._append(
                     "SYSTEM", server_now, contract_id=contract.conId,
                     special_conditions="CONNECTED;READ_ONLY=true;SERVER_TIME",
@@ -594,7 +1149,7 @@ class QuoteRecorder:
                         raise RuntimeError("RTH has not started and wait_for_rth is false")
                     ib.sleep(min(1.0, (session.start - datetime.now(session.start.tzinfo)).total_seconds()))
 
-                probe, ticker, bars = self._subscribe(ib, contract)
+                probe, _tickers, bars = self._subscribe(ib, contract)
                 last_mdt = None
                 last_server_probe = time.monotonic()
                 while datetime.now(session.end.tzinfo) < session.end:
@@ -616,12 +1171,9 @@ class QuoteRecorder:
                         )
                         raise ConnectionError("subscription reset required")
                     if time.monotonic() - last_server_probe >= 60:
-                        server_probe = ib.reqCurrentTime()
-                        self._clock_skew_seconds = (
-                            datetime.now(timezone.utc) - server_probe
-                        ).total_seconds()
+                        self._clock_skew_samples.extend(measure_clock_skew(ib, samples=3))
                         self._append(
-                            "SYSTEM", server_probe, contract_id=contract.conId,
+                            "SYSTEM", datetime.now(timezone.utc), contract_id=contract.conId,
                             special_conditions="SERVER_TIME",
                         )
                         last_server_probe = time.monotonic()
@@ -632,13 +1184,10 @@ class QuoteRecorder:
                 ib.cancelMktData(contract)
                 self._intentional_disconnect = True
                 ib.disconnect()
-                assert self.log is not None and session is not None
-                return finalize_day(
-                    self.log,
-                    session_seconds=(session.end - session.start).total_seconds(),
-                    clock_skew_seconds=self._clock_skew_seconds,
-                )
-            except RecorderPrerequisiteError as exc:
+                assert session is not None
+                return self._finalize(session)
+
+            except (RecorderPrerequisiteError, SessionRolloverError, ProcessLockUnavailable) as exc:
                 self._append(
                     "SYSTEM", datetime.now(timezone.utc),
                     special_conditions=f"RECORDER_ERROR:{type(exc).__name__}:{exc}",
@@ -647,11 +1196,7 @@ class QuoteRecorder:
                     self._intentional_disconnect = True
                     ib.disconnect()
                 if self.log is not None and session is not None:
-                    return finalize_day(
-                        self.log,
-                        session_seconds=(session.end - session.start).total_seconds(),
-                        clock_skew_seconds=self._clock_skew_seconds,
-                    )
+                    return self._finalize(session)
                 raise
             except Exception as exc:
                 self._append(
@@ -661,19 +1206,19 @@ class QuoteRecorder:
                 if ib.isConnected():
                     self._intentional_disconnect = True
                     ib.disconnect()
-                attempts += 1
-                if attempts > cfg.max_reconnects:
+                try:
+                    self._budget.record()
+                except ReconnectBudgetExhausted as fatal:
+                    self._append(
+                        "SYSTEM", datetime.now(timezone.utc),
+                        special_conditions=f"RECORDER_ERROR:{type(fatal).__name__}:{fatal}",
+                    )
                     if self.log is not None and session is not None:
-                        return finalize_day(
-                            self.log,
-                            session_seconds=(session.end - session.start).total_seconds(),
-                            clock_skew_seconds=self._clock_skew_seconds,
-                        )
-                    raise
-                delay = min(cfg.max_backoff_seconds, 2 ** (attempts - 1))
+                        return self._finalize(session)
+                    raise fatal from exc
+                delay = min(cfg.max_backoff_seconds, 2 ** (self._budget.recent - 1))
                 time.sleep(delay)
                 self._resubscribe = False
-        raise RuntimeError("unreachable")
 
 
 def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - operator CLI
@@ -683,18 +1228,22 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - operato
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=4002)
     ap.add_argument("--client-id", type=int, default=33)
-    ap.add_argument("--max-reconnects", type=int, default=8)
+    ap.add_argument("--session-reconnect-limit", type=int, default=20)
     ap.add_argument("--no-wait", action="store_true")
     args = ap.parse_args(argv)
-    manifest = QuoteRecorder(
-        args.root,
-        args.symbol,
-        host=args.host,
-        port=args.port,
-        client_id=args.client_id,
-        max_reconnects=args.max_reconnects,
-        wait_for_rth=not args.no_wait,
-    ).run()
+    try:
+        manifest = QuoteRecorder(
+            args.root,
+            args.symbol,
+            host=args.host,
+            port=args.port,
+            client_id=args.client_id,
+            session_reconnect_limit=args.session_reconnect_limit,
+            wait_for_rth=not args.no_wait,
+        ).run()
+    except ProcessLockUnavailable as exc:
+        print(f"refusing to start: {exc}")
+        return 3
     print(json.dumps(manifest, indent=2, sort_keys=True))
     return 0 if manifest.get("health_ok") else 2
 

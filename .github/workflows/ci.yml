@@ -26,7 +26,7 @@ jobs:
           enable-cache: true
 
       - name: Install pinned environment from the lockfile
-        run: uv sync --locked --extra dev
+        run: uv sync --locked --extra dev --extra ib
 
       - name: Lockfile is in sync with pyproject.toml
         run: uv lock --check
