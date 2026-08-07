@@ -22,19 +22,9 @@ def sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def source_tree_hash(root: Path) -> tuple[str, list[str]]:
-    files = [root / "pyproject.toml"]
-    for folder in ("src", "tests", "scripts"):
-        files.extend(sorted((root / folder).rglob("*.py")))
-    digest = hashlib.sha256()
-    names: list[str] = []
-    for path in sorted(files):
-        name = path.relative_to(root).as_posix()
-        names.append(name)
-        digest.update(name.encode("utf-8") + b"\0")
-        digest.update(path.read_bytes())
-        digest.update(b"\0")
-    return digest.hexdigest(), names
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from ib_execution import provenance  # noqa: E402
 
 
 def run_stage(name: str, args: list[str], root: Path, output: Path) -> dict:
@@ -65,7 +55,8 @@ def main(argv: list[str] | None = None) -> int:
     output = root / ns.output_root / stamp
     output.mkdir(parents=True, exist_ok=False)
     seed = ns.seed if ns.seed is not None else secrets.randbits(64)
-    tree_hash, source_files = source_tree_hash(root)
+    source_hash, source_files = provenance.source_tree_sha256(root)
+    config_hash, config_files = provenance.config_tree_sha256(root)
 
     stages = [
         run_stage(
@@ -102,6 +93,9 @@ def main(argv: list[str] | None = None) -> int:
         for path in sorted(output.iterdir())
         if path.is_file()
     }
+    # Four hashes, four different questions. Do not merge them: a lockfile is
+    # an intention, resolved_environment_sha256 is an observation, and Gate B1
+    # is an argument about observations.
     manifest = {
         "gate": "B1",
         "created_utc": datetime.now(timezone.utc).isoformat(),
@@ -110,12 +104,26 @@ def main(argv: list[str] | None = None) -> int:
         "pytest": importlib.metadata.version("pytest"),
         "hypothesis": importlib.metadata.version("hypothesis"),
         "seed": seed,
-        "source_tree_sha256": tree_hash,
+        "commit_sha": provenance.commit_sha(root),
+        "worktree_clean": provenance.worktree_clean(root),
+        "source_tree_sha256": source_hash,
         "source_files": source_files,
+        "config_tree_sha256": config_hash,
+        "config_files": config_files,
+        "dependency_lock_sha256": provenance.dependency_lock_sha256(root),
+        "resolved_environment_sha256": provenance.resolved_environment_sha256(),
+        "resolved_environment": provenance.resolved_environment(),
         "stages": stages,
         "artifact_hashes": artifact_hashes,
         "passed": all(stage["returncode"] == 0 for stage in stages),
     }
+    if not manifest["worktree_clean"]:
+        # A campaign run against a dirty worktree cannot be tied to a commit,
+        # so it can never become sign-off evidence. Produce it, label it.
+        manifest["passed"] = False
+        manifest["invalid_reason"] = (
+            "worktree is dirty; Gate B1 evidence must bind to an exact commit"
+        )
     manifest_path = output / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
     print(manifest_path)

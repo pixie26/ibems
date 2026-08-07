@@ -1,6 +1,8 @@
 # Invariant coverage matrix — v0.1.5.dev0
 
-`COMPLETE` 要求三层同时存在：Property/adversarial test（P）、runtime assertion/structural enforcement（R）、offline journal auditor（A）。P/R/A 完整不等于 Gate B1 已通过；正式 campaign、进程退出集成和评审结论仍是独立退出条件。
+`COMPLETE` 要求三层同时存在：Property/adversarial test（P）、runtime assertion/structural enforcement（R）、offline journal auditor（A）。
+
+**P/R/A 齐备不推导 `gate_b1: PASS`。** 正式 campaign、7 项 B1 blocker 和独立评审签字都是独立的退出条件。权威状态只有一个来源：仓库根目录的 `STATE.json`（由 `python -m ib_execution.provenance` 生成，`tests/test_provenance.py` 强制它与工作树一致）。本文件不复述该状态。
 
 | # | 简述 | P | R | A | 当前证据 |
 |---|---|---|---|---|---|

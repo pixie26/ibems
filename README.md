@@ -19,16 +19,31 @@
 | 无 IB 依赖的执行核心 | 已审查原型。Python 3.12.13 下当前工作树 149 项测试全部通过，其中 144 项 non-property、5 项 property；包含 7 个子进程强杀窗口和 6 类 journal/queue fail-closed 场景。 |
 | Hypothesis Gate campaign | 已提交的 Phase 0 基线中，两项生成式测试各通过 1,500 examples，seed 为 `2026080601`。2026-08-07 的 Recorder-only 修改已跑完整默认回归；下一次 B1 正式签字前应重新运行 formal campaign。 |
 | 22 条安全不变量 | Property / Runtime / Auditor 三重证据入口已齐；真实宿主退出、OS/卷级故障演练和正式评审签字仍未完成。 |
-| 只读 SPY Recorder | 4002 Gateway 握手、server time、SPY 合约解析（`conId=756733`）和静态三轮账户快照读取成功。2026-08-07 实测：IB `10089` entitlement 阻塞已解除，`marketDataType=1`（Live），20 秒采样收到 BidAsk tick 与 5 秒 realtime bars；但本次 `AllLast` 一路在采样窗内 0 tick，preflight 仍判 `passed=false`。尚无合格 Full-RTH session。 |
+| 只读 SPY Recorder | 4002 Gateway 握手、server time、SPY 合约解析（`conId=756733`）和静态三轮账户快照读取成功。2026-08-07 实测：IB `10089` entitlement 阻塞已解除，`marketDataType=1`（Live）。同一次预检的 `AllLast=0` **不构成任何结论**——当时的采样口径已被证明无效（见下）。尚无合格 Full-RTH session。 |
 | 交易型 IB Adapter | 未实现、未连接。`placeOrder`、`cancelOrder`、完整 callback/error mapping 和动态 stable-snapshot protocol 均属于 Gate B2。 |
 | Emergency flatten broker path | 未实现。现有代码只覆盖计划生成与人工确认边界。 |
 
 详细状态与可复查证据：
 
+- **[`STATE.json`](STATE.json) —— 唯一权威的机器可读状态**（gate 状态、source/config/lock 三个树 hash）
 - [实施状态](docs/IMPLEMENTATION_STATUS.md)
-- [验证清单](VALIDATION_MANIFEST.txt)
 - [22 条不变量覆盖矩阵](docs/INVARIANT_COVERAGE.md)
 - [审查与执行结论](docs/REVIEW_AND_EXECUTION_20260806_ZH.md)
+
+### provenance 由测试强制，不由纪律强制
+
+此前仓库同时维护 `SHA256SUMS`（手工）和四份互相复述验证状态的散文文档。它们漂移了：README 写 entitlement 已解除、`VALIDATION_MANIFEST.txt` 仍写 FAIL，而 `SHA256SUMS` 对不上自己的工作树。对普通项目这是文档缺陷；**对一个以可审计性为产品的平台，一份描述不了自身工作树的 provenance 文件比没有更糟——它制造信心。**
+
+因此两份手工文件都已删除，取而代之：
+
+```bash
+python -m ib_execution.provenance           # 重新生成 STATE.json
+python -m ib_execution.provenance --check   # CI：与工作树不一致则失败
+```
+
+`tests/test_provenance.py` 另外强制：不得重新引入 `SHA256SUMS`；追踪文件中不得出现账户标识或凭据（文档占位符需在同行写 `provenance-allow: <理由>`）；直接依赖必须 `==` 精确 pin；散文不得声称 Gate B1 已通过而 `STATE.json` 不同意。
+
+Gate campaign 的产物记录四个独立 hash，回答四个不同问题：`source_tree`（跑了什么逻辑）、`config_tree`（在什么限额下跑）、`dependency_lock`（**应该**装什么）、`resolved_environment`（**实际**装了什么）。最后一个才是观测，而 Gate B1 是一个关于观测的论证。
 
 ## 为什么策略和执行系统必须分开
 
@@ -110,7 +125,13 @@ Recorder 与交易路径隔离开发，只采集：
 
 原始事件以 append-only gzip JSONL 滚动保存，收盘后原子生成 Parquet、健康报告和 SHA-256 manifest。健康报告检查 LIVE 数据、三路覆盖、最大 gap、断线、时钟偏差、行数和文件 hash。
 
-当前实测连接正常。2026-08-07 在 4002（paper 账户 `DUN921978`）的预检显示：IB `10089` entitlement 阻塞已解除，`marketDataType=1`（Live），采样窗内收到 BidAsk tick 与 5 秒 realtime bars；但同一次预检中 `AllLast` 一路 0 tick，preflight 的三路 sample 全非零条件未满足，`passed=false`（证据见 `artifacts/ib_preflight/20260807T151722Z/report.json`）。需要再次在 RTH 内复测以判断 `AllLast=0` 是临时 tick 稀疏还是协议路径问题。在预检得到 `market_data_type=1` 且三路 sample 均非零之前，Recorder 仍会 fail-closed、退出码 2。
+当前实测连接正常。2026-08-07 在 4002（paper 账户已 redact）的预检确认：IB `10089` entitlement 阻塞**已解除**，`marketDataType=1`（Live），`entitlement_blocked=false`。这一条是直接观测，成立。
+
+同一次预检报出的 `AllLast=0` **是无效证据，不能用来推断任何事。** 当时 `run_ib_readonly_preflight.py` 在 sleep 结束后读取 `Ticker.tickByTicks` 的**残余内容**，而 `ib_async` 会在每次网络更新之间清空该缓冲区——所以那个 0 只说明「最后一次 flush 里没有 AllLast」，不说明「20 秒内 IB 没有推送 AllLast」。同一次预检里 `bars_5s=4` 之所以正确，仅仅因为它读的是会累积的 `RealTimeBarList`。
+
+已知的只有一件事：**entitlement 不是原因**（已直接观测到 LIVE）。`AllLast` 订阅路径本身是否正常，要等改成 event-driven 累积计数之后重测才能判断——`reqRealTimeBars` 正常并不能推出 `reqTickByTickData` 正常，两者是不同的请求路径。
+
+在预检得到 `market_data_type=1` 且三路 sample 均非零之前，Recorder 仍会 fail-closed、退出码 2。
 
 ```powershell
 # Broker-write-free Gateway 与稳定快照预检

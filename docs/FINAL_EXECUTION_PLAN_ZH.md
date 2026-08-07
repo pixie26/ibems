@@ -255,14 +255,14 @@ Recorder 不得伤害交易通路：独立 Gateway 优先；否则强制 token b
 
 ### Gate B0：规格冻结
 
-产物：SPEC、ADR、event schema、21 invariants、failure matrix、risk schema、runbook。
+产物：SPEC、ADR、event schema、22 invariants、failure matrix、risk schema、runbook。
 
 ### Gate B1：IB-free core
 
 退出条件：
 
 ```text
-21 invariants 全部具备 P/R/A
+22 invariants 全部具备 P/R/A
 进程级 kill-after-WAL/send/cancel 测试
 restart/reconnect generated sequences
 所有生成 journal auditor PASS
@@ -315,7 +315,7 @@ Gate profile: 2 generated tests x 1,500 examples PASS (seed 2026080601)
 7 subprocess force-kill crash windows PASS
 6 journal/queue fail-closed scenarios PASS
 read-only Gateway handshake and static three-round snapshot observed
-SPY API live-data entitlement blocked by IB 10089; no Full-RTH session passed
+IB 10089 entitlement cleared 2026-08-07 (marketDataType=1, LIVE); no Full-RTH session passed. Authoritative status: STATE.json
 Gate B1 NOT PASSED
 DO NOT CONNECT THE TRADING ADAPTER TO IB PAPER OR LIVE YET
 READ-ONLY RECORDER PREFLIGHT MAY CONNECT; FULL-RTH REQUIRES LIVE ENTITLEMENT

@@ -13,7 +13,7 @@ platform never handles a username or password.
 
 ```bash
 # outside the repo, mode 600, or a secrets manager
-export IB_ACCOUNT=DU1234567
+export IB_ACCOUNT=DU1234567   # provenance-allow: documentation placeholder, not a real account
 ```
 
 **If a password has ever been pasted into a chat, a ticket, a screenshot or a
