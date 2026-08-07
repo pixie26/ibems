@@ -19,7 +19,7 @@
 | 无 IB 依赖的执行核心 | 已审查原型。Python 3.12.13 下当前工作树 149 项测试全部通过，其中 144 项 non-property、5 项 property；包含 7 个子进程强杀窗口和 6 类 journal/queue fail-closed 场景。 |
 | Hypothesis Gate campaign | 已提交的 Phase 0 基线中，两项生成式测试各通过 1,500 examples，seed 为 `2026080601`。2026-08-07 的 Recorder-only 修改已跑完整默认回归；下一次 B1 正式签字前应重新运行 formal campaign。 |
 | 22 条安全不变量 | Property / Runtime / Auditor 三重证据入口已齐；真实宿主退出、OS/卷级故障演练和正式评审签字仍未完成。 |
-| 只读 SPY Recorder | 4002 Gateway 握手、server time、SPY 合约解析和静态三轮账户快照读取成功。IB 返回 `10089`：缺少 `SPY ARCA/TOP/ALL` API 实时行情权限，因此尚无合格 Full-RTH session。 |
+| 只读 SPY Recorder | 4002 Gateway 握手、server time、SPY 合约解析（`conId=756733`）和静态三轮账户快照读取成功。2026-08-07 实测：IB `10089` entitlement 阻塞已解除，`marketDataType=1`（Live），20 秒采样收到 BidAsk tick 与 5 秒 realtime bars；但本次 `AllLast` 一路在采样窗内 0 tick，preflight 仍判 `passed=false`。尚无合格 Full-RTH session。 |
 | 交易型 IB Adapter | 未实现、未连接。`placeOrder`、`cancelOrder`、完整 callback/error mapping 和动态 stable-snapshot protocol 均属于 Gate B2。 |
 | Emergency flatten broker path | 未实现。现有代码只覆盖计划生成与人工确认边界。 |
 
@@ -110,7 +110,7 @@ Recorder 与交易路径隔离开发，只采集：
 
 原始事件以 append-only gzip JSONL 滚动保存，收盘后原子生成 Parquet、健康报告和 SHA-256 manifest。健康报告检查 LIVE 数据、三路覆盖、最大 gap、断线、时钟偏差、行数和文件 hash。
 
-当前实测连接正常，但行情预检被 IB `10089` 阻止。Recorder 会在约 2 秒内 fail-closed、退出码 2，并保留 unhealthy 证据包，不会对不可重试的 entitlement 错误反复重连。
+当前实测连接正常。2026-08-07 在 4002（paper 账户 `DUN921978`）的预检显示：IB `10089` entitlement 阻塞已解除，`marketDataType=1`（Live），采样窗内收到 BidAsk tick 与 5 秒 realtime bars；但同一次预检中 `AllLast` 一路 0 tick，preflight 的三路 sample 全非零条件未满足，`passed=false`（证据见 `artifacts/ib_preflight/20260807T151722Z/report.json`）。需要再次在 RTH 内复测以判断 `AllLast=0` 是临时 tick 稀疏还是协议路径问题。在预检得到 `market_data_type=1` 且三路 sample 均非零之前，Recorder 仍会 fail-closed、退出码 2。
 
 ```powershell
 # Broker-write-free Gateway 与稳定快照预检
@@ -161,7 +161,7 @@ python -m ib_execution.auditor data\journal.db
 ## 下一步
 
 1. **策略 Gate A 独立推进。** 在策略仓库完成真实成本、数据质量和统计不确定性判断；若结论为 `NO_GO` 或 `INSUFFICIENT_EVIDENCE`，且没有独立第二消费者，就停止投资交易型 IB Adapter。
-2. **补齐 Recorder 权限并开始不可追回的数据采集。** 开通覆盖 SPY/NYSE Arca 的 API LIVE 行情，预检三路 sample 后，从下一个完整 RTH 开始采集和每日健康审计。
+2. **在 RTH 内复测预检并启动 Recorder。** 2026-08-07 已确认 `10089` entitlement 阻塞解除、`marketDataType=1`（Live）。下一步是在正常交易时段复测，确认 `AllLast` 一路稳定非零、三路 sample 全部满足后，从下一个完整 RTH 开始采集和每日健康审计。
 3. **完成 Gate B1。** 补真实 execution-engine 宿主退出/监督器、OS 或受限卷级 disk-full/WAL 演练，以及 22 条不变量正式评审签字。
 4. **B1 签字后才进入 Gate B2。** 先做只连接、只读账户事实和动态 stable-snapshot protocol，再做人工 1 股 paper target/cancel；MOC、多策略和自动 watchdog takeover 继续推迟。
 
