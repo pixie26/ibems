@@ -6,6 +6,7 @@
 
 | # | 简述 | P | R | A | 当前证据 |
 |---|---|---|---|---|---|
+| 0 | single-writer process ownership | yes | OS 独占锁 + 非零退出 | n/a | 真实双进程 + SIGKILL 后继承 |
 | 1 | decision id once | yes | DB PK + atomic accept | yes | complete |
 | 2 | durable before broker write | yes | commit-before-call | yes | subprocess force-kill: before/after WAL |
 | 3 | one live intent per leg | yes | state gate | yes | generated restart lifecycle |
@@ -26,17 +27,31 @@
 | 18 | callback/bridge failure fail-closed | yes | guarded callbacks + bridge liveness | yes | real adapter handlers remain B2 |
 | 19 | overnight survivability | yes | numeric stress | yes | auditor recomputes per-intent evidence |
 | 20 | every invariant has P/R/A | yes | coverage contract | yes | auditor fails on missing row |
-| 21 | startup must-reject self-test | yes | Controller construction path | yes | matching config hash must precede start/intent |
-| 22 | restart cannot clear HALT | yes | forced restore + exact CAS ack | yes | subprocess kill after durable HALT |
+| 21 | startup must-reject self-test | yes | Controller 构造路径 + calendar coverage | yes | 配置 hash 与日历覆盖必须先于 start/intent |
+| 22 | restart cannot clear HALT | yes | forced restore + exact CAS ack + durable fence | yes | subprocess kill 后重启；存储修复后仍拒绝 |
 
-## Gate B1 仍未通过
+### 不变量 0 与 21、22 的关系
 
-正式 Hypothesis campaign 已通过：Python 3.12.13、seed `2026080601`、两个生成测试各 1,500 passing examples、source-tree SHA-256 `4990d57cddc05d21924a3b3b1d01050ecc2d9e6a8f4b36a19969b1809f0f67ba`。证据见 `artifacts/gate_b1/20260806T142435Z/manifest.json`。
+三条一起才构成完整的 fail-closed，缺一条就有缺口：
 
-截至 2026-08-06，以下任一项未完成都必须维持 `Gate B1 not passed`：
+- **22** 保护**已经落盘**的 HALT。journal 本身失效时，HALT 落不了盘，所以 22 不会被触发——不是被绕过，是被跳过。
+- **0** 保证同一时刻只有一个进程能写，否则 1–4 全部只在单进程内成立。
+- **B1.3b 的 durable fence** 补上 22 够不到的那一段：把「这次决定停」带过进程边界、重启和存储恢复。
 
-- `fatal_shutdown_requested` 已测试，但真正 execution-engine 宿主进程的退出码/监督器行为尚未集成；
-- OS/卷级真实 disk-full 与 SQLite/WAL 损坏演练尚未取代当前确定性故障注入；
-- 本矩阵尚需正式评审签字，不能由测试数量自动升级 Gate。
+## Gate B1 的 7 项 blocker
+
+权威状态在 `STATE.json`；本文件不复述。P/R/A 齐备不推导 gate 通过。
+
+| Blocker | 内容 | 证据位置 |
+|---|---|---|
+| B1.0 | reproducible environment | `uv.lock` + gate manifest 的 `resolved_environment_sha256` |
+| B1.1 | single-writer process ownership | `tests/test_journal_ownership.py`（真实双进程 + SIGKILL） |
+| B1.2 | calendar fail-closed | `tests/test_calendar_coverage.py` |
+| B1.3a | fatal host exit | `tests/test_fatal_fence.py` + `deploy/` + `tests/test_supervisor.py` |
+| B1.3b | durable fatal fence | `tests/test_fatal_fence.py::test_a_repaired_journal_still_refuses_to_trade` |
+| B1.4 | real storage faults | `scripts/run_storage_fault_drill.py`（需真实受限卷，未跑） |
+| B1.5 | independent exact-commit sign-off | `docs/GATE_B1_SIGNOFF_TEMPLATE.md`（未签） |
+
+之前那次 1,500-example campaign（seed `2026080601`、source-tree `4990d57c…`）证明的是**当时那棵树**。A/B/C 三个 commit 已经改变了 source tree，所以它不能作为当前 HEAD 的签字证据；campaign 必须在 freeze commit 上重跑。
 
 Gate B2 的 IB stable-snapshot、permId、1101/1102 和 callback observed matrix 不倒灌进 B1，也不因 B1 的 FakeBroker 证据而预判通过。

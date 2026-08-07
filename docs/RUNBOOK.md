@@ -100,6 +100,49 @@ HALT is correct behaviour, not a bug. Do not restart to "clear" it.
 5. restart ONLY after the cause is understood
 ```
 
+### 3.1b Host exited non-zero (exit codes)
+
+`execution_host` exits with a distinct code per refusal, and the supervisor is
+configured never to restart it (`deploy/ibems-execution.service`,
+`Restart=no`). Every one of these means a human has to look.
+
+| Code | Meaning | What to do |
+|---|---|---|
+| 10 | fatal shutdown: the journal's durable path is gone | §3.1c — a durable fence has been raised |
+| 11 | another execution host owns this journal | **Find the other process.** Two writers is the failure this prevents. Do not delete the `.lock` file; it is held by a live process, and the kernel releases it when that process dies. |
+| 12 | a durable fence from an earlier fatal shutdown | §3.1c |
+| 13 | the trading calendar does not cover today | §5 — extend `calendar.py` |
+| 14 | some other pre-broker refusal | Read the message; the broker was never touched. |
+
+### 3.1c Durable fatal fence raised
+
+The engine hit a fault whose *durable* record could not go into the journal —
+because the journal is what failed. The fence file (on a different volume,
+e.g. `C:\ProgramData\ibems\fatal-fence.json`) carries the decision across the
+restart. **Restarting against repaired storage will still refuse**, which is
+the entire point: without the fence, a repaired journal replays with no HALT
+in it and the engine comes back NORMAL.
+
+The order matters. Do not acknowledge before step 2.
+
+```
+1. read the fence:
+   python -m ib_execution.fatal_fence --fence <path>
+2. open TWS. Read the actual position and open orders with your own eyes.
+   The engine may have been mid-send when the journal died, so IB can hold a
+   working order the journal has no record of.
+3. fix the underlying storage fault (disk space, volume health, permissions)
+4. acknowledge, by name:
+   python -m ib_execution.fatal_fence --fence <path> --acknowledge \
+       --operator <your name> --resolution "<what you found and what you did>"
+5. acknowledging does NOT retire the fence. The engine retires it only after a
+   reconciliation pass explains the account. Start the host and let it.
+```
+
+If the alert said **the fence could not be written**, there is no automatic
+block on the next start. Reconcile the account by hand before starting
+anything, and treat the engine as unfenced.
+
 ### 3.2 Watchdog killed the engine
 
 The watchdog does not restart it (ADR-004). Deliberate.
@@ -162,9 +205,22 @@ and will not pretend yesterday did not happen. Clear manually after review.
 
 ## 5. Annually (each December)
 
-- [ ] **Update the holiday and half-day tables in `calendar.py` for next year.**
-      A stale table means a hardcoded flatten time that never fires on a half
-      day. Nothing errors; you simply wake up long.
+- [ ] **Update the holiday and half-day tables in `calendar.py` for next year,
+      and add the year to `SUPPORTED_YEARS`.**
+
+      This is now enforced, not remembered. Leaving the table stale no longer
+      produces a full session plan for every holiday in the new year — the
+      engine refuses to start with `CalendarCoverageError` and exit code 13.
+      That refusal is deliberate and is the cheaper failure: being unable to
+      trade on the first business day of the year is loud; trading through a
+      closed session is silent.
+
+      Note the engine will refuse from the **last covered trading day**, not
+      from 1 January: the startup self-test requires the *next* session to be
+      covered too. Do this in December, not on the 2nd.
+
+      `TradingCalendar.__init__` rejects a year listed in `SUPPORTED_YEARS`
+      with no holidays in the table, so half-updating fails fast.
 - [ ] Re-review invariant 19 against current position limits
 - [ ] Re-review ADR-002 and ADR-006 if size has changed
 
