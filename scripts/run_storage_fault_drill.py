@@ -85,7 +85,7 @@ CHILD = textwrap.dedent(
     risk = RiskEngine(
         RiskConfig(symbol_whitelist=("SPY",), strategy_whitelist=("drill",),
                    max_position_shares=5, max_order_shares=10,
-                   max_order_notional=Decimal("20000")),
+                   max_order_notional=Decimal("20000")),  # any whitelist works
         clock,
     )
     host = ExecutionHost(
@@ -112,10 +112,13 @@ CHILD = textwrap.dedent(
             if code is not None:
                 raise SystemExit(code)
             try:
-                controller.journal.commit(EventType.HEARTBEAT, {{"t": time.time()}})
+                # A payload, and no sleep: the drill needs the WAL to grow an
+                # uncheckpointed tail, and needs to reach ENOSPC promptly.
+                controller.journal.commit(
+                    EventType.HEARTBEAT, {{"t": time.time(), "pad": "x" * 400}}
+                )
             except Exception as exc:
                 controller._fail_closed_journal("drill heartbeat", exc)
-            time.sleep(0.05)
     finally:
         host.close()
     """
@@ -147,80 +150,212 @@ def _wait_started(proc: subprocess.Popen, marker: Path, timeout: float = 30.0) -
     raise RuntimeError("child never started")
 
 
-def _fill_volume(volume: Path, keep_bytes: int = 0) -> Path:
-    """Consume the volume's free space with one ballast file."""
-    ballast = volume / ".drill-ballast"
-    free = shutil.disk_usage(volume).free
-    target = max(free - keep_bytes, 0)
-    with ballast.open("wb") as fh:
+class _Ballast:
+    """Holds a volume at zero free space for as long as it is open.
+
+    Filling once is not enough. SQLite in WAL mode reuses frames after a
+    checkpoint, so a single fill leaves the engine writing happily in the space
+    the checkpoint just freed -- the first run of this drill sat there for two
+    minutes without ever reaching ENOSPC. Pressure has to be *maintained*.
+
+    Note also that ext4 reserves 5% of blocks for uid 0 by default. A drill
+    running as root fills only the unreserved part while the engine, also root,
+    keeps writing into the reserve. Format the drill volume with ``-m 0``.
+    """
+
+    BLOCK = b"\0" * (256 * 1024)
+
+    def __init__(self, volume: Path):
+        self.path = volume / ".drill-ballast"
+        self._fh = self.path.open("wb")
+
+    def top_up(self) -> int:
+        """Consume whatever is free right now. Returns bytes newly written."""
         written = 0
-        block = b"\0" * (1024 * 1024)
-        while written < target:
-            chunk = block[: min(len(block), target - written)]
+        while True:
             try:
-                fh.write(chunk)
-                fh.flush()
-                os.fsync(fh.fileno())
+                self._fh.write(self.BLOCK)
+                self._fh.flush()
+                os.fsync(self._fh.fileno())
             except OSError:
+                # ENOSPC: the volume is genuinely full, which is the point.
                 break
-            written += len(chunk)
-    return ballast
+            written += len(self.BLOCK)
+        return written
+
+    def close(self) -> None:
+        try:
+            self._fh.close()
+        except OSError:
+            pass
+        self.path.unlink(missing_ok=True)
 
 
-def drill_disk_full(paths: dict[str, Path], volume: Path) -> dict[str, Any]:
+def drill_disk_full(paths: dict[str, Path], volume: Path, timeout: float = 180.0) -> dict[str, Any]:
     proc = _spawn(paths, separate=True)
-    ballast: Optional[Path] = None
+    ballast: Optional[_Ballast] = None
+    code: Optional[int] = None
+    filled = 0
     try:
         _wait_started(proc, paths["marker"])
-        ballast = _fill_volume(volume)
-        code = proc.wait(timeout=120)
+        ballast = _Ballast(volume)
+        filled = ballast.top_up()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            code = proc.poll()
+            if code is not None:
+                break
+            # Re-consume anything a WAL checkpoint handed back.
+            filled += ballast.top_up()
+            time.sleep(0.25)
     finally:
-        if ballast is not None and ballast.exists():
-            ballast.unlink()
+        if ballast is not None:
+            ballast.close()
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=20)
+            code = None
     output = proc.stdout.read() if proc.stdout else ""
     return {
         "exit_code": code,
         "expected_exit_code": EXIT_FATAL_SHUTDOWN,
+        "ballast_bytes": filled,
+        "timed_out": code is None,
         "output_tail": output[-4000:],
     }
 
 
-def drill_wal_corruption(paths: dict[str, Path]) -> dict[str, Any]:
-    """Corrupt the WAL while the engine is down, then start it.
+def _count_events(journal: Path) -> Any:
+    """Replay a journal read-only. Returns a count, or the error string."""
+    from ib_execution.journal import Journal
 
-    The engine must refuse to reach a trading state. It must NOT repair the
-    database: "the data is broken so we stopped" is the property under test.
+    handle = None
+    try:
+        handle = Journal(journal, owner=False)
+        return len(list(handle.replay()))
+    except Exception as exc:  # noqa: BLE001 - the error is the observation
+        return f"{type(exc).__name__}: {exc}"
+    finally:
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def drill_wal_corruption(
+    paths: dict[str, Path], run_seconds: float = 6.0, settle_seconds: float = 25.0
+) -> dict[str, Any]:
+    """Kill the engine, corrupt the WAL, and measure what the journal lost.
+
+    This drill counts events rather than only checking an exit code, because
+    the dangerous outcome here is not an error -- it is silence.
+
+    A corrupt WAL *header* fails SQLite's checksum, so recovery discards WAL
+    frames instead of reporting a problem. Every discarded frame is a
+    transaction that ``commit()`` already confirmed as durable under
+    ``synchronous=FULL``. The database is left internally consistent and
+    simply shorter, and nothing inside SQLite can tell you rows are missing.
+
+    For a platform whose central promise is durable-before-send, losing the
+    tail of the journal means an ORDER_SENT can vanish while the order itself
+    is live at the broker: the engine restarts believing it never sent.
     """
     proc = _spawn(paths, separate=True)
     try:
         _wait_started(proc, paths["marker"])
+        time.sleep(run_seconds)                 # accumulate committed events
     finally:
-        proc.terminate()
+        # SIGKILL, not terminate: a clean shutdown checkpoints and removes the
+        # WAL, and there would be nothing left to corrupt.
+        proc.kill()
         proc.wait(timeout=30)
 
-    wal = paths["journal"].with_name(paths["journal"].name + "-wal")
-    corrupted = False
-    if wal.exists() and wal.stat().st_size > 32:
-        with wal.open("r+b") as fh:
-            fh.seek(24)
-            fh.write(b"\xde\xad\xbe\xef" * 4)
-            fh.flush()
-            os.fsync(fh.fileno())
-        corrupted = True
+    journal = paths["journal"]
+    wal = journal.with_name(journal.name + "-wal")
+    result: dict[str, Any] = {"wal_bytes": wal.stat().st_size if wal.exists() else 0}
+
+    if not wal.exists() or wal.stat().st_size <= 32:
+        result.update(
+            corrupted=False,
+            passed=False,
+            note="no WAL left to corrupt; the drill proved nothing",
+        )
+        return result
+
+    # Take the baseline from a *copy*. Opening the real journal to count would
+    # recover and checkpoint it, deleting the very WAL this drill corrupts --
+    # the first version of this drill did exactly that and then reported "no
+    # WAL left to corrupt" against a 2.9MB WAL it had just consumed.
+    baseline = journal.parent / "pre-corruption"
+    shutil.rmtree(baseline, ignore_errors=True)
+    baseline.mkdir()
+    for suffix in ("", "-wal", "-shm"):
+        source = journal.with_name(journal.name + suffix)
+        if source.exists():
+            shutil.copy2(source, baseline / source.name)
+    result["events_before_corruption"] = _count_events(baseline / journal.name)
+
+    # Offset 24 is checksum-1/checksum-2 of the WAL header. A failed header
+    # checksum makes recovery discard frames rather than report a problem.
+    with wal.open("r+b") as fh:
+        fh.seek(24)
+        fh.write(b"\xde\xad\xbe\xef" * 4)
+        fh.flush()
+        os.fsync(fh.fileno())
+    result["corrupted"] = True
+
+    # Same trick for the after-count: measure a copy, so the number reflects
+    # what recovery discarded and not what the next process went on to write.
+    post = journal.parent / "post-corruption"
+    shutil.rmtree(post, ignore_errors=True)
+    post.mkdir()
+    for suffix in ("", "-wal", "-shm"):
+        source = journal.with_name(journal.name + suffix)
+        if source.exists():
+            shutil.copy2(source, post / source.name)
+    result["events_after_corruption"] = _count_events(post / journal.name)
 
     paths["marker"].unlink(missing_ok=True)
     second = _spawn(paths, separate=True)
-    code = second.wait(timeout=120)
+    try:
+        code: Optional[int] = second.wait(timeout=settle_seconds)
+    except subprocess.TimeoutExpired:
+        # Still running means it started and would trade on a journal it
+        # cannot vouch for. That is the failure, not a hang.
+        code = None
+        second.kill()
+        second.wait(timeout=20)
     output = second.stdout.read() if second.stdout else ""
-    return {
-        "wal_present_and_corrupted": corrupted,
-        "exit_code": code,
-        "acceptable_exit_codes": [EXIT_FATAL_SHUTDOWN, EXIT_FENCED],
-        "output_tail": output[-4000:],
-    }
+
+    before = result["events_before_corruption"]
+    after = result["events_after_corruption"]
+    lost = (
+        before - after
+        if isinstance(before, int) and isinstance(after, int) and before > after
+        else 0
+    )
+    started = code is None or code == EXIT_OK
+    result.update(
+        exit_code=code,
+        engine_started=started,
+        events_lost=lost,
+        acceptable_exit_codes=[EXIT_FATAL_SHUTDOWN, EXIT_FENCED],
+        output_tail=output[-4000:],
+    )
+    # The verdict is about durability, not about tidiness. Refusing to start is
+    # correct. Starting after losing committed events is the finding.
+    if lost and started:
+        result["passed"] = False
+        result["finding"] = (
+            f"{lost} committed events were silently discarded by WAL recovery and "
+            "the engine started anyway. commit() had already reported these durable. "
+            "SQLite cannot detect this from inside the database; it needs an "
+            "out-of-band monotone witness of the highest committed sequence."
+        )
+    else:
+        result["passed"] = code in (EXIT_FATAL_SHUTDOWN, EXIT_FENCED) or lost == 0
+    return result
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -295,8 +430,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             if fence_file.exists()
             else None
         )
-        expected = result.get("acceptable_exit_codes") or [result["expected_exit_code"]]
-        result["passed"] = result["exit_code"] in expected
+        if "passed" not in result:
+            result["passed"] = result["exit_code"] == result["expected_exit_code"]
         results[name] = result
         print(json.dumps({k: v for k, v in result.items() if k != "output_tail"}, indent=2))
 

@@ -14,6 +14,7 @@ import pytest
 
 from ib_execution.calendar import TradingCalendar
 from ib_execution.clock import ManualClock, assert_clock_sane, ClockSkewError
+from ib_execution.models import RiskRejection
 from ib_execution.risk import (
     HARD_MAX_POSITION_SHARES,
     RiskConfig,
@@ -107,6 +108,79 @@ def test_self_test_fails_when_a_check_is_disabled():
             run_self_test(cfg, clock)
     finally:
         risk_mod.RiskEngine.check = original
+
+
+def test_self_test_works_for_a_config_that_is_not_spy_manual_test():
+    """The probes used to hardcode SPY/manual_test as the admissible baseline.
+
+    Any configuration that did not happen to whitelist both raised
+    ``RiskRejection: symbol_whitelist: SPY`` out of ``run_self_test`` -- and
+    therefore out of ``Controller.__init__``. A production config for another
+    instrument could not construct a controller at all.
+    """
+    clock = ManualClock(datetime(2026, 8, 5, 14, 0, tzinfo=timezone.utc))
+    cfg = RiskConfig(symbol_whitelist=("QQQ",), strategy_whitelist=("momo_v1",))
+    proven = run_self_test(cfg, clock)
+    for expected in (
+        "symbol_whitelist",
+        "strategy_whitelist",
+        "max_order_shares",
+        "max_position_shares",
+        "quote_stale",
+        "max_spread_bps",
+        "limit_collar",
+        "no_quote",
+        "max_orders_per_minute",
+    ):
+        assert expected in proven, f"{expected} was not proven live"
+
+
+def test_a_probe_rejected_by_the_wrong_control_is_not_counted_as_proof():
+    """The worse of the two defects: a false pass.
+
+    Every ``RiskRejection`` used to count, whatever fired it. With a config
+    whitelisting only QQQ, the SPY-priced ``limit_collar`` probe was rejected
+    by ``symbol_whitelist`` and recorded as proof the collar was live. A
+    self-test whose purpose is to show that *specific* controls fire cannot
+    accept the wrong one firing as proof.
+    """
+    import ib_execution.risk as risk_mod
+
+    clock = ManualClock(datetime(2026, 8, 5, 14, 0, tzinfo=timezone.utc))
+    cfg = RiskConfig(strategy_whitelist=("manual_test",))
+    original = risk_mod.RiskEngine.check
+
+    def collar_answers_with_the_wrong_reason(self, intent, *, current_position, quote,
+                                             is_closing=False):
+        # The collar is dead; something unrelated rejects instead.
+        if quote is not None and intent.limit_price == Decimal("700"):
+            raise RiskRejection("max_spread_bps", "not the collar")
+        return original(
+            self, intent, current_position=current_position, quote=quote, is_closing=is_closing
+        )
+
+    risk_mod.RiskEngine.check = collar_answers_with_the_wrong_reason
+    try:
+        with pytest.raises(RiskSelfTestFailed, match=r"limit_collar \(rejected by max_spread_bps"):
+            run_self_test(cfg, clock)
+    finally:
+        risk_mod.RiskEngine.check = original
+
+
+def test_an_empty_whitelist_is_rejected_before_it_reaches_the_self_test():
+    """The config layer is the control; the self-test guard is only a backstop.
+
+    ``run_self_test`` indexes ``symbol_whitelist[0]`` for its baseline order, so
+    it also refuses an empty one -- but a config that empty never gets built.
+    """
+    with pytest.raises(ValueError, match="symbol_whitelist empty"):
+        RiskConfig(symbol_whitelist=(), strategy_whitelist=("manual_test",))
+
+    clock = ManualClock(datetime(2026, 8, 5, 14, 0, tzinfo=timezone.utc))
+    hollowed = RiskConfig(strategy_whitelist=("manual_test",))
+    object.__setattr__(hollowed, "symbol_whitelist", ())
+    with pytest.raises(RiskSelfTestFailed, match="empty symbol or strategy whitelist"):
+        run_self_test(hollowed, clock)
 
 
 # --------------------------------------------------------------------------

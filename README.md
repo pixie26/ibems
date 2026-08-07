@@ -18,7 +18,7 @@
 |---|---|
 | 无 IB 依赖的执行核心 | 已审查原型。包含子进程强杀窗口、journal/queue fail-closed 场景、跨进程所有权和 durable fence 的真实多进程测试。测试计数不在此手抄——运行 `pytest -q` 或看 gate manifest。 |
 | Hypothesis Gate campaign | **需要在 freeze commit 上重跑。** 此前 seed `2026080601` 的 1,500-example campaign 证明的是当时那棵树；A/B/C 三个 commit 已改变 source tree，且 Hypothesis 的 seed 不跨版本复现（依赖现已 `==` pin）。 |
-| 不变量 0 + 22 条安全不变量 | Property / Runtime / Auditor 三重入口已齐。新增不变量 0（单写者进程所有权）。剩 B1.4 真实受限卷演练与 B1.5 绑定 exact commit 的独立签字。 |
+| 不变量 0 + 22 条安全不变量 | Property / Runtime / Auditor 三重入口已齐，新增不变量 0（单写者进程所有权）。**不变量 2 尚不完整**：B1.4 演练实测 WAL 损坏会静默丢弃已提交事件，见 B1.6。 |
 | 只读 SPY Recorder | 4002 Gateway 握手、server time、SPY 合约解析（`conId=756733`）和静态三轮账户快照读取成功。2026-08-07 实测：IB `10089` entitlement 阻塞已解除，`marketDataType=1`（Live）。同一次预检的 `AllLast=0` **不构成任何结论**——当时的采样口径已被证明无效（见下）。尚无合格 Full-RTH session。 |
 | 交易型 IB Adapter | 未实现、未连接。`placeOrder`、`cancelOrder`、完整 callback/error mapping 和动态 stable-snapshot protocol 均属于 Gate B2。 |
 | Emergency flatten broker path | 未实现。现有代码只覆盖计划生成与人工确认边界。 |
@@ -177,7 +177,7 @@ python scripts\run_storage_fault_drill.py --journal-volume X:\ --fence-dir C:\Pr
 - [系统规格](docs/SPEC.md)：状态、事件、接口和不变量定义。
 - [最终执行计划](docs/FINAL_EXECUTION_PLAN_ZH.md)：Gate A/B/C/D、实施顺序和停止条件。
 - [运行手册](docs/RUNBOOK.md)：环境、凭证、启动、告警和事故处理。
-- [Gate B1 签字模板](docs/GATE_B1_SIGNOFF_TEMPLATE.md)：7 项 blocker、22 条不变量逐条签字、以及明确写下的范围边界。
+- [Gate B1 签字模板](docs/GATE_B1_SIGNOFF_TEMPLATE.md)：8 项 blocker、22 条不变量逐条签字、以及明确写下的范围边界。
 - [v0.1.5 变更](docs/CHANGES_v0.1.5.md)：本版本安全修正。
 - [v0.1.4 最终审查](docs/FINAL_REVIEW_V014_ZH.md)：HALT durability 等审查结论。
 - `docs/adr/ADR-001` 至 `ADR-009`：关键架构决策。
@@ -205,7 +205,7 @@ python -m ib_execution.execution_host --journal D:\ibems-data\journal.db \
 
 1. **策略 Gate A 独立推进。** 在策略仓库完成真实成本、数据质量和统计不确定性判断；若结论为 `NO_GO` 或 `INSUFFICIENT_EVIDENCE`，且没有独立第二消费者，就停止投资交易型 IB Adapter。
 2. **在 RTH 内复测预检并启动 Recorder。** entitlement 已确认解除；预检的 tick 计数与时钟偏差口径已修好。下一步是在正常交易时段做 90–120 秒预检，取得**第一份关于 `AllLast` 的有效观测**，三路 sample 与时钟偏差中位数都满足后，从下一个完整 RTH 开始采集。第一天只做数据验收，不跑策略；cross-stream diagnostics 先标定 bar/tick 转换关系，标定完成前不作为硬 Gate。
-3. **完成 Gate B1 的 7 项 blocker。** B1.0–B1.3b 的代码与测试已就位；**剩下 B1.4（真实受限卷故障演练，需要一个 64–128MB 的独立卷）与 B1.5（绑定 exact commit 的独立签字）**。
+3. **完成 Gate B1 的 8 项 blocker。** B1.0–B1.3b 已就位。B1.4 已在 96MB loop ext4 上实跑：`disk_full` PASS，`wal_corruption` **FAIL** —— 由此新增 **B1.6**（WAL 恢复会静默丢弃已提交事件，需要带外单调见证者，未实现）。B1.5 仍需评审签字。
 4. **冻结后再跑正式 campaign。** 所有代码、配置、依赖和测试改动必须先全部落地，然后取 freeze commit，再在那个 commit 上跑 deterministic suite、formal Hypothesis campaign、真实存储故障演练和 journal auditor。**campaign 是最后的证明，不是开发过程中的阶段性测试。** 期间发现 bug 就修、重取 freeze commit、整个 campaign 重跑——不 cherry-pick 一个小修然后沿用旧证明。
 5. **B1 签字后才进入 Gate B2，且第一阶段仍然不下单。** 先做只连接、只读账户事实、动态 stable-snapshot protocol 和 `DOCUMENTED_VS_OBSERVED.md`，再做人工 1 股 paper target/cancel；MOC、多策略和自动 watchdog takeover 继续推迟。
 

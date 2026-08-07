@@ -321,7 +321,12 @@ class RiskSelfTestFailed(RuntimeError):
     """A must-reject order was allowed. The process must not start."""
 
 
-def _probe(symbol="SPY", strategy="manual_test", side=Side.BUY, qty=1, px="600") -> OrderIntent:
+def _probe(symbol, strategy, side=Side.BUY, qty=1, px="600") -> OrderIntent:
+    """A probe order. Symbol and strategy are required, never defaulted.
+
+    They used to default to ``"SPY"`` and ``"manual_test"``, which quietly made
+    the self-test a test of one particular configuration. See ``run_self_test``.
+    """
     return OrderIntent(
         intent_id="selftest",
         decision_id="selftest",
@@ -341,44 +346,79 @@ def _probe(symbol="SPY", strategy="manual_test", side=Side.BUY, qty=1, px="600")
     )
 
 
+def _absent(values: tuple[str, ...], stem: str) -> str:
+    """A name guaranteed not to be in ``values``, for the whitelist probes."""
+    candidate = f"__not_a_real_{stem}__"
+    while candidate in values:
+        candidate += "x"
+    return candidate
+
+
 def run_self_test(config: RiskConfig, clock) -> list[str]:
     """
-    Construct orders that MUST be rejected; verify each one is.
+    Construct orders that MUST be rejected; verify each one is rejected
+    **by the control it is meant to exercise**.
 
     Returns the list of check names proven live. Raises if any probe passes.
     A config hash tells you what was loaded. Only this tells you it works.
+
+    TWO THINGS THIS GETS RIGHT THAT IT PREVIOUSLY DID NOT
+    -----------------------------------------------------
+    1.  The baseline symbol and strategy come from ``config``, not from
+        hardcoded ``"SPY"`` / ``"manual_test"`` defaults. With those defaults,
+        any configuration that did not happen to whitelist both crashed out of
+        this function -- and therefore out of ``Controller.__init__`` -- with
+        ``RiskRejection: symbol_whitelist: SPY``. A production config for a
+        different instrument could not construct a controller at all.
+
+    2.  Each probe must be rejected by *its own* check. Previously any
+        ``RiskRejection`` counted, so with a config whitelisting only ``QQQ``
+        the ``limit_collar`` probe was rejected by ``symbol_whitelist`` and
+        recorded as proof that the collar was live. That is the worse of the
+        two failures: a self-test whose entire purpose is to demonstrate that
+        specific controls fire, accepting the wrong control firing as proof.
     """
     now = clock.now()
-    good_quote = Quote("SPY", Decimal("599.98"), Decimal("600.02"), 100, 100, now)
+    if not config.symbol_whitelist or not config.strategy_whitelist:
+        raise RiskSelfTestFailed(
+            "the risk configuration has an empty symbol or strategy whitelist; "
+            "the must-reject self-test has no admissible baseline order"
+        )
+    symbol = config.symbol_whitelist[0]
+    strategy = config.strategy_whitelist[0]
+    good_quote = Quote(symbol, Decimal("599.98"), Decimal("600.02"), 100, 100, now)
+
+    def probe(**over) -> OrderIntent:
+        return _probe(**{"symbol": symbol, "strategy": strategy, **over})
 
     cases: list[tuple[str, OrderIntent, dict]] = [
         (
             "symbol_whitelist",
-            _probe(symbol="TSLA"),
+            probe(symbol=_absent(config.symbol_whitelist, "symbol")),
             {"current_position": 0, "quote": good_quote},
         ),
         (
             "strategy_whitelist",
-            _probe(strategy="not_a_real_strategy"),
+            probe(strategy=_absent(config.strategy_whitelist, "strategy")),
             {"current_position": 0, "quote": good_quote},
         ),
         (
             "max_order_shares",
-            _probe(qty=config.max_order_shares + 1),
+            probe(qty=config.max_order_shares + 1),
             {"current_position": 0, "quote": good_quote},
         ),
         (
             "max_position_shares",
-            _probe(qty=1),
+            probe(qty=1),
             {"current_position": config.max_position_shares, "quote": good_quote},
         ),
         (
             "quote_stale",
-            _probe(),
+            probe(),
             {
                 "current_position": 0,
                 "quote": Quote(
-                    "SPY",
+                    symbol,
                     Decimal("599.98"),
                     Decimal("600.02"),
                     100,
@@ -389,20 +429,20 @@ def run_self_test(config: RiskConfig, clock) -> list[str]:
         ),
         (
             "max_spread_bps",
-            _probe(),
+            probe(),
             {
                 "current_position": 0,
-                "quote": Quote("SPY", Decimal("590"), Decimal("610"), 100, 100, now),
+                "quote": Quote(symbol, Decimal("590"), Decimal("610"), 100, 100, now),
             },
         ),
         (
             "limit_collar",
-            _probe(px="700"),
+            probe(px="700"),
             {"current_position": 0, "quote": good_quote},
         ),
         (
             "no_quote",
-            _probe(),
+            probe(),
             {"current_position": 0, "quote": None},
         ),
     ]
@@ -413,8 +453,13 @@ def run_self_test(config: RiskConfig, clock) -> list[str]:
         engine = RiskEngine(config, clock)  # fresh: no counter pollution
         try:
             engine.check(intent, **kwargs)
-        except RiskRejection:
-            proven.append(name)
+        except RiskRejection as exc:
+            if exc.check == name:
+                proven.append(name)
+            else:
+                # Rejected, but by a different control: this probe demonstrates
+                # nothing about `name`, and counting it would be a false pass.
+                failures.append(f"{name} (rejected by {exc.check} instead)")
         else:
             failures.append(name)
 
@@ -422,18 +467,20 @@ def run_self_test(config: RiskConfig, clock) -> list[str]:
     engine = RiskEngine(config, clock)
     tripped = False
     for _ in range(config.max_orders_per_minute + 2):
-        p = _probe()
+        p = probe()
         try:
             engine.check(p, current_position=0, quote=good_quote)
         except RiskRejection as exc:
             if "orders_per_minute" in exc.check:
                 tripped = True
                 break
-            raise
+            # The baseline order must be admissible under its own config.
+            failures.append(f"max_orders_per_minute (baseline rejected by {exc.check})")
+            break
         engine.record_sent(p, Decimal("600"))
     if tripped:
         proven.append("max_orders_per_minute")
-    else:
+    elif not any(f.startswith("max_orders_per_minute") for f in failures):
         failures.append("max_orders_per_minute")
 
     if failures:

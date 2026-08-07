@@ -340,6 +340,52 @@ def test_host_refuses_a_fence_sharing_the_journal_volume(tmp_path):
     assert excinfo.value.code == EXIT_STARTUP
 
 
+def test_an_unwritable_status_file_does_not_change_the_exit_code(tmp_path):
+    """Found by the Gate B1.4 drill on a real full ext4 volume, not by injection.
+
+    The status file usually lives beside the journal, so "cannot write it" is
+    overwhelmingly "the journal volume is full" -- exactly when the exit code
+    matters most. The host used to heartbeat before checking
+    ``fatal_shutdown_requested``, so the status write raised OSError and the
+    process died with exit 1, which is not in the documented exit-code table
+    the supervisor branches on. The fence had already been raised correctly;
+    only the exit contract broke.
+    """
+    host = _host(tmp_path)
+    controller = host.start()
+    try:
+        # A file where the status directory must be: writes fail as they would
+        # on a full volume.
+        blocker = tmp_path / "blocked"
+        blocker.write_text("not a directory", encoding="utf-8")
+        host.config.status_path = blocker / "status.json"
+
+        alerts: list[tuple[str, str]] = []
+        host.alert = lambda level, msg: alerts.append((level, msg))
+
+        assert host.run_once() is None, "a failed heartbeat is not a reason to stop"
+        assert any("cannot write the status file" in msg for _, msg in alerts)
+
+        controller._fail_closed_runtime("journal unavailable; disk full")
+        assert host.run(ticks=3) == EXIT_FATAL_SHUTDOWN
+    finally:
+        host.close()
+
+
+def test_the_fatal_check_runs_before_the_heartbeat(tmp_path):
+    """Nothing may run ahead of the decision to stop."""
+    host = _host(tmp_path)
+    controller = host.start()
+    try:
+        beats: list[int] = []
+        host._heartbeat = lambda: beats.append(1)  # type: ignore[method-assign]
+        controller._fail_closed_runtime("journal unavailable")
+        assert host.run_once() == EXIT_FATAL_SHUTDOWN
+        assert beats == [], "heartbeated on the way out instead of exiting"
+    finally:
+        host.close()
+
+
 def test_host_writes_a_status_file_the_watchdog_can_read(tmp_path):
     import json
 

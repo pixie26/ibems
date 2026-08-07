@@ -216,6 +216,7 @@ DEFAULT_GATE_STATUS: dict[str, Any] = {
         "B1.3b durable fatal fence",
         "B1.4 real storage faults",
         "B1.5 independent exact-commit sign-off",
+        "B1.6 journal high-water witness (WAL recovery silently drops committed events)",
     ],
 }
 

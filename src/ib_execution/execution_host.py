@@ -109,6 +109,7 @@ class ExecutionHost:
             require_separate_domain=config.require_separate_fence_domain,
         )
         self._stop = False
+        self._heartbeat_failed = False
 
     # -- startup gates ---------------------------------------------------
 
@@ -170,9 +171,27 @@ class ExecutionHost:
         self._stop = True
 
     def _heartbeat(self) -> None:
+        """Best-effort. The status file is telemetry, not a control.
+
+        It usually lives beside the journal, so the case where writing it fails
+        is overwhelmingly "the journal volume is full" -- exactly the case
+        where the exit code matters most. An unhandled ``OSError`` here used to
+        kill the host with exit 1, which is not in the documented exit-code
+        table the supervisor branches on. Found by the Gate B1.4 drill on a
+        real full volume, not by fault injection.
+
+        A stale status file is not a silent failure: the watchdog treats a
+        stopped heartbeat as critical, and the CRITICAL alert has already been
+        emitted through a channel that does not touch this disk.
+        """
         controller = self.controller
         assert controller is not None
-        write_status(self.config.status_path, controller.status())
+        try:
+            write_status(self.config.status_path, controller.status())
+        except OSError as exc:
+            if not self._heartbeat_failed:
+                self._heartbeat_failed = True
+                self.alert("CRITICAL", f"cannot write the status file ({exc}); heartbeat is stale")
 
     def run_once(self) -> Optional[int]:
         """One supervision tick. Returns an exit code when the host must stop.
@@ -181,10 +200,12 @@ class ExecutionHost:
         a statement that the durable path is gone, and the only correct
         response to it is to stop the process -- not to log it, and not to
         keep serving callbacks on state we no longer believe.
+
+        The fatal check comes before the heartbeat: nothing may run ahead of
+        the decision to stop.
         """
         controller = self.controller
         assert controller is not None
-        self._heartbeat()
         if controller.fatal_shutdown_requested:
             detail = controller.journal_failure or "fatal shutdown requested"
             if controller.fence_write_failed:
@@ -202,6 +223,7 @@ class ExecutionHost:
             return EXIT_FATAL_SHUTDOWN
         if self._stop:
             return EXIT_OK
+        self._heartbeat()
         return None
 
     def run(self, ticks: Optional[int] = None) -> int:
