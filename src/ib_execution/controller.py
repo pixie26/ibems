@@ -26,6 +26,7 @@ from typing import Callable, Optional
 from .broker_protocol import Broker, BrokerRejected, BrokerSendUncertain
 from .calendar import ET, TradingCalendar
 from .clock import Clock
+from .fatal_fence import FatalFence
 from .journal import Journal, JournalUnavailable
 from .models import (
     BLOCKS_NEW_ORDER,
@@ -109,6 +110,7 @@ class Controller:
         calendar: Optional[TradingCalendar] = None,
         policy: Optional[ExecutionPolicy] = None,
         alert: Optional[Callable[[str, str], None]] = None,
+        fence: Optional[FatalFence] = None,
     ):
         self.journal = journal
         self.broker = broker
@@ -117,6 +119,10 @@ class Controller:
         self.calendar = calendar or TradingCalendar()
         self.policy = policy or ExecutionPolicy()
         self.alert = alert or (lambda level, msg: None)
+        # Out-of-band durable fence. Optional here so the core stays testable
+        # without a second volume; execution_host always supplies one.
+        self.fence = fence
+        self.fence_write_failed: Optional[str] = None
 
         self.link_state = LinkState.DISCONNECTED
         self.sync_state = SyncState.UNVERIFIED
@@ -1310,15 +1316,43 @@ class Controller:
         )
 
     def _fail_closed_runtime(self, detail: str, *, already_reported: bool = False) -> None:
-        """Out-of-band fatal fence for components whose durable path is unavailable."""
+        """Out-of-band fatal fence for components whose durable path is unavailable.
+
+        The in-memory state below fences *this* process. It cannot fence the
+        next one: the journal is the failed component, so no HALT reaches the
+        disk, and a restart against repaired storage would replay a journal
+        with no HALT in it and come back NORMAL. The durable fence is what
+        carries the decision across the restart -- see fatal_fence.py.
+        """
         self.fatal_shutdown_requested = True
         self.link_state = LinkState.DEGRADED
         self.sync_state = SyncState.UNVERIFIED
         self.operating_mode = OperatingMode.HALTED
+        self._raise_durable_fence(detail)
         if not already_reported:
             self.alert(
                 "CRITICAL",
                 f"engine fenced HALTED; process shutdown required: {detail}",
+            )
+
+    def _raise_durable_fence(self, detail: str) -> None:
+        """Persist the fence, or say plainly that it could not be persisted.
+
+        A fence that failed to write is never reported as one. The process
+        still exits non-zero with a CRITICAL alert, which is where this stood
+        before the fence existed -- strictly no worse, and honest about it.
+        """
+        if self.fence is None:
+            return
+        try:
+            self.fence.raise_fence(detail)
+        except Exception as exc:  # noqa: BLE001 -- must not mask the original fault
+            self.fence_write_failed = str(exc)
+            self.alert(
+                "CRITICAL",
+                "engine fenced HALTED and the DURABLE FENCE COULD NOT BE WRITTEN "
+                f"({exc}). A restart will NOT be blocked automatically. Do not "
+                f"restart this engine until the account is reconciled by hand: {detail}",
             )
 
     def on_connected(self, connection_epoch: int) -> None:

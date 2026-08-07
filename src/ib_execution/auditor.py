@@ -620,7 +620,8 @@ def audit_file(path: str) -> int:
     if not db.exists() or not db.is_file():
         print(f"FAIL: journal does not exist: {db}")
         return 2
-    j = Journal(db)
+    # Read-only: the auditor must be runnable against a live engine's journal.
+    j = Journal(db, owner=False)
     try:
         auditor = JournalAuditor(j.replay())
         findings = auditor.audit()

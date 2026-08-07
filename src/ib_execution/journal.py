@@ -39,6 +39,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
+from .processlock import ProcessLock, ProcessLockUnavailable
+
 from .models import DuplicateDecision, EventType
 
 
@@ -124,6 +126,31 @@ class JournalUnavailable(RuntimeError):
     """
 
 
+class JournalOwnershipError(RuntimeError):
+    """
+    Another live process already owns this journal.
+
+    INVARIANT 0 / PLATFORM OWNERSHIP PREREQUISITE
+    ---------------------------------------------
+    At most one execution host holds writer ownership of one journal (one
+    account execution domain) at any instant.
+
+    Before this existed, single-writer was an architectural convention and
+    nothing more. The only lock here was a ``threading.Lock``, which is
+    per-process, and SQLite in WAL mode admits a second writing process
+    happily. Two hosts on one journal therefore each kept their own in-memory
+    state machine and each sent orders: invariants 1-4 are all stated
+    per-process, and none of them survive that. Invariant 1 in particular is
+    enforced by a primary key, which cannot help when the two processes mint
+    different decision ids for the same intent.
+
+    This is a startup refusal, deliberately not a subclass of
+    ``JournalUnavailable``: nothing is wrong with the journal, and there is no
+    fail-closed runtime state to enter. The correct response is to exit
+    non-zero without connecting to the broker.
+    """
+
+
 class Journal:
     def __init__(
         self,
@@ -132,6 +159,7 @@ class Journal:
         *,
         write_timeout_seconds: float = 30.0,
         sqlite_timeout_seconds: float = 5.0,
+        owner: bool = True,
     ):
         self.path = str(path)
         self._clock = clock
@@ -144,6 +172,24 @@ class Journal:
         self._lock = threading.Lock()
         self._failed: Optional[BaseException] = None
         self._closed = False
+
+        # Cross-process writer ownership. Taken before the schema bootstrap so
+        # a rejected process never touches the database file at all.
+        #
+        # `owner=False` exists for handles that are not the execution host:
+        # the offline auditor (read-only), and tests that deliberately hold two
+        # handles to exercise the halt-acknowledgement CAS. Every production
+        # writing path -- execution_host and the ack_halt CLI -- takes
+        # ownership, which also means an operator cannot acknowledge a halt on
+        # a journal whose engine is still running.
+        self._ownership: Optional[ProcessLock] = None
+        if owner:
+            lock = ProcessLock(Path(self.path).with_name(Path(self.path).name + ".lock"))
+            try:
+                lock.acquire(note=f"journal={Path(self.path).name}")
+            except ProcessLockUnavailable as exc:
+                raise JournalOwnershipError(str(exc)) from exc
+            self._ownership = lock
 
         # Bootstrap schema on the calling thread, then hand the connection to
         # the writer thread which owns it exclusively from then on.
@@ -601,3 +647,6 @@ class Journal:
         self._closed = True
         self._q.put(None)
         self._thread.join(timeout=10)
+        if self._ownership is not None:
+            self._ownership.release()
+            self._ownership = None
