@@ -1,0 +1,50 @@
+name: ci
+
+# Deliberately excluded from CI: the formal Hypothesis campaign, the real
+# storage-fault drills, and anything that touches an IB Gateway.
+#
+# The formal campaign is Gate B1 sign-off evidence and must bind to an exact
+# frozen commit in a controlled environment -- a hosted runner cannot make
+# that claim. A real Gateway must never be reachable from a public runner at
+# all. CI's job is to stop regressions between those campaigns, not to
+# produce gate evidence.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install pinned environment from the lockfile
+        run: uv sync --locked --extra dev --extra ib
+
+      - name: Lockfile is in sync with pyproject.toml
+        run: uv lock --check
+
+      - name: Byte-compile every source file
+        run: uv run python -m compileall -q src tests scripts
+
+      - name: Deterministic suite
+        run: uv run pytest -m "not property" --junitxml=deterministic.xml
+
+      - name: Generated tests, default profile
+        run: uv run pytest -m property --junitxml=property_default.xml
+
+      - name: STATE.json describes this worktree
+        run: uv run python -m ib_execution.provenance --check
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: junit
+          path: "*.xml"

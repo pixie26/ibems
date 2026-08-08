@@ -16,19 +16,34 @@
 
 | 模块 | 状态 |
 |---|---|
-| 无 IB 依赖的执行核心 | 已审查原型。Python 3.12.13 下当前工作树 149 项测试全部通过，其中 144 项 non-property、5 项 property；包含 7 个子进程强杀窗口和 6 类 journal/queue fail-closed 场景。 |
-| Hypothesis Gate campaign | 已提交的 Phase 0 基线中，两项生成式测试各通过 1,500 examples，seed 为 `2026080601`。2026-08-07 的 Recorder-only 修改已跑完整默认回归；下一次 B1 正式签字前应重新运行 formal campaign。 |
-| 22 条安全不变量 | Property / Runtime / Auditor 三重证据入口已齐；真实宿主退出、OS/卷级故障演练和正式评审签字仍未完成。 |
-| 只读 SPY Recorder | 4002 Gateway 握手、server time、SPY 合约解析（`conId=756733`）和静态三轮账户快照读取成功。2026-08-07 实测：IB `10089` entitlement 阻塞已解除，`marketDataType=1`（Live），20 秒采样收到 BidAsk tick 与 5 秒 realtime bars；但本次 `AllLast` 一路在采样窗内 0 tick，preflight 仍判 `passed=false`。尚无合格 Full-RTH session。 |
+| 无 IB 依赖的执行核心 | 已审查原型。包含子进程强杀窗口、journal/queue fail-closed 场景、跨进程所有权和 durable fence 的真实多进程测试。测试计数不在此手抄——运行 `pytest -q` 或看 gate manifest。 |
+| Hypothesis Gate campaign | **需要在 freeze commit 上重跑。** 此前 seed `2026080601` 的 1,500-example campaign 证明的是当时那棵树；A/B/C 三个 commit 已改变 source tree，且 Hypothesis 的 seed 不跨版本复现（依赖现已 `==` pin）。 |
+| 不变量 0 + 22 条安全不变量 | Property / Runtime / Auditor 三重入口已齐，新增不变量 0（单写者进程所有权）。**不变量 2 尚不完整**：B1.4 演练实测 WAL 损坏会静默丢弃已提交事件，见 B1.6。 |
+| 只读 SPY Recorder | 4002 Gateway 握手、server time、SPY 合约解析（`conId=756733`）和静态三轮账户快照读取成功。2026-08-07 实测：IB `10089` entitlement 阻塞已解除，`marketDataType=1`（Live）。同一次预检的 `AllLast=0` **不构成任何结论**——当时的采样口径已被证明无效（见下）。尚无合格 Full-RTH session。 |
 | 交易型 IB Adapter | 未实现、未连接。`placeOrder`、`cancelOrder`、完整 callback/error mapping 和动态 stable-snapshot protocol 均属于 Gate B2。 |
 | Emergency flatten broker path | 未实现。现有代码只覆盖计划生成与人工确认边界。 |
 
 详细状态与可复查证据：
 
+- **[`STATE.json`](STATE.json) —— 唯一权威的机器可读状态**（gate 状态、source/config/lock 三个树 hash）
 - [实施状态](docs/IMPLEMENTATION_STATUS.md)
-- [验证清单](VALIDATION_MANIFEST.txt)
 - [22 条不变量覆盖矩阵](docs/INVARIANT_COVERAGE.md)
 - [审查与执行结论](docs/REVIEW_AND_EXECUTION_20260806_ZH.md)
+
+### provenance 由测试强制，不由纪律强制
+
+此前仓库同时维护 `SHA256SUMS`（手工）和四份互相复述验证状态的散文文档。它们漂移了：README 写 entitlement 已解除、`VALIDATION_MANIFEST.txt` 仍写 FAIL，而 `SHA256SUMS` 对不上自己的工作树。对普通项目这是文档缺陷；**对一个以可审计性为产品的平台，一份描述不了自身工作树的 provenance 文件比没有更糟——它制造信心。**
+
+因此两份手工文件都已删除，取而代之：
+
+```bash
+python -m ib_execution.provenance           # 重新生成 STATE.json
+python -m ib_execution.provenance --check   # CI：与工作树不一致则失败
+```
+
+`tests/test_provenance.py` 另外强制：不得重新引入 `SHA256SUMS`；追踪文件中不得出现账户标识或凭据（文档占位符需在同行写 `provenance-allow: <理由>`）；直接依赖必须 `==` 精确 pin；散文不得声称 Gate B1 已通过而 `STATE.json` 不同意。
+
+Gate campaign 的产物记录四个独立 hash，回答四个不同问题：`source_tree`（跑了什么逻辑）、`config_tree`（在什么限额下跑）、`dependency_lock`（**应该**装什么）、`resolved_environment`（**实际**装了什么）。最后一个才是观测，而 Gate B1 是一个关于观测的论证。
 
 ## 为什么策略和执行系统必须分开
 
@@ -110,7 +125,13 @@ Recorder 与交易路径隔离开发，只采集：
 
 原始事件以 append-only gzip JSONL 滚动保存，收盘后原子生成 Parquet、健康报告和 SHA-256 manifest。健康报告检查 LIVE 数据、三路覆盖、最大 gap、断线、时钟偏差、行数和文件 hash。
 
-当前实测连接正常。2026-08-07 在 4002（paper 账户 `DUN921978`）的预检显示：IB `10089` entitlement 阻塞已解除，`marketDataType=1`（Live），采样窗内收到 BidAsk tick 与 5 秒 realtime bars；但同一次预检中 `AllLast` 一路 0 tick，preflight 的三路 sample 全非零条件未满足，`passed=false`（证据见 `artifacts/ib_preflight/20260807T151722Z/report.json`）。需要再次在 RTH 内复测以判断 `AllLast=0` 是临时 tick 稀疏还是协议路径问题。在预检得到 `market_data_type=1` 且三路 sample 均非零之前，Recorder 仍会 fail-closed、退出码 2。
+当前实测连接正常。2026-08-07 在 4002（paper 账户已 redact）的预检确认：IB `10089` entitlement 阻塞**已解除**，`marketDataType=1`（Live），`entitlement_blocked=false`。这一条是直接观测，成立。
+
+同一次预检报出的 `AllLast=0` **是无效证据，不能用来推断任何事。** 当时 `run_ib_readonly_preflight.py` 在 sleep 结束后读取 `Ticker.tickByTicks` 的**残余内容**，而 `ib_async` 会在每次网络更新之间清空该缓冲区——所以那个 0 只说明「最后一次 flush 里没有 AllLast」，不说明「20 秒内 IB 没有推送 AllLast」。同一次预检里 `bars_5s=4` 之所以正确，仅仅因为它读的是会累积的 `RealTimeBarList`。
+
+已知的只有一件事：**entitlement 不是原因**（已直接观测到 LIVE）。`AllLast` 订阅路径本身是否正常，要等改成 event-driven 累积计数之后重测才能判断——`reqRealTimeBars` 正常并不能推出 `reqTickByTickData` 正常，两者是不同的请求路径。
+
+在预检得到 `market_data_type=1` 且三路 sample 均非零之前，Recorder 仍会 fail-closed、退出码 2。
 
 ```powershell
 # Broker-write-free Gateway 与稳定快照预检
@@ -136,13 +157,17 @@ Watchdog 不自动平仓的前提是 invariant 19：即使日终完全无法平�
 ## 本地验证
 
 ```powershell
-pip install -e ".[dev]"
+uv sync --locked --extra dev --extra ib
 pytest -q
 pytest -q -m property --hypothesis-profile=gate
 python scripts\run_gate_b1.py
 python scripts\demo.py
 python scripts\deterministic_soak.py --seeds 150 --actions 100
 python -m ib_execution.auditor data\journal.db
+python -m ib_execution.provenance --check
+
+# Gate B1.4 需要一个 64-128MB 的独立卷，fence 必须在另一个卷上
+python scripts\run_storage_fault_drill.py --journal-volume X:\ --fence-dir C:\ProgramData\ibems
 ```
 
 150 seeds × 100 actions 的 deterministic soak 已通过；300 × 150 没有在既定审查时限内完成，因此不宣称通过。
@@ -152,17 +177,36 @@ python -m ib_execution.auditor data\journal.db
 - [系统规格](docs/SPEC.md)：状态、事件、接口和不变量定义。
 - [最终执行计划](docs/FINAL_EXECUTION_PLAN_ZH.md)：Gate A/B/C/D、实施顺序和停止条件。
 - [运行手册](docs/RUNBOOK.md)：环境、凭证、启动、告警和事故处理。
+- [Gate B1 签字模板](docs/GATE_B1_SIGNOFF_TEMPLATE.md)：8 项 blocker、22 条不变量逐条签字、以及明确写下的范围边界。
 - [v0.1.5 变更](docs/CHANGES_v0.1.5.md)：本版本安全修正。
 - [v0.1.4 最终审查](docs/FINAL_REVIEW_V014_ZH.md)：HALT durability 等审查结论。
 - `docs/adr/ADR-001` 至 `ADR-009`：关键架构决策。
 
 凭证永远不得进入仓库、配置文件、日志或聊天记录。Gateway 负责认证，本平台不读取 IB 用户名或密码。
 
+## 进程所有权与 fail-closed 边界
+
+三条机制合起来，才让「停下来」这个决定能跨越线程、进程、重启和存储恢复。任何一条缺失都留一个缺口。
+
+**不变量 0 —— 单写者进程所有权。** `Journal` 打开时对 sidecar 取 OS 级独占锁，在建表之前。SQLite WAL 允许多进程写，所以在此之前 single-writer 只是架构约定：两个 host 各自持有内存状态机、各自发单，而不变量 1–4 全部只在单进程内成立。锁由内核在进程死亡（含 SIGKILL）时释放，因此没有租约续期，也没有 stale lock 需要回收。被拒绝的进程**不接触数据库文件，也不连接 broker**。
+
+**`execution_host` —— fail-closed 有了出口。** `fatal_shutdown_requested` 此前是核心置位、watchdog 从状态文件读取、而没有任何进程消费的一个 bool。现在 host 消费它并以退出码 10 结束；生产 supervisor 配置为 `Restart=no`（`deploy/`，由 `tests/test_supervisor.py` 解析断言）。启动顺序本身就是安全论证：日历 → fence 配置 → fence 状态 → journal 所有权 → journal restore，**全部在构造 broker 之前**。
+
+**Durable fatal fence —— 22 号不变量够不到的那一段。** `_fail_closed_journal` 刻意不写 journal，因为 journal 正是失效的那个组件——这是对的，但后果不是：HALT 只存在于内存，进程退出，运维清出磁盘，下一个进程回放一个不含 HALT 的 journal，回到 `NORMAL` 继续交易。不变量 22 全程成立，只是从未被触及——它只能保护**已经落盘**的 HALT。fence 写在**另一个卷**上（journal 所在卷写满，正是最可能要写 fence 的原因；这条通过 `st_dev` 在启动时强制，不靠文档），退休是两阶段的：`RAISED` → 具名确认 → 只有对账解释了账户之后才 retire。确认本身不清除 fence，否则「点确认」就成了恢复交易的捷径。
+
+```bash
+python -m ib_execution.execution_host --journal D:\ibems-data\journal.db \
+    --fence C:\ProgramData\ibems\fatal-fence.json --status D:\ibems-data\status.json
+```
+
+日历同理：`SUPPORTED_YEARS` 之外直接拒绝启动（退出码 13）。此前 `is_trading_day` 只问「是工作日且不在 2026 表里」，于是 2027 年每个 NYSE 假日都会被规划成 16:00 收盘的完整交易日——不报错，只是对着关闭的市场下单。没有任何不变量覆盖「假日表是否仍然有效」，所以再多生成式测试也抓不到。
+
 ## 下一步
 
 1. **策略 Gate A 独立推进。** 在策略仓库完成真实成本、数据质量和统计不确定性判断；若结论为 `NO_GO` 或 `INSUFFICIENT_EVIDENCE`，且没有独立第二消费者，就停止投资交易型 IB Adapter。
-2. **在 RTH 内复测预检并启动 Recorder。** 2026-08-07 已确认 `10089` entitlement 阻塞解除、`marketDataType=1`（Live）。下一步是在正常交易时段复测，确认 `AllLast` 一路稳定非零、三路 sample 全部满足后，从下一个完整 RTH 开始采集和每日健康审计。
-3. **完成 Gate B1。** 补真实 execution-engine 宿主退出/监督器、OS 或受限卷级 disk-full/WAL 演练，以及 22 条不变量正式评审签字。
-4. **B1 签字后才进入 Gate B2。** 先做只连接、只读账户事实和动态 stable-snapshot protocol，再做人工 1 股 paper target/cancel；MOC、多策略和自动 watchdog takeover 继续推迟。
+2. **在 RTH 内复测预检并启动 Recorder。** entitlement 已确认解除；预检的 tick 计数与时钟偏差口径已修好。下一步是在正常交易时段做 90–120 秒预检，取得**第一份关于 `AllLast` 的有效观测**，三路 sample 与时钟偏差中位数都满足后，从下一个完整 RTH 开始采集。第一天只做数据验收，不跑策略；cross-stream diagnostics 先标定 bar/tick 转换关系，标定完成前不作为硬 Gate。
+3. **完成 Gate B1 的 8 项 blocker。** B1.0–B1.3b 已就位。B1.4 已在 96MB loop ext4 上实跑：`disk_full` PASS，`wal_corruption` **FAIL** —— 由此新增 **B1.6**（WAL 恢复会静默丢弃已提交事件，需要带外单调见证者，未实现）。B1.5 仍需评审签字。
+4. **冻结后再跑正式 campaign。** 所有代码、配置、依赖和测试改动必须先全部落地，然后取 freeze commit，再在那个 commit 上跑 deterministic suite、formal Hypothesis campaign、真实存储故障演练和 journal auditor。**campaign 是最后的证明，不是开发过程中的阶段性测试。** 期间发现 bug 就修、重取 freeze commit、整个 campaign 重跑——不 cherry-pick 一个小修然后沿用旧证明。
+5. **B1 签字后才进入 Gate B2，且第一阶段仍然不下单。** 先做只连接、只读账户事实、动态 stable-snapshot protocol 和 `DOCUMENTED_VS_OBSERVED.md`，再做人工 1 股 paper target/cancel；MOC、多策略和自动 watchdog takeover 继续推迟。
 
-当前第二个独立使用者仍为 `NONE_CONFIRMED`。QQQ 与 SPY 属于同一日内动量命题，不能单独证明继续建设交易 Adapter 的经济必要性。
+当前第二个独立使用者仍为 `NONE_CONFIRMED`。QQQ 与 SPY 属于同一日内动量命题，不能单独证明继续建设交易 Adapter 的经济必要性。**平台越成熟，越不能反过来成为「所以策略应该交易」的理由。**

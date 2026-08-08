@@ -38,6 +38,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
+from uuid import uuid4
+
+from .processlock import ProcessLock, ProcessLockUnavailable
 
 from .models import DuplicateDecision, EventType
 
@@ -79,6 +82,15 @@ CREATE TABLE IF NOT EXISTS booked_executions (
     exec_id TEXT PRIMARY KEY,
     seq     INTEGER NOT NULL,
     ts_utc  TEXT    NOT NULL
+);
+
+-- A stable identity for this journal file, written once at creation.
+-- The out-of-band witness (B1.6) binds to it, so pointing the engine at a
+-- different journal -- a restored backup, a stale copy, an empty file -- is a
+-- detectable mismatch rather than a witness that silently refers to nothing.
+CREATE TABLE IF NOT EXISTS journal_identity (
+    id         TEXT PRIMARY KEY,
+    created_utc TEXT NOT NULL
 );
 """
 
@@ -124,6 +136,31 @@ class JournalUnavailable(RuntimeError):
     """
 
 
+class JournalOwnershipError(RuntimeError):
+    """
+    Another live process already owns this journal.
+
+    INVARIANT 0 / PLATFORM OWNERSHIP PREREQUISITE
+    ---------------------------------------------
+    At most one execution host holds writer ownership of one journal (one
+    account execution domain) at any instant.
+
+    Before this existed, single-writer was an architectural convention and
+    nothing more. The only lock here was a ``threading.Lock``, which is
+    per-process, and SQLite in WAL mode admits a second writing process
+    happily. Two hosts on one journal therefore each kept their own in-memory
+    state machine and each sent orders: invariants 1-4 are all stated
+    per-process, and none of them survive that. Invariant 1 in particular is
+    enforced by a primary key, which cannot help when the two processes mint
+    different decision ids for the same intent.
+
+    This is a startup refusal, deliberately not a subclass of
+    ``JournalUnavailable``: nothing is wrong with the journal, and there is no
+    fail-closed runtime state to enter. The correct response is to exit
+    non-zero without connecting to the broker.
+    """
+
+
 class Journal:
     def __init__(
         self,
@@ -132,6 +169,7 @@ class Journal:
         *,
         write_timeout_seconds: float = 30.0,
         sqlite_timeout_seconds: float = 5.0,
+        owner: bool = True,
     ):
         self.path = str(path)
         self._clock = clock
@@ -145,10 +183,37 @@ class Journal:
         self._failed: Optional[BaseException] = None
         self._closed = False
 
+        # Cross-process writer ownership. Taken before the schema bootstrap so
+        # a rejected process never touches the database file at all.
+        #
+        # `owner=False` exists for handles that are not the execution host:
+        # the offline auditor (read-only), and tests that deliberately hold two
+        # handles to exercise the halt-acknowledgement CAS. Every production
+        # writing path -- execution_host and the ack_halt CLI -- takes
+        # ownership, which also means an operator cannot acknowledge a halt on
+        # a journal whose engine is still running.
+        self._ownership: Optional[ProcessLock] = None
+        if owner:
+            lock = ProcessLock(Path(self.path).with_name(Path(self.path).name + ".lock"))
+            try:
+                lock.acquire(note=f"journal={Path(self.path).name}")
+            except ProcessLockUnavailable as exc:
+                raise JournalOwnershipError(str(exc)) from exc
+            self._ownership = lock
+
         # Bootstrap schema on the calling thread, then hand the connection to
         # the writer thread which owns it exclusively from then on.
         conn = sqlite3.connect(self.path, timeout=self._sqlite_timeout_seconds)
         conn.executescript(SCHEMA)
+        row = conn.execute("SELECT id FROM journal_identity LIMIT 1").fetchone()
+        if row is None:
+            self.journal_id = uuid4().hex
+            conn.execute(
+                "INSERT INTO journal_identity(id, created_utc) VALUES (?, ?)",
+                (self.journal_id, datetime.now(timezone.utc).isoformat()),
+            )
+        else:
+            self.journal_id = str(row[0])
         conn.commit()
         conn.close()
 
@@ -558,6 +623,43 @@ class Journal:
         finally:
             conn.close()
 
+    def max_seq(self) -> int:
+        """The highest sequence present *after* any WAL recovery.
+
+        Deliberately read from the database rather than remembered in memory:
+        the whole point of B1.6 is that recovery can leave fewer events than
+        were committed, and only a fresh read can show that.
+        """
+        conn = self._read_conn()
+        try:
+            row = conn.execute("SELECT MAX(seq) FROM events").fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+        finally:
+            conn.close()
+
+    def event_at(self, seq: int) -> Optional[JournalEvent]:
+        conn = self._read_conn()
+        try:
+            row = conn.execute("SELECT * FROM events WHERE seq = ?", (seq,)).fetchone()
+            if row is None:
+                return None
+            return JournalEvent(
+                seq=row["seq"],
+                ts_utc=datetime.fromisoformat(row["ts_utc"]),
+                ts_mono_ns=row["ts_mono_ns"],
+                event_type=EventType(row["event_type"]),
+                payload=json.loads(row["payload"]),
+                strategy_id=row["strategy_id"],
+                symbol=row["symbol"],
+                decision_id=row["decision_id"],
+                intent_id=row["intent_id"],
+                order_ref=row["order_ref"],
+                perm_id=row["perm_id"],
+                exec_id=row["exec_id"],
+            )
+        finally:
+            conn.close()
+
     def events_of(self, *types: EventType) -> list[JournalEvent]:
         wanted = {t.value for t in types}
         return [e for e in self.replay() if e.event_type.value in wanted]
@@ -601,3 +703,6 @@ class Journal:
         self._closed = True
         self._q.put(None)
         self._thread.join(timeout=10)
+        if self._ownership is not None:
+            self._ownership.release()
+            self._ownership = None

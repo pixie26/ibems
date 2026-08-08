@@ -6,14 +6,29 @@ build-backend = "setuptools.build_meta"
 name = "ib-execution-platform"
 version = "0.1.5.dev0"
 description = "Thin single-account IBKR execution platform. Strategy-agnostic by construction."
-requires-python = ">=3.12"
-dependencies = ["PyYAML>=6.0"]
+requires-python = ">=3.12,<3.13"
+dependencies = ["PyYAML==6.0.3"]
 
+# EXACT PINS ARE A GATE B1 REQUIREMENT (B1.0), NOT A STYLE CHOICE.
+#
+# The formal Hypothesis campaign records a seed. A Hypothesis seed only
+# reproduces within one Hypothesis version -- generation and shrinking change
+# between releases -- so `hypothesis>=6.100` makes the recorded seed, and
+# therefore the whole B1 evidence chain, unreproducible. The same argument
+# applies to ib_async: every Gate B2 observation is a claim about one exact
+# client implementation's callback semantics.
+#
+# uv.lock pins the full transitive closure. These pins pin the direct edges so
+# a reader of pyproject.toml alone cannot mistake the intent.
 [project.optional-dependencies]
 # The state-machine core has no IB dependency. PyYAML is the only base runtime
 # dependency because production must load the exact checked risk configuration.
-ib = ["ib_async>=1.0", "pyarrow>=15.0"]
-dev = ["pytest>=8.0", "hypothesis>=6.100", "pyarrow>=15.0"]
+ib = ["ib_async==2.1.0", "pyarrow==25.0.0"]
+dev = ["pytest==9.1.1", "hypothesis==6.165.2", "pyarrow==25.0.0"]
+# Gate B1.4 harness only, never loaded by the platform. fusepy backs
+# scripts/slow_fsync_fs.py, whose whole purpose is that the kernel -- not a
+# Python patch -- is what blocks SQLite inside fsync. Linux only.
+drill = ["fusepy==3.0.1"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

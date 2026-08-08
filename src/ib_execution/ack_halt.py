@@ -32,7 +32,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from .journal import HaltAcknowledgementConflict, Journal
+from .journal import HaltAcknowledgementConflict, Journal, JournalOwnershipError
 from .models import EventType, OperatingMode
 
 
@@ -96,7 +96,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"journal not found: {path}")
         return 2
 
-    journal = Journal(path)
+    try:
+        # Ownership on purpose: acknowledging a halt on a journal whose engine
+        # is still running would race the engine's own state machine, and the
+        # engine is exactly what should be stopped and diagnosed first.
+        journal = Journal(path)
+    except JournalOwnershipError as exc:
+        print(
+            f"Refusing to clear: the engine still owns this journal.\n  {exc}\n"
+            "Stop the execution host, diagnose the cause, then acknowledge."
+        )
+        return 2
     try:
         halt = find_unacknowledged_halt(journal)
         if halt is None:

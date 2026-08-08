@@ -88,7 +88,7 @@ def confirm(plan: FlattenPlan, stream=None, out=None) -> bool:
     stream = stream or sys.stdin
     out = out or sys.stdout
     print(plan.describe(), file=out)
-    token = "FLATTEN LIVE" if plan.is_live else "FLATTEN"
+    token = "FLATTEN LIVE" if plan.is_live else "FLATTEN"  # provenance-allow: operator confirmation phrase, not a credential
     print(f"Type exactly: {token}", file=out)
     return stream.readline().strip() == token
 

@@ -129,8 +129,21 @@ def test_a_second_halt_needs_a_second_acknowledgement(
     assert c2.operating_mode is OperatingMode.HALTED, "stale acknowledgement reused"
 
 
+def test_ack_tool_refuses_while_the_engine_still_owns_the_journal(ctl, journal, capsys):
+    """Acknowledging a live engine's halt would race its own state machine.
+
+    The engine is the thing to stop and diagnose first, so the tool refuses
+    rather than opening a second writer.
+    """
+    ctl.halt("needs a human")
+    rc = ack_main(["--journal", journal.path])
+    assert rc == 2
+    assert "still owns this journal" in capsys.readouterr().out
+
+
 def test_ack_tool_refuses_without_attribution(ctl, journal, broker, clock, capsys):
     ctl.halt("needs a human")
+    journal.close()                     # the operator acknowledges with the engine down
     rc = ack_main(["--journal", journal.path])
     out = capsys.readouterr().out
     assert rc == 1
@@ -141,6 +154,7 @@ def test_ack_tool_refuses_without_attribution(ctl, journal, broker, clock, capsy
 def test_ack_tool_shows_the_leading_events(ctl, journal, broker, clock, capsys):
     """The operator should read the cause before being offered the button."""
     ctl.halt("unexplained position mismatch: {'SPY': {'expected': 0, 'actual': 77}}")
+    journal.close()
     rc = ack_main(["--journal", journal.path, "--show"])
     out = capsys.readouterr().out
     assert rc == 0
@@ -149,6 +163,7 @@ def test_ack_tool_shows_the_leading_events(ctl, journal, broker, clock, capsys):
 
 
 def test_ack_tool_is_a_noop_when_nothing_is_halted(ctl, journal, capsys):
+    journal.close()
     rc = ack_main(["--journal", journal.path])
     assert rc == 0
     assert "Nothing to do" in capsys.readouterr().out
@@ -207,7 +222,11 @@ def test_restart_does_not_append_synthetic_halts(
 def test_stale_ack_cannot_clear_a_newer_halt(tmp_path, clock):
     path = tmp_path / "race.db"
     j1 = Journal(path, clock=clock)
-    j2 = Journal(path, clock=clock)
+    # Two handles on purpose: this is about the acknowledgement CAS, not about
+    # writer ownership, so the second one bypasses the ownership lock that
+    # would otherwise (correctly) refuse it. See test_journal_ownership.py for
+    # the ownership property itself.
+    j2 = Journal(path, clock=clock, owner=False)
     try:
         first = j1.commit(
             EventType.OPERATING_MODE_CHANGED,

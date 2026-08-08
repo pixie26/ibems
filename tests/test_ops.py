@@ -1,28 +1,19 @@
 """
-Watchdog, recorder storage, and emergency-flatten scaffolding.
+Watchdog and emergency-flatten scaffolding.
 
 The watchdog tests are mostly about what it REFUSES to do.
+Recorder storage and health live in tests/test_recorder.py.
 """
 
 from __future__ import annotations
 
 import io
 import json
-import time
-from datetime import date
 
 import pytest
 
 from ib_execution.emergency_flatten import FlattenPlan, build_plan_from_snapshot, confirm
 from ib_execution.models import BrokerOrder, BrokerSnapshot, Side
-from ib_execution.quote_recorder import (
-    QuoteRecorder,
-    RawEventLog,
-    RawTick,
-    SubscriptionLimiter,
-    compute_health,
-    finalize_day,
-)
 from ib_execution.watchdog import Watchdog, WatchdogConfig, write_status
 
 
@@ -122,82 +113,6 @@ def test_status_write_is_atomic(tmp_path):
         assert "pid" in loaded and "heartbeat_mono" in loaded
 
 
-# --------------------------------------------------------------------------
-# recorder storage
-# --------------------------------------------------------------------------
-
-
-def _tick(i: int, ns: int) -> RawTick:
-    return RawTick(
-        event_id=i,
-        connection_epoch=1,
-        contract_id=756733,
-        event_type="BID_ASK",
-        broker_timestamp="2026-08-05T14:00:00Z",
-        local_wall_ns=ns,
-        local_monotonic_ns=ns,
-        market_data_type="LIVE",
-        receive_sequence=i,
-        bid=599.98,
-        ask=600.02,
-        bid_size=500,
-        ask_size=500,
-    )
-
-
-def test_segments_roll_and_rename_atomically(tmp_path):
-    """
-    Never hold one file open all session: a crash at 15:45 costs the whole day.
-    """
-    log = RawEventLog(tmp_path, session=date(2026, 8, 5), roll_seconds=10)
-    for i in range(5):
-        log.append(_tick(i, 1_000_000_000 * i), now_mono=float(i))
-    for i in range(5, 10):
-        log.append(_tick(i, 1_000_000_000 * i), now_mono=float(i * 10))
-    log.close()
-
-    segs = log.segments()
-    assert len(segs) >= 2, "expected the log to roll"
-    assert not list(log.dir.glob(".partial-*")), "no partial files left behind"
-    assert len(list(log.read_all())) == 10
-
-
-def test_health_detects_delayed_data(tmp_path):
-    """
-    The classic silent failure: three months of delayed data, and every L2/L3
-    conclusion built on it is void. A daily check makes it a one-day loss.
-    """
-    log = RawEventLog(tmp_path, session=date(2026, 8, 5))
-    for i in range(10):
-        t = _tick(i, 1_000_000_000 * i)
-        log.append(RawTick(**{**t.__dict__, "market_data_type": "DELAYED"}), now_mono=float(i))
-    log.close()
-
-    h = compute_health(log, session_seconds=10.0)
-    assert not h.ok()
-    assert any("LIVE" in p for p in h.problems())
-
-
-def test_health_detects_gaps(tmp_path):
-    log = RawEventLog(tmp_path, session=date(2026, 8, 5))
-    log.append(_tick(0, 0), now_mono=0.0)
-    log.append(_tick(1, 600 * 1_000_000_000), now_mono=1.0)   # 10 minute hole
-    log.close()
-
-    h = compute_health(log, session_seconds=600.0)
-    assert h.max_gap_seconds >= 600
-    assert not h.ok()
-
-
-def test_health_passes_on_a_clean_session(tmp_path):
-    log = RawEventLog(tmp_path, session=date(2026, 8, 5))
-    for i in range(100):
-        log.append(_tick(i, i * 1_000_000_000), now_mono=float(i))
-    log.close()
-
-    h = compute_health(log, session_seconds=99.0)
-    assert h.ok(), h.problems()
-
 
 # --------------------------------------------------------------------------
 # emergency flatten scaffolding
@@ -237,136 +152,3 @@ def test_flat_account_needs_no_closing_order():
     plan = FlattenPlan("DU123", "SPY", 0)
     assert plan.closing_side is None
     assert "already flat" in plan.describe()
-
-
-def test_health_does_not_hide_delayed_interval_with_final_live_tick(tmp_path):
-    log = RawEventLog(tmp_path, session=date(2026, 8, 5))
-    delayed = _tick(0, 0)
-    log.append(RawTick(**{**delayed.__dict__, "market_data_type": "DELAYED"}), now_mono=0)
-    log.append(_tick(1, 1_000_000_000), now_mono=1)
-    log.close()
-    h = compute_health(log, session_seconds=1.0)
-    assert not h.ok()
-    assert h.market_data_type.startswith("MIXED")
-
-
-def test_system_events_cannot_mask_market_data_gap(tmp_path):
-    log = RawEventLog(tmp_path, session=date(2026, 8, 5))
-    log.append(_tick(0, 0), now_mono=0)
-    for i in range(1, 10):
-        t = _tick(i, i * 60 * 1_000_000_000)
-        log.append(
-            RawTick(**{**t.__dict__, "event_type": "SYSTEM", "special_conditions": "HEARTBEAT"}),
-            now_mono=i,
-        )
-    log.append(_tick(10, 600 * 1_000_000_000), now_mono=10)
-    log.close()
-    h = compute_health(log, session_seconds=600.0)
-    assert h.max_gap_seconds == 600.0
-    assert not h.ok()
-
-
-def test_health_surfaces_fatal_recorder_error(tmp_path):
-    log = RawEventLog(tmp_path, session=date(2026, 8, 5))
-    event = _tick(0, 0)
-    log.append(
-        RawTick(
-            **{
-                **event.__dict__,
-                "event_type": "SYSTEM",
-                "special_conditions": "RECORDER_ERROR:RecorderPrerequisiteError:10089",
-            }
-        ),
-        now_mono=0,
-    )
-    log.close()
-    health = compute_health(log, session_seconds=1.0)
-    assert any("10089" in problem for problem in health.problems())
-
-
-def test_health_does_not_count_intentional_close_as_disconnect(tmp_path):
-    log = RawEventLog(tmp_path, session=date(2026, 8, 5))
-    event = _tick(0, 0)
-    log.append(
-        RawTick(
-            **{
-                **event.__dict__,
-                "event_type": "SYSTEM",
-                "special_conditions": "CONNECTION_CLOSED_INTENTIONAL",
-            }
-        ),
-        now_mono=0,
-    )
-    log.close()
-    assert compute_health(log, session_seconds=1.0).disconnects == 0
-
-
-def test_same_day_recorder_restarts_use_unique_segment_names(tmp_path):
-    d = date(2026, 8, 5)
-    a = RawEventLog(tmp_path, session=d)
-    a.append(_tick(0, 0), now_mono=0)
-    a.close()
-    b = RawEventLog(tmp_path, session=d)
-    b.append(_tick(1, 1_000_000_000), now_mono=0)
-    b.close()
-    assert len(a.segments()) == 2
-
-
-def test_recorder_finalizes_parquet_health_and_hash_manifest(tmp_path):
-    log = RawEventLog(tmp_path, session=date(2026, 8, 5))
-    bid = _tick(1, 0)
-    last = RawTick(
-        **{
-            **_tick(2, 1_000_000_000).__dict__,
-            "event_type": "ALL_LAST",
-            "last": 600.0,
-            "last_size": 10,
-        }
-    )
-    bar = RawTick(
-        **{
-            **_tick(3, 2_000_000_000).__dict__,
-            "event_type": "BAR_5S",
-            "open": 599.9,
-            "high": 600.1,
-            "low": 599.8,
-            "close": 600.0,
-            "volume": 1000,
-            "wap": 599.99,
-            "trade_count": 25,
-        }
-    )
-    for i, row in enumerate((bid, last, bar)):
-        log.append(row, now_mono=float(i))
-
-    manifest = finalize_day(log, session_seconds=2.0, clock_skew_seconds=0.1)
-    assert manifest["health_ok"] is True
-    assert manifest["rows"] == 3
-    assert (log.dir / "events.parquet").exists()
-    assert (log.dir / "health.json").exists()
-    assert (log.dir / "manifest.json").exists()
-    assert all(len(value) == 64 for value in manifest["files"].values())
-
-    import pyarrow.parquet as pq
-
-    assert pq.read_table(log.dir / "events.parquet").num_rows == 3
-
-
-def test_subscription_limiter_waits_when_bucket_is_empty():
-    limiter = SubscriptionLimiter(rate_per_second=1000, burst=1)
-    limiter.wait(lambda _: None)
-    sleeps: list[float] = []
-    limiter.wait(lambda delay: (sleeps.append(delay), time.sleep(delay)))
-    assert sleeps and sleeps[0] > 0
-
-
-@pytest.mark.parametrize("code", [354, 10089, 10189])
-def test_recorder_classifies_entitlement_errors_as_non_retryable(code):
-    assert QuoteRecorder._is_fatal_market_data_error(code, "localized message")
-
-
-def test_recorder_classifies_permission_specific_realtime_bar_error_as_non_retryable():
-    assert QuoteRecorder._is_fatal_market_data_error(
-        420, "No market data permissions for AMEX STK"
-    )
-    assert not QuoteRecorder._is_fatal_market_data_error(420, "generic pacing error")

@@ -1,0 +1,74 @@
+# Production supervisor unit for the execution host (Linux).
+#
+# THIS FILE IS GATE B1.3a EVIDENCE, NOT AN EXAMPLE.
+#
+# Proving in a test that the child exits non-zero says nothing about
+# production if production is configured to restart it. The restart policy is
+# therefore part of the signed-off artifact set, and tests/test_supervisor.py
+# parses this file and asserts on it.
+#
+# Restart=no is the entire point. Every non-zero exit from execution_host
+# means a human has to look:
+#
+#   10  EXIT_FATAL_SHUTDOWN  the engine fenced itself; the journal's durable
+#                            path is gone. Restarting cannot fix it, and the
+#                            durable fence will refuse the next start anyway.
+#   11  EXIT_NOT_OWNER       another execution host owns this journal. A
+#                            restart loop here is how you get two writers.
+#   12  EXIT_FENCED          a durable fence from a previous fatal shutdown.
+#                            Acknowledge it and reconcile the account first.
+#   13  EXIT_CALENDAR        the trading calendar does not cover today.
+#   14  EXIT_STARTUP         some other pre-broker refusal.
+#   15  EXIT_WITNESS         the journal no longer holds the event that
+#                            authorised the last broker write. An order may be
+#                            live at IB with no local record of it. Reconcile
+#                            the account by hand before anything else.
+#
+# Restart=on-failure would turn every one of these into a crash loop that
+# reconnects to a broker each time. RestartSec cannot make that safe.
+
+[Unit]
+Description=IB execution host (single account, single writer)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ibems
+Group=ibems
+
+# The journal and the fence MUST be on different volumes. The host verifies
+# this at startup via st_dev and refuses otherwise, but keep them apart here
+# too so the intent is visible in the deployment.
+Environment=IBEMS_JOURNAL=/var/lib/ibems/journal.db
+Environment=IBEMS_FENCE=/var/opt/ibems-fence/fatal-fence.json
+Environment=IBEMS_STATUS=/run/ibems/status.json
+# Gate B1.6. Same volume as the fence, and for the same reason: it has to
+# outlive the journal's volume.
+Environment=IBEMS_WITNESS=/var/opt/ibems-fence/journal-witness.json
+
+ExecStart=/opt/ibems/.venv/bin/python -m ib_execution.execution_host \
+    --journal ${IBEMS_JOURNAL} \
+    --fence ${IBEMS_FENCE} \
+    --status ${IBEMS_STATUS} \
+    --witness ${IBEMS_WITNESS}
+
+# NEVER change this to on-failure or always. See the exit-code table above.
+Restart=no
+
+# A stop must not look like a crash: give the host time to finalize.
+TimeoutStopSec=60
+KillSignal=SIGTERM
+
+# The engine writes only to its own state directories.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/var/lib/ibems /var/opt/ibems-fence /run/ibems
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
