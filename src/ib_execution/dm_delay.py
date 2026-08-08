@@ -12,7 +12,7 @@ Lifecycle, all of it owned here so the operator runs one command:
 
     sparse image -> loop device -> dm-delay target -> mkfs -> mount
         ... the drill runs ...
-    umount -> dmsetup remove -> losetup -d -> delete the image
+    reset delay -> umount -> dmsetup remove -> losetup -d -> delete image
 
 ``delay_ms`` is applied to writes, which is what an fsync waits on. It can be
 changed while mounted (``set_delay``), so a drill can prove the engine is
@@ -27,7 +27,9 @@ restricted to devices this module made:
 * the mapper name is namespaced and must not already be in use;
 * the image is size-capped;
 * it never touches a caller-supplied device, and there is no flag to make it;
-* teardown runs from ``finally`` and is idempotent, including after Ctrl-C.
+* teardown runs from ``finally`` and is idempotent, including after Ctrl-C;
+* teardown is bounded and best-effort: cleanup trouble must not erase the
+  behavioral evidence the drill just produced.
 
 Linux only, and root only. It is drill scaffolding, never imported by the
 platform at runtime.
@@ -54,8 +56,12 @@ class DmDelayUnsafe(RuntimeError):
     """A precondition that protects real devices was not met."""
 
 
-def _run(*args: str, check: bool = True) -> subprocess.CompletedProcess:
-    result = subprocess.run(args, capture_output=True, text=True, timeout=120)
+def _run(
+    *args: str,
+    check: bool = True,
+    timeout: float = 120.0,
+) -> subprocess.CompletedProcess:
+    result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
     if check and result.returncode != 0:
         raise RuntimeError(
             f"{' '.join(args)} failed ({result.returncode}): "
@@ -107,6 +113,7 @@ class DelayedVolume:
         self.loop: Optional[str] = None
         self._mounted = False
         self._created = False
+        self.teardown_errors: list[str] = []
 
     @property
     def device(self) -> str:
@@ -175,26 +182,86 @@ class DelayedVolume:
 
     # -- teardown ---------------------------------------------------------
 
-    def destroy(self) -> None:
-        """Idempotent, best-effort, and safe to call twice or after a crash."""
+    def _cleanup_call(self, *args: str, timeout: float = 20.0) -> bool:
+        """Run one cleanup command without allowing it to mask drill evidence."""
+        try:
+            result = _run(*args, check=False, timeout=timeout)
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.teardown_errors.append(f"{' '.join(args)}: {type(exc).__name__}: {exc}")
+            return False
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            self.teardown_errors.append(
+                f"{' '.join(args)} failed ({result.returncode}): {detail}"
+            )
+            return False
+        return True
+
+    def destroy(self) -> list[str]:
+        """Idempotent, bounded best-effort cleanup.
+
+        The first real dm-delay run found an important harness bug here: the
+        device was intentionally left at 45 seconds of delay and ``umount`` was
+        called directly. Unmount then blocked past the generic 120-second
+        command timeout, and the exception from this ``finally`` erased the
+        behavioral result before the manifest could be written.
+
+        Teardown therefore first restores a zero-delay table while the device
+        is still mounted. Every subsequent cleanup operation is bounded and
+        failures are collected rather than raised. The caller can report those
+        errors separately; cleanup must never rewrite a PASS/FAIL observation.
+        """
+        self.teardown_errors = []
+
+        # A delayed filesystem can make unmount itself take minutes because an
+        # unmount flushes metadata. Restore the transparent table first. This is
+        # safe: the target is namespaced and was created by this object.
+        if (self._created or Path(self.device).exists()) and self.delay_ms != 0:
+            try:
+                self.set_delay(0)
+            except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+                self.teardown_errors.append(
+                    f"reset delay to 0 before unmount: {type(exc).__name__}: {exc}"
+                )
+
         if self._mounted or os.path.ismount(self.mount_point):
-            for attempt in range(5):
-                if _run("umount", str(self.mount_point), check=False).returncode == 0:
-                    break
-                time.sleep(1 + attempt)      # a delayed device unmounts slowly
-            else:
-                _run("umount", "-l", str(self.mount_point), check=False)
-            self._mounted = False
+            if not self._cleanup_call("umount", str(self.mount_point), timeout=20.0):
+                # Lazy detach is a drill-owned last resort. It prevents cleanup
+                # from blocking forever while the kernel retires stale refs.
+                self._cleanup_call("umount", "-l", str(self.mount_point), timeout=20.0)
+            self._mounted = os.path.ismount(self.mount_point)
+            if self._mounted:
+                self.teardown_errors.append(f"mount still active: {self.mount_point}")
+
         if self._created or Path(self.device).exists():
-            for attempt in range(5):
-                if _run("dmsetup", "remove", self.name, check=False).returncode == 0:
-                    break
-                time.sleep(1 + attempt)
-            self._created = False
+            if not self._cleanup_call("dmsetup", "remove", self.name, timeout=20.0):
+                # The target is drill-owned and namespaced; deferred removal is
+                # safer than a long blocking retry if a stale kernel ref remains.
+                self._cleanup_call(
+                    "dmsetup", "remove", "--deferred", self.name, timeout=20.0
+                )
+            self._created = Path(self.device).exists()
+            if self._created:
+                self.teardown_errors.append(f"mapper still present: {self.device}")
+
         if self.loop:
-            _run("losetup", "-d", self.loop, check=False)
-            self.loop = None
-        self.image.unlink(missing_ok=True)
+            if self._cleanup_call("losetup", "-d", self.loop, timeout=20.0):
+                self.loop = None
+            else:
+                self.teardown_errors.append(f"loop still attached: {self.loop}")
+
+        # Only delete the backing pathname once no loop reference remains. If a
+        # cleanup step failed, leaving the namespaced image is better evidence
+        # than silently deleting the operator's only clue.
+        if self.loop is None:
+            try:
+                self.image.unlink(missing_ok=True)
+            except OSError as exc:
+                self.teardown_errors.append(
+                    f"delete backing image {self.image}: {type(exc).__name__}: {exc}"
+                )
+
+        return list(self.teardown_errors)
 
     def __enter__(self) -> "DelayedVolume":
         return self.create()
