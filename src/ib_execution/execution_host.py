@@ -276,9 +276,20 @@ class ExecutionHost:
         return EXIT_OK
 
     def close(self) -> None:
-        if self.journal is not None:
-            self.journal.close()
-            self.journal = None
+        if self.journal is None:
+            return
+        # Fatal storage shutdown is intentionally different from a graceful
+        # stop. Journal.close() waits only a bounded time for its writer and
+        # then releases the process lock. With a real fsync still blocked below
+        # SQLite, that could briefly make a second execution host the "owner"
+        # while this process is still alive. On the fatal path there is no
+        # cleanup obligation worth weakening invariant 0 for: keep the Journal
+        # (and therefore its OS ownership lock) alive until process death, when
+        # the kernel releases it atomically with the process.
+        if self.controller is not None and self.controller.fatal_shutdown_requested:
+            return
+        self.journal.close()
+        self.journal = None
 
     # -- fence retirement ------------------------------------------------
 
