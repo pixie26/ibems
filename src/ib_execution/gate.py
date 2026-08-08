@@ -99,17 +99,27 @@ B1_REQUIREMENTS: tuple[Requirement, ...] = (
     Requirement(
         id="B1.4",
         title="real storage faults on a constrained volume",
-        status=PARTIAL,
-        evidence="scripts/run_storage_fault_drill.py, artifacts/gate_b1_storage/",
+        status=READY_FOR_FREEZE,
+        evidence=(
+            "scripts/run_storage_fault_drill.py, artifacts/gate_b1_storage/, "
+            "GitHub Actions b1-storage-fsync run 31268292501"
+        ),
         note=(
-            "On 96MB loop ext4 (-m 0), fence on a separate volume: disk_full PASS "
-            "(exit 10, fence raised). wal_corruption PASS (real rollback lost 21-138 "
-            "committed events; loss above the witness correctly tolerated, forced "
-            "crossing correctly refused with exit 15 and a fence). fsync_stall "
-            "NOT RUN -- the dm-delay driver is complete (provisioning, delay "
-            "reload, healthy/stalling control pair, finally-teardown) but this "
-            "kernel has no device-mapper, and the FUSE fallback cannot back "
-            "SQLite's WAL -shm mmap (SIGBUS). One command on a host with dm."
+            "All three real-storage sub-drills have passed. On 96MB loop ext4 "
+            "(-m 0), fence on a separate volume: disk_full PASS (real ENOSPC -> "
+            "fence -> exit 10); wal_corruption PASS (real WAL rollback measured, "
+            "loss above the witness tolerated and forced crossing refused with "
+            "exit 15 + fence). fsync_stall PASS on Ubuntu 24.04 / Linux 6.17 Azure "
+            "with real dm-delay v1.5.0 and separate constrained filesystems: 200ms "
+            "healthy control reached one observed place_order while remaining alive "
+            "and unfenced; live reload to 45s before the target crossed the 30s "
+            "journal timeout, raised the durable fence, exited 10, and recorded zero "
+            "broker writes after the fault. The first real dm-delay run also found "
+            "and fixed a teardown defect: unmounting while delay remained 45s could "
+            "time out and mask the behavioral result; teardown now resets delay to "
+            "0 and is bounded/best-effort. This is pre-freeze engineering evidence; "
+            "the complete campaign must still be regenerated against the exact "
+            "freeze commit for B1.5."
         ),
     ),
     Requirement(
