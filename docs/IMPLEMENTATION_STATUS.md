@@ -46,46 +46,66 @@ DO NOT CONNECT THE TRADING ADAPTER TO IB PAPER OR LIVE
 - **B1.3b** durable fatal fence：带外持久围栏；存储修复后用健康 journal 重启仍拒绝进入 NORMAL；
 - **B1.4** real storage faults：真实受限卷 disk-full / WAL 损坏 / fsync stall。**已在 96MB loop-mounted ext4（`-m 0`）上实跑**：
   - `disk_full` **PASS**：真实 ENOSPC → journal 写失败 → 另一卷上的 durable fence 已写入 → host 退出码 10；
-  - `wal_corruption` **FAIL —— 见下方 B1.6**；
+  - `wal_corruption` **PASS**（见 B1.6）：真实回滚丢失的事件若在 witness 之上则正确容忍，强制越过 witness 则退出码 15 + fence；
+  - `fsync_stall` **INCONCLUSIVE**：本机 FUSE harness 无法承载 SQLite WAL 的 `-shm` mmap（SIGBUS，已实测确认 non-WAL 与 `locking_mode=EXCLUSIVE` 均正常），需在生产主机上用 dm-delay 重跑；
 - **B1.5** independent exact-commit sign-off：22 条不变量 + 全部 artifact 绑定 exact commit；
-- **B1.6（本次演练新增）** journal high-water witness：WAL 损坏会**静默丢弃已提交事件**，详见下节。
+- **B1.6（本次演练新增，已实现）** journal witness：WAL 损坏会**静默丢弃已提交事件**，详见下节。
 
 `docs/INVARIANT_COVERAGE.md` 的 P/R/A 三层齐备不等于 Gate B1 通过；上述任一项未完成都必须维持 `gate_b1: NOT_PASSED`。
 
-## B1.6 — WAL 损坏会静默丢弃已提交事件（2026-08-07 实测，未修）
+## B1.6 — WAL 损坏会静默丢弃已提交事件（2026-08-08 已修）
 
 这是 B1.4 演练在**真实 ext4 卷**上发现的，不是注入故障能发现的。
 
-实测（`scripts/run_storage_fault_drill.py --drill wal_corruption`，96MB loop ext4）：
-
 ```text
-SIGKILL 引擎，WAL 保留 4,161,232 bytes
-损坏前可回放事件：4,406
+SIGKILL 引擎，WAL 保留约 4.1 MB
 损坏 WAL header 的 checksum（offset 24）
-损坏后可回放事件：4,379
-→ 27 条已提交事件消失，SQLite 未报任何错误
-→ 引擎正常启动，继续运行
+损坏前可回放事件 4,406 → 损坏后 4,379
+→ 27 条已提交事件消失，SQLite 未报任何错误，引擎正常启动
 ```
 
-这些事件全部是在 `synchronous=FULL` 下 `commit()` 成功返回的——调用方**已被告知它们持久化了**。WAL header 的 checksum 失败会让 SQLite 的恢复流程**丢弃 WAL 帧而不是报错**，数据库仍然内部自洽，只是变短了。`PRAGMA integrity_check` 查不出来，因为没有任何损坏——只是少了行。
+这些事件全部是 `synchronous=FULL` 下 `commit()` 成功返回的——调用方**已被告知它们持久化了**。WAL header checksum 失败会让恢复流程**丢弃帧而不是报错**，数据库仍内部自洽，只是变短了；`PRAGMA integrity_check` 查不出来，因为确实没有损坏，只是少了行。直接打穿不变量 2。
 
-对一个以 durable-before-send 为核心承诺的平台，这直接打穿不变量 2：
+### 修法：带外见证者，绑定事件身份而不是裸 max_seq
+
+`src/ib_execution/journal_witness.py`。写在 fence 那个卷上（同一个理由：要能活过 journal 所在卷）。**不是每次 commit 都写**——那会为心跳和遥测付一次跨卷 fsync；只在**安全边界**写。
+
+记录的不是「至少有 N 行」，而是授权了这次副作用的**那一条具体证据**：
 
 ```text
-commit(ORDER_SENT) → 成功
-place_order()      → IB 侧订单已存在
-崩溃 + WAL 损坏
-重启 → 回放的 journal 里没有那条 ORDER_SENT
-→ 引擎认为自己从未下单，而单子活在 IB
+journal_id + seq + event_type + intent_id + order_ref + payload digest
 ```
 
-**从数据库内部无法检测这件事**，必须有一个带外的单调见证者。建议方案（待决策，未实现）：
+启动时（构造 broker 之前）四种失败都拒绝：seq 缺失、digest 不符、`journal_id` 不符、`max_seq < witness.seq`。`journal_id` 那条顺带挡住恢复的备份和被换掉的 journal 文件——裸序号做不到。
 
-在 fence 所在的那个卷上维护一个 **journal high-water mark**——已提交的最大 seq。启动时若回放得到的 max seq **低于**记录值，说明 journal 丢过已提交事件 → 拒绝启动并升起 fence。
+### 覆盖面：先做对抗性演练，再决定，而不是先假设
 
-写入时机是设计要点：每次 commit 都写一次代价太高（多一次跨卷 fsync）。真正需要覆盖的只有**其丢失会造成危险的那些事件**，也就是紧邻 broker write 之前的那些。因此 mark 应该在 durable-before-send 序列里、`place_order` 之前更新一次。这样滞后只会漏掉不影响安全的事件，而任何低于 mark 的丢失都会被抓住。
+原先的判断是「只覆盖 broker write 就够，漏掉的都是丢了也不危险的」。**这个判断是错的**，`tests/test_journal_witness.py` 的 HALT tail-loss drill 证伪了它：
 
-在 B1.6 关闭之前，`gate_b1` 必须维持 `NOT_PASSED`。
+```text
+seq 100  最后一次 broker-write witness
+seq 120  HALTED
+崩溃 + WAL 回滚到 seq 110
+→ max_seq 110 ≥ 100，witness 通过
+→ 但 HALT 没了 → 重启回到 NORMAL → 不变量 22 被存储打穿
+```
+
+因此 `SAFETY_CRITICAL_TYPES` 现在也覆盖 `OPERATING_MODE_CHANGED` 与 `HALT_CAUSE_ADDED`。仍然只需一条记录：WAL 恢复截断的是尾部而不是打洞，所以钉住**最新**的安全关键事件就界定了它之前所有事件的丢失。
+
+写入失败的处理是**不对称**的，这是刻意的：
+
+- **broker write 之前** witness 写不了 → 拒绝下单 + fence。此刻「什么都不做」是明确安全的，因为还没发单。
+- **HALT 之后** witness 写不了 → 告警但**不撤销 HALT**。HALT 已经发生且已落盘，为了满足见证者去撤销它是荒谬的。
+
+### 真实卷实测（`artifacts/gate_b1_storage/`）
+
+```text
+HALT 被 witness 钉在 seq 2309（OPERATING_MODE_CHANGED）
+真实 WAL 回滚丢 21 条，全部在 witness 之上
+→ 引擎正确启动（只丢遥测不是安全事件；否则每次 WAL 受损都变成停机）
+强制越过 witness（删除 seq ≥ 2309）
+→ host 退出码 15（EXIT_WITNESS），fence 已升起，原因写明缺了哪一条
+```
 
 ## Recorder deployment blockers
 

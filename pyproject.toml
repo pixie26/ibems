@@ -25,6 +25,10 @@ dependencies = ["PyYAML==6.0.3"]
 # dependency because production must load the exact checked risk configuration.
 ib = ["ib_async==2.1.0", "pyarrow==25.0.0"]
 dev = ["pytest==9.1.1", "hypothesis==6.165.2", "pyarrow==25.0.0"]
+# Gate B1.4 harness only, never loaded by the platform. fusepy backs
+# scripts/slow_fsync_fs.py, whose whole purpose is that the kernel -- not a
+# Python patch -- is what blocks SQLite inside fsync. Linux only.
+drill = ["fusepy==3.0.1"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

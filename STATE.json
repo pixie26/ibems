@@ -43,7 +43,7 @@
       {
         "evidence": "scripts/run_storage_fault_drill.py, artifacts/gate_b1_storage/",
         "id": "B1.4",
-        "note": "disk_full PASS on 96MB loop ext4 (exit 10, fence raised on the other volume). wal_corruption FAIL -> B1.6. fsync_stall implemented but not yet run on the production host.",
+        "note": "On 96MB loop ext4 (-m 0), fence on a separate volume: disk_full PASS (exit 10, fence raised). wal_corruption PASS (real rollback lost 21-138 committed events; loss above the witness correctly tolerated, forced crossing correctly refused with exit 15 and a fence). fsync_stall INCONCLUSIVE -- the FUSE harness cannot back SQLite's WAL -shm mmap (SIGBUS), so it must be rerun with dm-delay on the production host.",
         "status": "PARTIAL",
         "title": "real storage faults on a constrained volume"
       },
@@ -55,10 +55,10 @@
         "title": "independent sign-off bound to an exact commit"
       },
       {
-        "evidence": "src/ib_execution/journal_witness.py, tests/test_journal_witness.py",
+        "evidence": "src/ib_execution/journal_witness.py, tests/test_journal_witness.py, artifacts/gate_b1_storage/ (forced_crossing -> exit 15 + fence)",
         "id": "B1.6",
-        "note": "WAL recovery silently discards committed frames: 27 of 4,406 events vanished with no error. Breaks invariant 2, since a commit()ed SEND_ATTEMPT_STARTED can disappear while the order is live at IB.",
-        "status": "OPEN",
+        "note": "",
+        "status": "READY_FOR_FREEZE",
         "title": "out-of-band witness that committed events still exist"
       }
     ],
@@ -72,8 +72,8 @@
       "config/risk.example.yml"
     ],
     "config_tree_sha256": "2afcb80305ec6de198a911624c05f6e7681326d16d53fe0a268e60594ab26dcf",
-    "dependency_lock_sha256": "5863fe636a10cfb4170c54f4bf3df68e9438ab769be8d8e45e4cf0926d98d1d3",
-    "source_file_count": 55,
-    "source_tree_sha256": "69dc3934f0ef7ffca074089fe174d4145c264c57fc3b3cc9dfaa34cc0a9ec421"
+    "dependency_lock_sha256": "6156296dd9b10927a0700cc2dfd77d42a19a6c39c0bb2753d982b30045de1a5b",
+    "source_file_count": 58,
+    "source_tree_sha256": "da518e3d092185501e5273edaa1490c1561d483762dcb8fe0d8a436a7f35dae9"
   }
 }

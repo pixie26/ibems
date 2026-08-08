@@ -19,17 +19,21 @@ $Python    = 'C:\opt\ibems\.venv\Scripts\python.exe'
 $Journal   = 'D:\ibems-data\journal.db'
 $Fence     = 'C:\ProgramData\ibems\fatal-fence.json'
 $StatusOut = 'D:\ibems-data\status.json'
+# Gate B1.6: same drive as the fence, for the same reason.
+$Witness   = 'C:\ProgramData\ibems\journal-witness.json'
 
 nssm install $Service $Python `
     '-m' 'ib_execution.execution_host' `
     '--journal' $Journal `
     '--fence'   $Fence `
-    '--status'  $StatusOut
+    '--status'  $StatusOut `
+    '--witness' $Witness
 
 # NEVER change AppExit to Restart. Every non-zero exit code from
 # execution_host (10 fatal shutdown, 11 not owner, 12 fenced, 13 calendar,
-# 14 startup) means a human has to look before the engine reaches a broker
-# again. Restarting turns each of them into a crash loop that reconnects.
+# 14 startup, 15 witness violation) means a human has to look before the engine
+# reaches a broker again. Restarting turns each of them into a crash loop that
+# reconnects.
 nssm set $Service AppExit Default Exit
 nssm set $Service AppStopMethodConsole 60000
 nssm set $Service Start SERVICE_DEMAND_START

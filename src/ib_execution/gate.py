@@ -102,9 +102,12 @@ B1_REQUIREMENTS: tuple[Requirement, ...] = (
         status=PARTIAL,
         evidence="scripts/run_storage_fault_drill.py, artifacts/gate_b1_storage/",
         note=(
-            "disk_full PASS on 96MB loop ext4 (exit 10, fence raised on the other "
-            "volume). wal_corruption FAIL -> B1.6. fsync_stall implemented but not "
-            "yet run on the production host."
+            "On 96MB loop ext4 (-m 0), fence on a separate volume: disk_full PASS "
+            "(exit 10, fence raised). wal_corruption PASS (real rollback lost 21-138 "
+            "committed events; loss above the witness correctly tolerated, forced "
+            "crossing correctly refused with exit 15 and a fence). fsync_stall "
+            "INCONCLUSIVE -- the FUSE harness cannot back SQLite's WAL -shm mmap "
+            "(SIGBUS), so it must be rerun with dm-delay on the production host."
         ),
     ),
     Requirement(
@@ -117,12 +120,10 @@ B1_REQUIREMENTS: tuple[Requirement, ...] = (
     Requirement(
         id="B1.6",
         title="out-of-band witness that committed events still exist",
-        status=OPEN,
-        evidence="src/ib_execution/journal_witness.py, tests/test_journal_witness.py",
-        note=(
-            "WAL recovery silently discards committed frames: 27 of 4,406 events "
-            "vanished with no error. Breaks invariant 2, since a commit()ed "
-            "SEND_ATTEMPT_STARTED can disappear while the order is live at IB."
+        status=READY_FOR_FREEZE,
+        evidence=(
+            "src/ib_execution/journal_witness.py, tests/test_journal_witness.py, "
+            "artifacts/gate_b1_storage/ (forced_crossing -> exit 15 + fence)"
         ),
     ),
 )

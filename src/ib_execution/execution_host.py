@@ -49,6 +49,7 @@ from .clock import Clock, SystemClock
 from .controller import Controller, ExecutionPolicy
 from .fatal_fence import FatalFence, FenceStillRaised
 from .journal import Journal, JournalOwnershipError
+from .journal_witness import JournalWitness, WitnessViolation
 from .risk import RiskEngine
 from .watchdog import write_status
 
@@ -60,6 +61,7 @@ EXIT_NOT_OWNER = 11           # another execution host owns this journal
 EXIT_FENCED = 12              # a durable fatal fence from a previous run
 EXIT_CALENDAR = 13            # the trading calendar does not cover this date
 EXIT_STARTUP = 14             # any other refusal before the broker was touched
+EXIT_WITNESS = 15             # the journal lost evidence that authorised a broker write
 
 
 class HostStartupRefused(RuntimeError):
@@ -75,6 +77,9 @@ class HostConfig:
     journal_path: Path
     fence_path: Path
     status_path: Path
+    # Gate B1.6. Defaults to a sibling of the fence, which is the point: it has
+    # to survive the journal's volume, exactly like the fence does.
+    witness_path: Optional[Path] = None
     require_separate_fence_domain: bool = True
     heartbeat_seconds: float = 1.0
 
@@ -108,6 +113,10 @@ class ExecutionHost:
             config.journal_path,
             require_separate_domain=config.require_separate_fence_domain,
         )
+        self.witness = JournalWitness(
+            config.witness_path
+            or config.fence_path.with_name("journal-witness.json")
+        )
         self._stop = False
         self._heartbeat_failed = False
 
@@ -137,6 +146,20 @@ class ExecutionHost:
         except FenceStillRaised as exc:
             raise HostStartupRefused(EXIT_FENCED, str(exc)) from exc
 
+    def _gate_witness(self, journal: Journal) -> None:
+        """Gate B1.6, and the reason it runs before the broker is constructed.
+
+        If the journal no longer holds the event that authorised the last
+        broker write, an order may be live at the broker with no local record.
+        Connecting first and reconciling would be reasoning from a journal we
+        have just proved incomplete.
+        """
+        try:
+            self.witness.verify(journal)
+        except WitnessViolation as exc:
+            self.fence.raise_fence(f"journal witness violation: {exc}")
+            raise HostStartupRefused(EXIT_WITNESS, str(exc)) from exc
+
     def start(self) -> Controller:
         """Run every gate, then build the controller. Broker untouched until the end."""
         calendar_state = self._gate_calendar()
@@ -145,6 +168,12 @@ class ExecutionHost:
         # the journal, so that an operator tool can open it while diagnosing.
         self._gate_fence()
         self.journal = self._gate_ownership()
+        try:
+            self._gate_witness(self.journal)
+        except HostStartupRefused:
+            self.journal.close()
+            self.journal = None
+            raise
 
         self.controller = Controller(
             journal=self.journal,
@@ -155,6 +184,7 @@ class ExecutionHost:
             policy=self.policy,
             alert=self.alert,
             fence=self.fence,
+            witness=self.witness,
         )
         self.controller.restore_from_journal()
         self.alert(
@@ -264,6 +294,12 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     ap.add_argument("--status", default="status.json")
     ap.add_argument(
+        "--witness",
+        default=None,
+        help="journal witness path; defaults to a sibling of --fence, and must "
+             "be on a different volume from --journal for the same reason",
+    )
+    ap.add_argument(
         "--allow-shared-fence-volume",
         action="store_true",
         help="testing only: skip the separate-failure-domain check",
@@ -295,6 +331,7 @@ def main(  # pragma: no cover - exercised by tests/test_execution_host.py subpro
             journal_path=Path(ns.journal),
             fence_path=Path(ns.fence),
             status_path=Path(ns.status),
+            witness_path=Path(ns.witness) if ns.witness else None,
             require_separate_fence_domain=not ns.allow_shared_fence_volume,
         ),
         broker_factory=broker_factory,

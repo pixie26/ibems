@@ -8,7 +8,7 @@
 |---|---|---|---|---|---|
 | 0 | single-writer process ownership | yes | OS 独占锁 + 非零退出 | n/a | 真实双进程 + SIGKILL 后继承 |
 | 1 | decision id once | yes | DB PK + atomic accept | yes | complete |
-| 2 | durable before broker write | yes | commit-before-call | yes | subprocess force-kill: before/after WAL。**B1.6 未关闭前不完整**：WAL 损坏会静默丢弃已提交事件 |
+| 2 | durable before broker write | yes | commit-before-call + 带外 witness | yes | subprocess force-kill；真实卷 WAL 回滚越过 witness → 退出码 15 |
 | 3 | one live intent per leg | yes | state gate | yes | generated restart lifecycle |
 | 4 | no second send pending ACK | yes | state gate | yes | generated lifecycle |
 | 5 | no replacement pending cancel | yes | state gate | yes | cancel crash window |
@@ -35,7 +35,7 @@
 三条一起才构成完整的 fail-closed，缺一条就有缺口：
 
 - **22** 保护**已经落盘**的 HALT。journal 本身失效时，HALT 落不了盘，所以 22 不会被触发——不是被绕过，是被跳过。
-- **B1.6** 是同一族的第四块，也是唯一还没补的：22 假设「落盘了就还在」。WAL 损坏后的恢复会**丢弃已提交帧而不报错**，所以落了盘的事件也可能消失。没有带外的单调见证者，从数据库内部无法察觉。
+- **B1.6 的 witness** 是同一族的第四块：22 假设「落盘了就还在」，而 WAL 恢复会**丢弃已提交帧而不报错**。对抗性演练证明只钉 broker write 不够——HALT 不是 broker write，丢掉它就绕过了 22——所以 witness 也覆盖 HALT 类事件。
 - **0** 保证同一时刻只有一个进程能写，否则 1–4 全部只在单进程内成立。
 - **B1.3b 的 durable fence** 补上 22 够不到的那一段：把「这次决定停」带过进程边界、重启和存储恢复。
 
@@ -50,9 +50,9 @@
 | B1.2 | calendar fail-closed | `tests/test_calendar_coverage.py` |
 | B1.3a | fatal host exit | `tests/test_fatal_fence.py` + `deploy/` + `tests/test_supervisor.py` |
 | B1.3b | durable fatal fence | `tests/test_fatal_fence.py::test_a_repaired_journal_still_refuses_to_trade` |
-| B1.4 | real storage faults | `scripts/run_storage_fault_drill.py`。96MB loop ext4 实跑：`disk_full` PASS（退出码 10 + fence），`wal_corruption` FAIL |
+| B1.4 | real storage faults | 96MB loop ext4 实跑：`disk_full` PASS，`wal_corruption` PASS，`fsync_stall` INCONCLUSIVE（需 dm-delay） |
 | B1.5 | independent exact-commit sign-off | `docs/GATE_B1_SIGNOFF_TEMPLATE.md`（未签） |
-| B1.6 | journal high-water witness | **未实现。** WAL 损坏静默丢弃已提交事件（实测 27/4406），打穿不变量 2；详见 `docs/IMPLEMENTATION_STATUS.md` |
+| B1.6 | journal witness | 已实现。绑定 `journal_id`+seq+event identity+digest；覆盖 broker write 与 HALT 类事件；`tests/test_journal_witness.py` |
 
 之前那次 1,500-example campaign（seed `2026080601`、source-tree `4990d57c…`）证明的是**当时那棵树**。A/B/C 三个 commit 已经改变了 source tree，所以它不能作为当前 HEAD 的签字证据；campaign 必须在 freeze commit 上重跑。
 

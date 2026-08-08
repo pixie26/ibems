@@ -38,6 +38,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
+from uuid import uuid4
 
 from .processlock import ProcessLock, ProcessLockUnavailable
 
@@ -81,6 +82,15 @@ CREATE TABLE IF NOT EXISTS booked_executions (
     exec_id TEXT PRIMARY KEY,
     seq     INTEGER NOT NULL,
     ts_utc  TEXT    NOT NULL
+);
+
+-- A stable identity for this journal file, written once at creation.
+-- The out-of-band witness (B1.6) binds to it, so pointing the engine at a
+-- different journal -- a restored backup, a stale copy, an empty file -- is a
+-- detectable mismatch rather than a witness that silently refers to nothing.
+CREATE TABLE IF NOT EXISTS journal_identity (
+    id         TEXT PRIMARY KEY,
+    created_utc TEXT NOT NULL
 );
 """
 
@@ -195,6 +205,15 @@ class Journal:
         # the writer thread which owns it exclusively from then on.
         conn = sqlite3.connect(self.path, timeout=self._sqlite_timeout_seconds)
         conn.executescript(SCHEMA)
+        row = conn.execute("SELECT id FROM journal_identity LIMIT 1").fetchone()
+        if row is None:
+            self.journal_id = uuid4().hex
+            conn.execute(
+                "INSERT INTO journal_identity(id, created_utc) VALUES (?, ?)",
+                (self.journal_id, datetime.now(timezone.utc).isoformat()),
+            )
+        else:
+            self.journal_id = str(row[0])
         conn.commit()
         conn.close()
 
@@ -601,6 +620,43 @@ class Journal:
                     perm_id=row["perm_id"],
                     exec_id=row["exec_id"],
                 )
+        finally:
+            conn.close()
+
+    def max_seq(self) -> int:
+        """The highest sequence present *after* any WAL recovery.
+
+        Deliberately read from the database rather than remembered in memory:
+        the whole point of B1.6 is that recovery can leave fewer events than
+        were committed, and only a fresh read can show that.
+        """
+        conn = self._read_conn()
+        try:
+            row = conn.execute("SELECT MAX(seq) FROM events").fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+        finally:
+            conn.close()
+
+    def event_at(self, seq: int) -> Optional[JournalEvent]:
+        conn = self._read_conn()
+        try:
+            row = conn.execute("SELECT * FROM events WHERE seq = ?", (seq,)).fetchone()
+            if row is None:
+                return None
+            return JournalEvent(
+                seq=row["seq"],
+                ts_utc=datetime.fromisoformat(row["ts_utc"]),
+                ts_mono_ns=row["ts_mono_ns"],
+                event_type=EventType(row["event_type"]),
+                payload=json.loads(row["payload"]),
+                strategy_id=row["strategy_id"],
+                symbol=row["symbol"],
+                decision_id=row["decision_id"],
+                intent_id=row["intent_id"],
+                order_ref=row["order_ref"],
+                perm_id=row["perm_id"],
+                exec_id=row["exec_id"],
+            )
         finally:
             conn.close()
 

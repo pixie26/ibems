@@ -28,6 +28,7 @@ from .calendar import ET, TradingCalendar
 from .clock import Clock
 from .fatal_fence import FatalFence
 from .journal import Journal, JournalUnavailable
+from .journal_witness import JournalWitness
 from .models import (
     BLOCKS_NEW_ORDER,
     UNTRUSTWORTHY_ORDER_STATES,
@@ -111,6 +112,7 @@ class Controller:
         policy: Optional[ExecutionPolicy] = None,
         alert: Optional[Callable[[str, str], None]] = None,
         fence: Optional[FatalFence] = None,
+        witness: Optional[JournalWitness] = None,
     ):
         self.journal = journal
         self.broker = broker
@@ -123,6 +125,9 @@ class Controller:
         # without a second volume; execution_host always supplies one.
         self.fence = fence
         self.fence_write_failed: Optional[str] = None
+        # Gate B1.6. Pins the durable evidence behind each broker write so a
+        # later WAL rollback that removes it is detectable at startup.
+        self.witness = witness
 
         self.link_state = LinkState.DISCONNECTED
         self.sync_state = SyncState.UNVERIFIED
@@ -203,11 +208,12 @@ class Controller:
         if self.operating_mode is new:
             return
         old, self.operating_mode = self.operating_mode, new
-        self.journal.commit(
+        seq = self.journal.commit(
             EventType.OPERATING_MODE_CHANGED,
             {"from": old.value, "to": new.value, "why": why},
         )
         if new is OperatingMode.HALTED:
+            self._witness_safety_critical(seq, f"HALT: {why}")
             self.alert("CRITICAL", f"HALTED: {why}")
 
     def halt(self, why: str) -> None:
@@ -216,7 +222,8 @@ class Controller:
             # is already HALTED. It advances the durable acknowledgement token,
             # so an operator looking at an older screen cannot clear a newer
             # unresolved cause.
-            self.journal.commit(EventType.HALT_CAUSE_ADDED, {"why": why})
+            seq = self.journal.commit(EventType.HALT_CAUSE_ADDED, {"why": why})
+            self._witness_safety_critical(seq, f"HALT cause: {why}")
             self.alert("CRITICAL", f"HALT cause added: {why}")
             return
         self.set_mode(OperatingMode.HALTED, why)
@@ -507,8 +514,11 @@ class Controller:
         leg.live_intent = intent
         self._set_order_state(leg, OrderState.INTENT_COMMITTED, "intent durable")
 
-        # 2. mark the send attempt durable BEFORE the call (invariant 2)
-        self.journal.commit(
+        # 2. mark the send attempt durable BEFORE the call (invariant 2).
+        # The returned sequence is what the out-of-band witness pins: it is the
+        # specific piece of evidence that will later have to prove a send may
+        # have happened, so it is that event's continued existence that matters.
+        send_seq = self.journal.commit(
             EventType.SEND_ATTEMPT_STARTED,
             {
                 "attempt": leg.attempt,
@@ -533,6 +543,11 @@ class Controller:
         # Count every broker submission attempt, including clean rejects. A
         # rejection loop is still a runaway loop and must hit the daily/minute cap.
         self.risk.record_sent(intent, accounting_price or Decimal(0))
+        if not self._witness_or_fence(send_seq, "place_order"):
+            self._set_order_state(leg, OrderState.IDLE, "witness unavailable")
+            leg.live_intent = None
+            self._defer(leg, MissReason.MODE_BLOCKED)
+            return False
         try:
             broker_order_id = self.broker.place_order(intent)
         except BrokerRejected as exc:
@@ -600,7 +615,7 @@ class Controller:
             f"cancel_order while link={self.link_state.value} sync={self.sync_state.value}",
         )
 
-        self.journal.commit(
+        cancel_seq = self.journal.commit(
             EventType.CANCEL_REQUESTED,
             {"why": why},
             strategy_id=leg.strategy_id,
@@ -611,6 +626,9 @@ class Controller:
         self._set_order_state(leg, OrderState.PENDING_CANCEL, why)
         leg.cancel_requested_at = self.clock.now()
         leg.cancel_reason = why
+        if not self._witness_or_fence(cancel_seq, "cancel_order"):
+            self._set_order_state(leg, OrderState.TERMINAL_UNRECONCILED, "witness unavailable")
+            return False
         try:
             self.broker.cancel_order(intent.order_ref)
         except Exception as exc:  # noqa: BLE001
@@ -1333,6 +1351,54 @@ class Controller:
             self.alert(
                 "CRITICAL",
                 f"engine fenced HALTED; process shutdown required: {detail}",
+            )
+
+    def _witness_or_fence(self, seq: int, where: str) -> bool:
+        """Pin the authorising event out of band, or refuse to write to the broker.
+
+        Gate B1.6. ``commit()`` returning success is not the same as the event
+        still being there after a crash -- WAL recovery discards frames whose
+        checksums do not verify and reports nothing, leaving a shorter but
+        internally consistent database. Without a witness the restarted engine
+        can believe it never sent an order that is live at the broker.
+
+        A witness that cannot be written is a hard stop, not a warning. Sending
+        anyway would create precisely the untracked broker state this exists to
+        prevent, and it is the one moment where "do nothing" is unambiguously
+        safe: no order has been placed yet.
+        """
+        if self.witness is None:
+            return True
+        try:
+            self.witness.record(self.journal, seq)
+            return True
+        except Exception as exc:  # noqa: BLE001 -- any failure here stops the send
+            self._fail_closed_runtime(
+                f"journal witness unavailable before {where}; refusing the broker "
+                f"write: {exc}"
+            )
+            return False
+
+    def _witness_safety_critical(self, seq: int, detail: str) -> None:
+        """Pin a HALT out of band. Asymmetric with the broker-write case.
+
+        A witness failure before a broker write means "do not send", and that
+        is unambiguously safe because nothing has been sent. A witness failure
+        after a HALT is the opposite: the HALT already happened and is already
+        durable, and undoing it to satisfy the witness would be absurd. So this
+        alerts and continues -- the engine stays HALTED either way, and the
+        operator is told that a storage fault could hide this HALT from the
+        next start.
+        """
+        if self.witness is None:
+            return
+        try:
+            self.witness.record(self.journal, seq)
+        except Exception as exc:  # noqa: BLE001
+            self.alert(
+                "CRITICAL",
+                f"could not witness {detail}; a WAL rollback could hide it from the "
+                f"next start, so do not restart without reconciling: {exc}",
             )
 
     def _raise_durable_fence(self, detail: str) -> None:

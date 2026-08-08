@@ -19,6 +19,10 @@
 #                            Acknowledge it and reconcile the account first.
 #   13  EXIT_CALENDAR        the trading calendar does not cover today.
 #   14  EXIT_STARTUP         some other pre-broker refusal.
+#   15  EXIT_WITNESS         the journal no longer holds the event that
+#                            authorised the last broker write. An order may be
+#                            live at IB with no local record of it. Reconcile
+#                            the account by hand before anything else.
 #
 # Restart=on-failure would turn every one of these into a crash loop that
 # reconnects to a broker each time. RestartSec cannot make that safe.
@@ -39,11 +43,15 @@ Group=ibems
 Environment=IBEMS_JOURNAL=/var/lib/ibems/journal.db
 Environment=IBEMS_FENCE=/var/opt/ibems-fence/fatal-fence.json
 Environment=IBEMS_STATUS=/run/ibems/status.json
+# Gate B1.6. Same volume as the fence, and for the same reason: it has to
+# outlive the journal's volume.
+Environment=IBEMS_WITNESS=/var/opt/ibems-fence/journal-witness.json
 
 ExecStart=/opt/ibems/.venv/bin/python -m ib_execution.execution_host \
     --journal ${IBEMS_JOURNAL} \
     --fence ${IBEMS_FENCE} \
-    --status ${IBEMS_STATUS}
+    --status ${IBEMS_STATUS} \
+    --witness ${IBEMS_WITNESS}
 
 # NEVER change this to on-failure or always. See the exit-code table above.
 Restart=no
