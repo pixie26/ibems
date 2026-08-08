@@ -18,7 +18,20 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out the exact evidence commit
+        uses: actions/checkout@v4
+        with:
+          # pull_request normally checks out GitHub's synthetic merge ref. That
+          # is useful for compatibility CI but wrong for provenance: the B1.4
+          # manifest must name the exact PR-head code that was exercised.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+
+      - name: Confirm evidence commit
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git rev-parse HEAD
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
