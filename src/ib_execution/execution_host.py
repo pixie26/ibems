@@ -275,18 +275,27 @@ class ExecutionHost:
             self.sleeper(self.config.heartbeat_seconds)
         return EXIT_OK
 
-    def close(self) -> None:
+    def close(self, *, process_exiting: bool = False) -> None:
+        """Close gracefully, except for a fatal path that is actually exiting.
+
+        ``process_exiting`` is explicit because unit tests and operator tooling
+        often simulate a fatal condition without terminating the Python process.
+        Those callers still need normal cleanup. Only ``main()`` sets it True,
+        at the point where returning the fatal exit code will end the process.
+        """
         if self.journal is None:
             return
-        # Fatal storage shutdown is intentionally different from a graceful
-        # stop. Journal.close() waits only a bounded time for its writer and
-        # then releases the process lock. With a real fsync still blocked below
-        # SQLite, that could briefly make a second execution host the "owner"
-        # while this process is still alive. On the fatal path there is no
-        # cleanup obligation worth weakening invariant 0 for: keep the Journal
-        # (and therefore its OS ownership lock) alive until process death, when
-        # the kernel releases it atomically with the process.
-        if self.controller is not None and self.controller.fatal_shutdown_requested:
+        # Journal.close() waits only a bounded time for its writer and then
+        # releases the ProcessLock. With a real fsync still blocked below
+        # SQLite, doing that during a fatal process exit could briefly admit a
+        # second execution host before this one has actually died. Keep the
+        # Journal (and its OS lock) alive instead; the kernel releases the lock
+        # atomically with process death.
+        if (
+            process_exiting
+            and self.controller is not None
+            and self.controller.fatal_shutdown_requested
+        ):
             return
         self.journal.close()
         self.journal = None
@@ -370,7 +379,7 @@ def main(  # pragma: no cover - exercised by tests/test_execution_host.py subpro
     try:
         return host.run(ticks=ns.ticks)
     finally:
-        host.close()
+        host.close(process_exiting=True)
 
 
 if __name__ == "__main__":  # pragma: no cover
