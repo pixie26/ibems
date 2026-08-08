@@ -11,7 +11,11 @@ anything it did not make itself.
 
 from __future__ import annotations
 
+import importlib.util
+import inspect
+import json
 import os
+from pathlib import Path
 
 import pytest
 
@@ -27,6 +31,16 @@ def _volume(tmp_path, **over):
     )
     kwargs.update(over)
     return dm_delay.DelayedVolume(**kwargs)
+
+
+def _storage_drill_module():
+    """Load the script without requiring ``scripts`` to be a package."""
+    path = Path(__file__).resolve().parents[1] / "scripts" / "run_storage_fault_drill.py"
+    spec = importlib.util.spec_from_file_location("ibems_storage_fault_drill", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_availability_gives_a_reason_rather_than_a_bare_false():
@@ -69,6 +83,40 @@ def test_destroy_is_idempotent_and_safe_before_create(tmp_path):
 def test_the_device_path_is_derived_from_the_namespaced_name(tmp_path):
     volume = _volume(tmp_path)
     assert volume.device == f"/dev/mapper/{dm_delay.MAPPER_PREFIX}test"
+
+
+def test_fsync_stall_is_injected_after_a_healthy_start_and_before_the_trigger():
+    """Protect the causal ordering that makes B1.4 a runtime-failure drill."""
+    drill = _storage_drill_module()
+    source = inspect.getsource(drill._run_fsync_stalling_case)
+    started = source.index("_wait_started")
+    fault = source.index("volume.set_delay(stalling_delay_ms)")
+    trigger = source.index('paths["trigger"].write_text')
+    assert started < fault < trigger
+
+
+def test_post_fault_broker_writes_are_read_from_the_child_log(tmp_path):
+    """The manifest value must be an observation, never a literal zero."""
+    drill = _storage_drill_module()
+    path = tmp_path / "broker-calls.jsonl"
+    records = [
+        {"ts_monotonic_ns": 10, "operation": "place_order", "order_ref": "a"},
+        {"ts_monotonic_ns": 20, "operation": "cancel_order", "order_ref": "a"},
+    ]
+    path.write_text("\n".join(json.dumps(row) for row in records) + "\n", encoding="utf-8")
+    assert drill._read_broker_calls(path) == records
+    source = inspect.getsource(drill._run_fsync_stalling_case)
+    assert "post_fault_broker_writes=len(post_fault)" in source
+
+
+def test_healthy_control_requires_a_live_unfenced_process_and_a_real_broker_write():
+    """Any self-exit is a failed healthy control, not merely exit-code != 10."""
+    drill = _storage_drill_module()
+    source = inspect.getsource(drill._run_fsync_healthy_control)
+    assert "still_running_after_probe=alive" in source
+    assert "len(calls) == 1" in source
+    assert 'calls[0].get("operation") == "place_order"' in source
+    assert "and not fence_present" in source
 
 
 @pytest.mark.skipif(
