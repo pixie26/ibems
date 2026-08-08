@@ -1,0 +1,113 @@
+name: b1-storage-fsync
+
+# Real Linux/block-layer engineering evidence for B1.4 before the freeze.
+# This is deliberately separate from ordinary CI. A PASS may move B1.4 to
+# READY_FOR_FREEZE, but the complete campaign must still be regenerated against
+# the eventual frozen commit before Gate B1 can pass.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fsync-stall:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install pinned Python environment
+        run: uv sync --locked --extra dev --extra ib
+
+      - name: Provision device-mapper tooling and verify dm-delay
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if ! command -v dmsetup >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y dmsetup
+          fi
+          if ! command -v mkfs.ext4 >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y e2fsprogs
+          fi
+
+          # modprobe accepts '-' and '_' interchangeably for module names.
+          sudo modprobe dm_delay || sudo modprobe dm-delay
+          sudo mkdir -p /dev/mapper
+          sudo dmsetup mknodes
+
+          test -e /dev/mapper/control
+          sudo dmsetup targets | tee /tmp/dm-targets.txt
+          grep -Eq '^delay[[:space:]]' /tmp/dm-targets.txt
+
+      - name: Create small separate drill and fence filesystems
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo mkdir -p /mnt/ibems-drill /mnt/ibems-fence
+          sudo mount -t tmpfs -o size=512m ibems-journal /mnt/ibems-drill
+          sudo mount -t tmpfs -o size=64m ibems-fence /mnt/ibems-fence
+
+          sudo "$PWD/.venv/bin/python" - <<'PY'
+          import os, shutil
+          from pathlib import Path
+          journal = Path('/mnt/ibems-drill')
+          fence = Path('/mnt/ibems-fence')
+          print('journal st_dev=', os.stat(journal).st_dev, 'free=', shutil.disk_usage(journal).free)
+          print('fence   st_dev=', os.stat(fence).st_dev, 'free=', shutil.disk_usage(fence).free)
+          assert os.stat(journal).st_dev != os.stat(fence).st_dev
+          assert shutil.disk_usage(journal).free <= 2 * 1024**3
+          PY
+
+      - name: Run real B1.4 fsync-stall drill
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo -E "$PWD/.venv/bin/python" scripts/run_storage_fault_drill.py \
+            --journal-volume /mnt/ibems-drill \
+            --fence-dir /mnt/ibems-fence \
+            --drill fsync_stall \
+            --healthy-delay-ms 200 \
+            --fsync-delay 45
+
+      - name: Show B1.4 manifest
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          find artifacts/gate_b1_storage -name manifest.json -print -exec cat {} \;
+
+      - name: Upload B1.4 evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: b1-fsync-stall-evidence
+          path: artifacts/gate_b1_storage/**/manifest.json
+          if-no-files-found: warn
+
+      - name: Safe cleanup
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          # The drill normally removes its own mapper/loop/image in finally.
+          # This cleanup is deliberately namespaced and never touches arbitrary
+          # device-mapper targets.
+          if command -v dmsetup >/dev/null 2>&1; then
+            sudo dmsetup ls --noheadings 2>/dev/null \
+              | awk '{print $1}' \
+              | grep '^ibems-drill-' \
+              | while read -r name; do sudo dmsetup remove "$name" || true; done
+          fi
+          sudo umount -l /mnt/ibems-drill 2>/dev/null || true
+          sudo umount -l /mnt/ibems-fence 2>/dev/null || true
