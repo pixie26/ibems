@@ -15,6 +15,7 @@ import importlib.util
 import inspect
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -75,8 +76,54 @@ def test_an_existing_image_is_never_reused(tmp_path):
 def test_destroy_is_idempotent_and_safe_before_create(tmp_path):
     """Teardown runs from `finally`, including on paths that never provisioned."""
     volume = _volume(tmp_path)
-    volume.destroy()
-    volume.destroy()
+    assert volume.destroy() == []
+    assert volume.destroy() == []
+    assert not volume.image.exists()
+
+
+def test_destroy_resets_a_slow_table_before_unmount(monkeypatch, tmp_path):
+    """The first real dm-delay run hung because it unmounted at the 45s delay."""
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(*args, check=True, timeout=120.0):
+        calls.append(tuple(args))
+        stdout = "4096\n" if args and args[0] == "blockdev" else ""
+        return subprocess.CompletedProcess(args, 0, stdout, "")
+
+    monkeypatch.setattr(dm_delay, "_run", fake_run)
+    monkeypatch.setattr(dm_delay.os.path, "ismount", lambda _p: False)
+
+    volume = _volume(tmp_path, delay_ms=45_000)
+    volume.image.touch()
+    volume.loop = "/dev/loop99"
+    volume._created = True
+    volume._mounted = True
+
+    assert volume.destroy() == []
+    assert volume.delay_ms == 0
+
+    resume = calls.index(("dmsetup", "resume", volume.name))
+    unmount = calls.index(("umount", str(volume.mount_point)))
+    assert resume < unmount, "zero-delay table must be active before unmount"
+
+
+def test_destroy_reports_a_timeout_instead_of_masking_the_drill(monkeypatch, tmp_path):
+    """Cleanup failures are evidence too; they must not escape from finally."""
+    def fake_run(*args, check=True, timeout=120.0):
+        if args[:1] == ("umount",) and "-l" not in args:
+            raise subprocess.TimeoutExpired(args, timeout)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(dm_delay, "_run", fake_run)
+    monkeypatch.setattr(dm_delay.os.path, "ismount", lambda _p: False)
+
+    volume = _volume(tmp_path)
+    volume.image.touch()
+    volume._mounted = True
+    errors = volume.destroy()
+
+    assert errors
+    assert "TimeoutExpired" in errors[0]
     assert not volume.image.exists()
 
 
@@ -136,6 +183,7 @@ def test_a_delayed_volume_can_be_created_and_destroyed(tmp_path):
         volume.set_delay(50)
         assert volume.delay_ms == 50
     finally:
-        volume.destroy()
+        errors = volume.destroy()
+    assert errors == []
     assert not os.path.ismount(volume.mount_point)
     assert not volume.image.exists()
