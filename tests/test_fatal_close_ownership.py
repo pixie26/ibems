@@ -1,4 +1,4 @@
-"""Fatal host shutdown must not release writer ownership before process death."""
+"""Fatal process exit must not release writer ownership before process death."""
 
 from types import SimpleNamespace
 
@@ -28,17 +28,26 @@ def test_graceful_close_closes_journal_and_releases_reference():
     assert host.journal is None
 
 
-def test_fatal_close_retains_journal_until_process_death():
+def test_simulated_fatal_close_still_allows_test_and_tool_cleanup():
+    """A fatal state alone is not proof that this Python process is exiting."""
+    host = _bare_host(fatal=True)
+    journal = host.journal
+    host.close()
+    assert journal.close_calls == 1
+    assert host.journal is None
+
+
+def test_real_fatal_process_exit_retains_journal_until_process_death():
     """A writer still blocked in fsync must not lose the process ownership lock.
 
     Journal.close() uses a bounded writer join and then releases its ProcessLock.
     On a fatal storage path the writer may still be inside the kernel after that
-    join. ExecutionHost therefore deliberately skips graceful Journal.close():
-    the Journal object and its OS lock remain live until the process exits, at
-    which point the kernel releases the lock atomically with process death.
+    join. The real ``main()`` exit path passes ``process_exiting=True`` so the
+    Journal object and its OS lock remain live until process death, when the
+    kernel releases the lock atomically with the process.
     """
     host = _bare_host(fatal=True)
     journal = host.journal
-    host.close()
+    host.close(process_exiting=True)
     assert journal.close_calls == 0
     assert host.journal is journal
