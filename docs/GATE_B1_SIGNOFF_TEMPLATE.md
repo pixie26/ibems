@@ -31,6 +31,9 @@ argument about observations.
 
 ## 2. Blockers
 
+The rows below are the ids in `ib_execution.gate.B1_REQUIREMENTS`, and
+`tests/test_provenance.py` fails if this table and that registry disagree.
+
 | # | Blocker | Artifact | Verdict |
 |---|---|---|---|
 | B1.0 | reproducible environment | `artifacts/gate_b1/<stamp>/manifest.json` | |
@@ -40,6 +43,29 @@ argument about observations.
 | B1.3b | durable fatal fence | `deterministic.xml` :: `test_a_repaired_journal_still_refuses_to_trade` | |
 | B1.4 | real storage faults | `artifacts/gate_b1_storage/<stamp>/manifest.json` | |
 | B1.5 | this document, signed | — | |
+| B1.6 | out-of-band witness that committed events still exist | `deterministic.xml` :: `test_journal_witness`, `artifacts/gate_b1_storage/<stamp>/manifest.json` | |
+
+### B1.6 detail
+
+`commit()` returning success under `synchronous=FULL` does not mean the event
+is still there after a crash: WAL recovery discards frames whose checksums do
+not verify, leaving a database that is internally consistent and simply
+shorter. Measured on a real volume: **27 of 4,406 committed events gone, no
+error reported, engine started normally.**
+
+| Field | Value |
+|---|---|
+| Witness covers | every broker write (`place_order`, `cancel_order`) |
+| Witness binds | `journal_id`, `seq`, event type, intent id, order ref, payload digest |
+| Startup refuses on | missing seq, digest mismatch, wrong `journal_id`, `max_seq < witness.seq` |
+| Witness write failure before a broker write | must fence; must not send |
+| HALT tail-loss drill | does broker-write-only coverage still satisfy invariant 22? |
+
+The HALT drill is the open question, not a formality. `HALT` and
+`HALT_CAUSE_ADDED` are not broker writes, so a broker-write-only witness does
+not pin them; if a WAL rollback can drop a HALT while leaving `max_seq` above
+the witness, invariant 22 breaks and the witness has to cover safety-critical
+events too. Record the answer here rather than assuming it.
 
 ### B1.4 detail
 
