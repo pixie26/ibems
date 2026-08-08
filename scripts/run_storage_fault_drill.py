@@ -25,21 +25,24 @@ the fact that no broker write happened after the fault.
                      via dm-delay -- SQLite runs unmodified and cannot tell it
                      is being tested. Run as a positive/negative pair, so the
                      drill distinguishes "fails closed past its timeout" from
-                     "dies whenever storage is slow". A FUSE fallback exists
-                     for hosts without device-mapper but is usually
-                     inconclusive; see _fuse_supports_sqlite_wal.
+                     "dies whenever storage is slow". The failing delay is
+                     injected only AFTER a healthy host has fully started. A
+                     FUSE fallback exists for hosts without device-mapper but
+                     is usually inconclusive; see _fuse_supports_sqlite_wal.
 
     On a host with device-mapper this is the whole command:
 
-        sudo python scripts/run_storage_fault_drill.py \\
-            --journal-volume /mnt/ibems-drill --fence-dir /var/opt/ibems-fence \\
+        sudo python scripts/run_storage_fault_drill.py \
+            --journal-volume /mnt/ibems-drill --fence-dir /var/opt/ibems-fence \
             --drill fsync_stall
 
 THE VOLUME
 ----------
 ``--journal-volume`` must be a small dedicated filesystem, NOT a directory on
 your main disk -- filling the latter takes the machine down with it, and the
-drill needs the volume to be genuinely exhaustible.
+drill needs the volume to be genuinely exhaustible. The fsync-stall drill
+creates its disposable dm-delay image inside this dedicated filesystem; it
+never takes over a caller-supplied block device.
 
     Linux    truncate -s 64M /tmp/ibems-drill.img
              mkfs.ext4 -q /tmp/ibems-drill.img
@@ -82,9 +85,15 @@ from ib_execution.execution_host import (  # noqa: E402
 
 # The child runs the real host with a FakeBroker: this drill is about storage
 # and process lifecycle, and a real Gateway must never be reachable from it.
+#
+# For fsync_stall the child starts healthy and waits for a trigger on the fence
+# volume. The parent either triggers while storage is healthy (positive
+# control), or first reloads dm-delay past the write timeout and only then
+# triggers a target. Broker calls are durably logged on the fence volume so
+# "post_fault_broker_writes == 0" is an observation, not a hard-coded claim.
 CHILD = textwrap.dedent(
     """
-    import json, sys, time
+    import json, os, sys, time
     sys.path.insert(0, {src!r})
     from datetime import datetime, timezone
     from decimal import Decimal
@@ -98,21 +107,47 @@ CHILD = textwrap.dedent(
     from ib_execution.models import Quote, TargetPosition
     from ib_execution.risk import RiskConfig, RiskEngine
 
-    journal, fence, status, marker, witness = sys.argv[1:6]
-    halt_after = float(sys.argv[6])
+    journal, fence, status, marker, witness, broker_calls, trigger, probe_done = sys.argv[1:9]
+    halt_after = float(sys.argv[9])
+    mode = sys.argv[10]
     clock = SystemClock()
+
+    class RecordingFakeBroker(FakeBroker):
+        def _record_write(self, operation, order_ref):
+            entry = dict(
+                ts_monotonic_ns=time.monotonic_ns(),
+                pid=os.getpid(),
+                operation=operation,
+                order_ref=order_ref,
+            )
+            path = Path(broker_calls)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, sort_keys=True) + "\\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+
+        def place_order(self, intent):
+            self._record_write("place_order", intent.order_ref)
+            return super().place_order(intent)
+
+        def cancel_order(self, order_ref):
+            self._record_write("cancel_order", order_ref)
+            return super().cancel_order(order_ref)
+
     risk = RiskEngine(
         RiskConfig(symbol_whitelist=("SPY",), strategy_whitelist=("drill",),
                    max_position_shares=5, max_order_shares=10,
                    max_order_notional=Decimal("20000")),
         clock,
     )
+    broker = RecordingFakeBroker(clock, Faults())
     host = ExecutionHost(
         HostConfig(journal_path=Path(journal), fence_path=Path(fence),
                    status_path=Path(status), witness_path=Path(witness),
                    require_separate_fence_domain={separate!r},
                    heartbeat_seconds=0.05),
-        broker_factory=lambda: FakeBroker(clock, Faults()),
+        broker_factory=lambda: broker,
         risk=risk, clock=clock,
         alert=lambda level, msg: print(f"[{{level}}] {{msg}}", flush=True),
     )
@@ -122,31 +157,64 @@ CHILD = textwrap.dedent(
         print(f"REFUSED {{exc}}", flush=True)
         raise SystemExit(exc.code)
 
-    # Place one real (Fake-brokered) order so the run has a witnessed broker
-    # write on the real volume. Without it the wal_corruption drill exercises
-    # storage but never B1.6.
     controller.on_connected(1)
     now = clock.now()
     controller.on_quote(Quote("SPY", Decimal("599.98"), Decimal("600.02"), 500, 500, now))
     controller.reconcile()
-    sent = controller.submit_target(TargetPosition(
-        strategy_id="drill", symbol="SPY", target_quantity=1,
-        decision_id="drill-1", valid_until=now + timedelta(hours=8),
-    ))
-    print(f"SENT {{sent}} witness_seq={{host.witness.read().seq if host.witness.read() else None}}",
-          flush=True)
+
+    # The traffic drills need one witnessed broker write before damaging the
+    # WAL. The fsync-stall child deliberately does NOT send here: it must prove
+    # that a fully healthy, already-started host blocks the first broker write
+    # attempted after the block-layer stall is injected.
+    if mode != "fsync_trigger":
+        sent = controller.submit_target(TargetPosition(
+            strategy_id="drill", symbol="SPY", target_quantity=1,
+            decision_id="drill-1", valid_until=now + timedelta(hours=8),
+        ))
+        print(f"SENT {{sent}} witness_seq={{host.witness.read().seq if host.witness.read() else None}}",
+              flush=True)
 
     Path(marker).write_text("started", encoding="utf-8")
     print("STARTED", flush=True)
     halt_deadline = time.monotonic() + halt_after if halt_after > 0 else None
+    trigger_handled = False
     try:
-        # Keep writing to the journal so a storage fault is actually reached.
         from ib_execution.models import EventType
         while True:
+            if mode == "fsync_trigger":
+                if not trigger_handled and Path(trigger).exists():
+                    trigger_handled = True
+                    try:
+                        probe_now = clock.now()
+                        sent = controller.submit_target(TargetPosition(
+                            strategy_id="drill", symbol="SPY", target_quantity=1,
+                            decision_id="fsync-trigger",
+                            valid_until=probe_now + timedelta(hours=1),
+                        ))
+                        Path(probe_done).write_text(
+                            json.dumps(dict(
+                                sent=bool(sent),
+                                ts_monotonic_ns=time.monotonic_ns(),
+                            )),
+                            encoding="utf-8",
+                        )
+                        print(f"FSYNC_PROBE sent={{sent}}", flush=True)
+                    except Exception as exc:
+                        # submit_target has already fail-closed on a journal
+                        # timeout. Keep the process alive long enough for the
+                        # real host supervision tick to emit contractual exit 10.
+                        print(f"FSYNC_PROBE_EXCEPTION {{type(exc).__name__}}: {{exc}}", flush=True)
+
+                if trigger_handled:
+                    code = host.run_once()
+                    if code is not None:
+                        raise SystemExit(code)
+                time.sleep(0.02)
+                continue
+
+            # Traffic mode: keep writing so ENOSPC and WAL-tail behavior are
+            # reached by the real journal rather than an injected exception.
             if halt_deadline is not None and time.monotonic() >= halt_deadline:
-                # A HALT mid-session, then more journal traffic. This puts a
-                # witnessed safety-critical event near the tail, so a real WAL
-                # rollback crosses the witness instead of only losing telemetry.
                 controller.halt("drill: provoked mid-session halt")
                 print(f"HALTED witness_seq={{host.witness.read().seq}}", flush=True)
                 halt_deadline = None
@@ -154,8 +222,6 @@ CHILD = textwrap.dedent(
             if code is not None:
                 raise SystemExit(code)
             try:
-                # A payload, and no sleep: the drill needs the WAL to grow an
-                # uncheckpointed tail, and needs to reach ENOSPC promptly.
                 controller.journal.commit(
                     EventType.HEARTBEAT, {{"t": time.time(), "pad": "x" * 400}}
                 )
@@ -167,14 +233,20 @@ CHILD = textwrap.dedent(
 )
 
 
-def _spawn(paths: dict[str, Path], separate: bool, halt_after: float = 0.0) -> subprocess.Popen:
+def _spawn(
+    paths: dict[str, Path],
+    separate: bool,
+    halt_after: float = 0.0,
+    mode: str = "traffic",
+) -> subprocess.Popen:
     return subprocess.Popen(
         [
             sys.executable, "-c",
             CHILD.format(src=str(ROOT / "src"), separate=separate),
             str(paths["journal"]), str(paths["fence"]),
             str(paths["status"]), str(paths["marker"]), str(paths["witness"]),
-            str(halt_after),
+            str(paths["broker_calls"]), str(paths["trigger"]), str(paths["probe_done"]),
+            str(halt_after), mode,
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -182,15 +254,61 @@ def _spawn(paths: dict[str, Path], separate: bool, halt_after: float = 0.0) -> s
     )
 
 
-def _wait_started(proc: subprocess.Popen, marker: Path, timeout: float = 30.0) -> None:
+def _wait_for_path(
+    proc: subprocess.Popen,
+    path: Path,
+    *,
+    timeout: float,
+    description: str,
+) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if marker.exists():
+        if path.exists():
             return
         if proc.poll() is not None:
-            raise RuntimeError(f"child exited early with {proc.returncode}")
+            raise RuntimeError(
+                f"child exited early with {proc.returncode} while waiting for {description}"
+            )
         time.sleep(0.05)
-    raise RuntimeError("child never started")
+    raise RuntimeError(f"timed out waiting for {description}")
+
+
+def _wait_started(proc: subprocess.Popen, marker: Path, timeout: float = 30.0) -> None:
+    _wait_for_path(proc, marker, timeout=timeout, description="STARTED marker")
+
+
+def _clear_case_paths(paths: dict[str, Path]) -> None:
+    """Remove only files owned by this drill case, including SQLite sidecars."""
+    for key in (
+        "journal", "status", "marker", "witness", "fence",
+        "broker_calls", "trigger", "probe_done",
+    ):
+        path = paths[key]
+        suffixes = ("", "-wal", "-shm", ".lock") if key == "journal" else ("",)
+        for suffix in suffixes:
+            Path(str(path) + suffix).unlink(missing_ok=True)
+
+
+def _read_broker_calls(path: Path) -> list[dict[str, Any]]:
+    """Read the child-side durable observation of broker writes."""
+    if not path.exists():
+        return []
+    calls: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            calls.append(json.loads(line))
+    return calls
+
+
+def _stop_child(proc: subprocess.Popen, timeout: float = 30.0) -> None:
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=timeout)
 
 
 class _Ballast:
@@ -500,35 +618,155 @@ def _fuse_supports_sqlite_wal(mount: Path, timeout: float) -> tuple[bool, str]:
     )
 
 
-def _run_host_under_delay(
-    paths: dict[str, Path], volume, delay_ms: int, budget: float
+def _run_fsync_healthy_control(
+    paths: dict[str, Path],
+    volume,
+    *,
+    healthy_delay_ms: int,
+    write_timeout: float,
 ) -> dict[str, Any]:
-    """One control case: set a delay, run the host, record how it ended."""
-    for key in ("journal", "status", "marker", "witness"):
-        for suffix in ("", "-wal", "-shm", ".lock"):
-            Path(str(paths[key]) + suffix).unlink(missing_ok=True)
-
-    volume.set_delay(delay_ms)
-    proc = _spawn(paths, separate=True)
-    started = time.monotonic()
-    try:
-        code: Optional[int] = proc.wait(timeout=budget)
-    except subprocess.TimeoutExpired:
-        code = None
-        proc.terminate()
-        try:
-            proc.wait(timeout=60)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=60)
-    output = proc.stdout.read() if proc.stdout else ""
-    return {
-        "delay_ms": delay_ms,
-        "exit_code": code,
-        "seconds_to_exit": round(time.monotonic() - started, 1),
-        "still_running_at_budget": code is None,
-        "output_tail": output[-3000:],
+    """Start healthy, trigger one broker write, and prove the engine stays alive."""
+    _clear_case_paths(paths)
+    volume.set_delay(healthy_delay_ms)
+    proc = _spawn(paths, separate=True, mode="fsync_trigger")
+    started_at = time.monotonic_ns()
+    result: dict[str, Any] = {
+        "delay_ms": healthy_delay_ms,
+        "started_at_monotonic_ns": started_at,
+        "expectation": "healthy trigger reaches broker; engine stays alive and unfenced",
     }
+    try:
+        _wait_started(proc, paths["marker"], timeout=max(30.0, write_timeout + 10.0))
+        trigger_at = time.monotonic_ns()
+        paths["trigger"].write_text(str(trigger_at), encoding="utf-8")
+        _wait_for_path(
+            proc,
+            paths["probe_done"],
+            timeout=write_timeout + 30.0,
+            description="healthy fsync probe completion",
+        )
+        # Give the host another supervision turn after the broker call. A
+        # healthy control that exits immediately afterwards is not healthy.
+        time.sleep(max(0.25, healthy_delay_ms / 1000.0 * 2.0))
+        calls = _read_broker_calls(paths["broker_calls"])
+        probe = json.loads(paths["probe_done"].read_text(encoding="utf-8"))
+        alive = proc.poll() is None
+        fence_present = paths["fence"].exists()
+        result.update(
+            trigger_at_monotonic_ns=trigger_at,
+            probe=probe,
+            broker_writes=calls,
+            broker_write_count=len(calls),
+            still_running_after_probe=alive,
+            fence_present=fence_present,
+        )
+        result["passed"] = bool(
+            alive
+            and probe.get("sent") is True
+            and len(calls) == 1
+            and calls[0].get("operation") == "place_order"
+            and not fence_present
+        )
+    except Exception as exc:  # noqa: BLE001 - evidence must record harness failures
+        result.update(passed=False, error=f"{type(exc).__name__}: {exc}")
+    finally:
+        exit_before_cleanup = proc.poll()
+        _stop_child(proc)
+        result["exit_code_before_cleanup"] = exit_before_cleanup
+        result["exit_code_after_cleanup"] = proc.returncode
+        output = proc.stdout.read() if proc.stdout else ""
+        result["output_tail"] = output[-3000:]
+    return result
+
+
+def _run_fsync_stalling_case(
+    paths: dict[str, Path],
+    volume,
+    *,
+    healthy_delay_ms: int,
+    stalling_delay_ms: int,
+    write_timeout: float,
+) -> dict[str, Any]:
+    """Start healthy, inject the stall live, then demand a broker write.
+
+    This ordering is the claim B1.4 needs. Starting a process on an already
+    stalled device only proves startup refusal; it does not prove that a live
+    engine fails closed when storage degrades underneath it.
+    """
+    _clear_case_paths(paths)
+    volume.set_delay(healthy_delay_ms)
+    proc = _spawn(paths, separate=True, mode="fsync_trigger")
+    started_at = time.monotonic_ns()
+    result: dict[str, Any] = {
+        "healthy_boot_delay_ms": healthy_delay_ms,
+        "stalling_delay_ms": stalling_delay_ms,
+        "started_at_monotonic_ns": started_at,
+        "expected_exit_code": EXIT_FATAL_SHUTDOWN,
+        "expectation": "live stall -> JournalUnavailable -> fence -> exit 10; no broker write",
+    }
+    try:
+        _wait_started(proc, paths["marker"], timeout=max(30.0, write_timeout + 10.0))
+        calls_before = _read_broker_calls(paths["broker_calls"])
+
+        fault_requested_at = time.monotonic_ns()
+        volume.set_delay(stalling_delay_ms)
+        fault_active_at = time.monotonic_ns()
+
+        # Only after dm-delay confirms the new table is active do we request a
+        # target that would normally place an order. Its journal write must
+        # time out before the broker boundary is reached.
+        trigger_at = time.monotonic_ns()
+        paths["trigger"].write_text(str(trigger_at), encoding="utf-8")
+
+        try:
+            code: Optional[int] = proc.wait(
+                timeout=(stalling_delay_ms / 1000.0) + write_timeout + 180.0
+            )
+        except subprocess.TimeoutExpired:
+            code = None
+            _stop_child(proc, timeout=60.0)
+        exit_observed_at = time.monotonic_ns()
+
+        calls = _read_broker_calls(paths["broker_calls"])
+        post_fault = [
+            call for call in calls
+            if int(call.get("ts_monotonic_ns", 0)) >= fault_active_at
+        ]
+        fence_present = paths["fence"].exists()
+        fence = (
+            json.loads(paths["fence"].read_text(encoding="utf-8"))
+            if fence_present else None
+        )
+        result.update(
+            fault_requested_at_monotonic_ns=fault_requested_at,
+            fault_injected_at_monotonic_ns=fault_active_at,
+            trigger_at_monotonic_ns=trigger_at,
+            exit_observed_at_monotonic_ns=exit_observed_at,
+            exit_code=code,
+            broker_writes_before_fault=calls_before,
+            broker_writes=calls,
+            post_fault_broker_writes=len(post_fault),
+            post_fault_broker_write_records=post_fault,
+            probe_completed=paths["probe_done"].exists(),
+            fence_present=fence_present,
+            fence=fence,
+        )
+        result["passed"] = bool(
+            code == EXIT_FATAL_SHUTDOWN
+            and len(calls_before) == 0
+            and len(post_fault) == 0
+            and fence_present
+            and fault_active_at <= trigger_at <= exit_observed_at
+        )
+    except Exception as exc:  # noqa: BLE001
+        result.update(passed=False, error=f"{type(exc).__name__}: {exc}")
+        _stop_child(proc, timeout=60.0)
+    finally:
+        if proc.poll() is None:
+            _stop_child(proc, timeout=60.0)
+        output = proc.stdout.read() if proc.stdout else ""
+        result["output_tail"] = output[-4000:]
+    return result
 
 
 def drill_fsync_stall_dm_delay(
@@ -545,20 +783,10 @@ def drill_fsync_stall_dm_delay(
     configuration and cannot tell it is being tested. Patching ``os.fsync``
     would only re-test the patch.
 
-    Two cases, because one proves half of what matters:
-
-    ``healthy``   a delay well under the journal's write timeout. Commits are
-                  slow and they succeed, and the engine must NOT fail closed.
-                  Without this the drill cannot distinguish "correctly fails
-                  closed past its timeout" from "dies whenever storage is slow".
-
-    ``stalling``  a delay past the write timeout. ``Journal._submit`` times
-                  out, ``JournalUnavailable`` fences the engine, the fatal
-                  fence is written to the other volume, and the host exits 10.
-
-    The teardown is in ``finally`` and is idempotent, so a failure or a Ctrl-C
-    still unmounts, removes the mapper target, detaches the loop device and
-    deletes the image.
+    Both cases boot under the healthy delay. The negative case then changes the
+    live, mounted device to a delay past the write timeout and only afterwards
+    requests a target that would normally reach ``place_order``. This proves a
+    runtime storage degradation, not merely failure to start on a bad disk.
     """
     result: dict[str, Any] = {
         "mechanism": "dm-delay",
@@ -582,35 +810,26 @@ def drill_fsync_stall_dm_delay(
         paths["status"] = mount / "status.json"
         paths["marker"] = mount / "started"
 
-        # Positive control: slow, but inside the timeout.
-        healthy = _run_host_under_delay(
-            paths, volume, healthy_delay_ms, budget=write_timeout + 60
+        healthy = _run_fsync_healthy_control(
+            paths,
+            volume,
+            healthy_delay_ms=healthy_delay_ms,
+            write_timeout=write_timeout,
         )
-        healthy["expectation"] = "commits succeed; the engine must not fail closed"
-        healthy["passed"] = healthy["exit_code"] != EXIT_FATAL_SHUTDOWN
         result["healthy"] = healthy
 
-        # Negative control: past the timeout.
-        stalling = _run_host_under_delay(
-            paths, volume, stalling_delay_ms,
-            budget=(stalling_delay_ms / 1000.0) + write_timeout + 180,
+        stalling = _run_fsync_stalling_case(
+            paths,
+            volume,
+            healthy_delay_ms=healthy_delay_ms,
+            stalling_delay_ms=stalling_delay_ms,
+            write_timeout=write_timeout,
         )
-        stalling["expectation"] = "JournalUnavailable -> fatal fence -> exit 10"
-        stalling["passed"] = stalling["exit_code"] == EXIT_FATAL_SHUTDOWN
         result["stalling"] = stalling
-
-        fence_file = paths["fence"]
-        result["fence_present"] = fence_file.exists()
-        result["fence"] = (
-            json.loads(fence_file.read_text(encoding="utf-8"))
-            if fence_file.exists() else None
-        )
-        # A broker write after the fault would be the thing this whole gate is
-        # about; the FakeBroker records every call it received.
-        result["post_fault_broker_writes"] = 0
-        result["passed"] = bool(
-            healthy["passed"] and stalling["passed"] and result["fence_present"]
-        )
+        result["fence_present"] = bool(stalling.get("fence_present"))
+        result["fence"] = stalling.get("fence")
+        result["post_fault_broker_writes"] = stalling.get("post_fault_broker_writes")
+        result["passed"] = bool(healthy.get("passed") and stalling.get("passed"))
     except dm_delay.DmDelayUnsafe as exc:
         result.update(passed=False, inconclusive=True, note=f"refused: {exc}")
     except dm_delay.DmDelayUnavailable as exc:
@@ -761,6 +980,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             "witness": fence_dir / f"witness-{name}.json",
             "status": work / "status.json",
             "marker": work / "started",
+            # Test instrumentation lives with the fence, not the delayed journal
+            # volume, so the observation itself survives the injected stall.
+            "broker_calls": fence_dir / f"broker-calls-{name}.jsonl",
+            "trigger": fence_dir / f"trigger-{name}",
+            "probe_done": fence_dir / f"probe-done-{name}.json",
         }
         for path in paths.values():
             path.unlink(missing_ok=True)
