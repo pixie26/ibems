@@ -106,8 +106,10 @@ B1_REQUIREMENTS: tuple[Requirement, ...] = (
             "(exit 10, fence raised). wal_corruption PASS (real rollback lost 21-138 "
             "committed events; loss above the witness correctly tolerated, forced "
             "crossing correctly refused with exit 15 and a fence). fsync_stall "
-            "INCONCLUSIVE -- the FUSE harness cannot back SQLite's WAL -shm mmap "
-            "(SIGBUS), so it must be rerun with dm-delay on the production host."
+            "NOT RUN -- the dm-delay driver is complete (provisioning, delay "
+            "reload, healthy/stalling control pair, finally-teardown) but this "
+            "kernel has no device-mapper, and the FUSE fallback cannot back "
+            "SQLite's WAL -shm mmap (SIGBUS). One command on a host with dm."
         ),
     ),
     Requirement(

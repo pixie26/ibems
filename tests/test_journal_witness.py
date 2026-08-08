@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 from decimal import Decimal
 
 import pytest
@@ -23,9 +24,16 @@ import pytest
 from ib_execution.calendar import TradingCalendar
 from ib_execution.clock import ManualClock
 from ib_execution.controller import Controller, ExecutionPolicy
-from ib_execution.execution_host import EXIT_WITNESS, ExecutionHost, HostConfig, HostStartupRefused
+from ib_execution.execution_host import (
+    EXIT_STARTUP,
+    EXIT_WITNESS,
+    ExecutionHost,
+    HostConfig,
+    HostStartupRefused,
+)
+from ib_execution.failure_domain import FailureDomainError
 from ib_execution.fake_broker import FakeBroker, Faults
-from ib_execution.fatal_fence import FatalFence
+from ib_execution.fatal_fence import FatalFence, FenceStillRaised
 from ib_execution.journal import Journal
 from ib_execution.journal_witness import (
     JournalWitness,
@@ -512,14 +520,8 @@ def test_a_bare_high_water_number_would_have_missed_this(tmp_path):
         reopened.close()
 
 
-def test_halt_survives_a_witness_that_cannot_be_written(tmp_path):
-    """Asymmetric with a broker write, on purpose.
-
-    Refusing to send is safe because nothing was sent. Refusing to HALT would
-    be absurd -- the HALT already happened and is already durable. So the
-    engine stays HALTED and the operator is told the next start might not see
-    it.
-    """
+def _halt_with_unwritable_witness(tmp_path):
+    """A HALT whose witness update cannot be persisted. Returns (ctl, journal, alerts)."""
     blocker = tmp_path / "blocked"
     blocker.write_text("not a directory", encoding="utf-8")
     alerts: list[tuple[str, str]] = []
@@ -538,14 +540,120 @@ def test_halt_survives_a_witness_that_cannot_be_written(tmp_path):
         journal=journal, broker=FakeBroker(clock, Faults()), risk=risk, clock=clock,
         calendar=TradingCalendar(), policy=ExecutionPolicy(),
         alert=lambda level, msg: alerts.append((level, msg)),
+        fence=FatalFence(tmp_path / "fatal-fence.json", tmp_path / "journal.db",
+                         require_separate_domain=False),
         witness=JournalWitness(blocker / "witness.json"),
     )
+    ctl.halt("unexplained position mismatch")
+    return ctl, journal, alerts
+
+
+def test_halt_survives_a_witness_that_cannot_be_written(tmp_path):
+    """Refusing to HALT would be absurd -- it already happened and is durable."""
+    ctl, journal, alerts = _halt_with_unwritable_witness(tmp_path)
     try:
-        ctl.halt("unexplained position mismatch")
         assert ctl.operating_mode is OperatingMode.HALTED
         assert any("could not witness" in msg for _, msg in alerts)
     finally:
         journal.close()
+
+
+def test_a_halt_whose_witness_failed_raises_the_durable_fence(tmp_path):
+    """Alerting alone leaves invariant 22 reachable again.
+
+        HALT at seq 120 commits, witness update fails
+        the witness still points at the last send, seq 100
+        crash, WAL rollback to seq 110
+        110 >= 100, so startup verification passes -- and the HALT is gone
+
+    The fence is what stops the *next* process. It lives on a different volume
+    from the journal, so a witness-specific failure usually leaves it writable.
+    """
+    ctl, journal, _alerts = _halt_with_unwritable_witness(tmp_path)
+    try:
+        assert ctl.fence is not None
+        record = ctl.fence.read()
+        assert record is not None
+        assert "witness update failed" in record.reason
+    finally:
+        journal.close()
+
+
+def test_a_restart_is_refused_even_if_the_halt_tail_then_disappears(tmp_path):
+    """End to end: the scenario the fence exists to stop.
+
+    The witness could not be updated for the HALT, and a later rollback removes
+    the HALT while leaving the journal longer than the stale witness. Nothing
+    in the journal or the witness can object -- only the fence can.
+    """
+    ctl, journal, _alerts = _halt_with_unwritable_witness(tmp_path)
+    path = Path(journal.path)
+    try:
+        halt_seq = journal.max_seq()
+    finally:
+        journal.close()
+
+    _rollback_to(path, halt_seq - 1)          # the HALT is gone
+
+    reopened = Journal(path, clock=ManualClock(SESSION_START))
+    try:
+        halts = [
+            ev for ev in reopened.replay()
+            if ev.event_type is EventType.OPERATING_MODE_CHANGED
+            and ev.payload.get("to") == OperatingMode.HALTED.value
+        ]
+        assert halts == [], "the HALT is no longer in the journal"
+    finally:
+        reopened.close()
+
+    fence = FatalFence(tmp_path / "fatal-fence.json", path, require_separate_domain=False)
+    with pytest.raises(FenceStillRaised):
+        fence.require_clear()
+
+
+# --------------------------------------------------------------------------
+# the witness must be able to outlive the journal's storage
+# --------------------------------------------------------------------------
+
+
+def test_a_witness_sharing_the_journal_volume_is_refused(tmp_path):
+    """The CLI help said so and nothing checked it. Documentation is not a control."""
+    witness = JournalWitness(
+        tmp_path / "journal-witness.json",
+        journal_path=tmp_path / "journal.db",
+        require_separate_domain=True,
+    )
+    with pytest.raises(FailureDomainError):
+        witness.verify_domain()
+
+
+def test_the_host_refuses_a_witness_on_the_journal_volume(tmp_path):
+    """An operator can pass --witness; the gate has to be in the host, not the docs."""
+    clock = ManualClock(SESSION_START)
+    risk = RiskEngine(
+        RiskConfig(
+            symbol_whitelist=("SPY",), strategy_whitelist=("manual_test",),
+            max_position_shares=5, max_order_shares=10,
+            max_order_notional=Decimal("20000"),
+        ),
+        clock,
+    )
+    host = ExecutionHost(
+        HostConfig(
+            journal_path=tmp_path / "journal.db",
+            fence_path=tmp_path / "fatal-fence.json",
+            status_path=tmp_path / "status.json",
+            witness_path=tmp_path / "journal-witness.json",
+            require_separate_fence_domain=True,
+        ),
+        broker_factory=lambda: FakeBroker(clock, Faults()),
+        risk=risk, clock=clock, alert=lambda level, msg: None,
+        sleeper=lambda _s: None,
+    )
+    with pytest.raises(HostStartupRefused) as excinfo:
+        host.start()
+    assert excinfo.value.code == EXIT_STARTUP
+    assert "journal witness" in str(excinfo.value) or "fatal fence" in str(excinfo.value)
 
 
 def test_the_witness_file_is_json_an_operator_can_read(tmp_path):

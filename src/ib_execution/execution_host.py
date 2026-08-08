@@ -14,13 +14,16 @@ half: "and the next start still refuses to trade". This host is where both
 become true, and the startup order below is the whole safety argument:
 
     1.  calendar coverage self-test    -- refuse a session we cannot bound
-    2.  journal writer ownership       -- refuse to be the second writer
+    2.  failure-domain configuration   -- fence and witness must outlive the
+                                          journal's volume, checked not assumed
     3.  durable fatal fence check      -- refuse to launder a previous fault
-    4.  restore from journal           -- durable HALT and residual survive
-    5.  connect + reconcile            -- broker truth before any write
-    6.  retire the fence               -- only now, and only if reconciled
+    4.  journal writer ownership       -- refuse to be the second writer
+    5.  journal witness verification   -- refuse a journal that lost evidence
+    6.  restore from journal           -- durable HALT and residual survive
+    7.  connect + reconcile            -- broker truth before any write
+    8.  retire the fence               -- only now, and only if reconciled
 
-Steps 1-3 all happen *before* the broker is touched. A process that will not
+Steps 1-6 all happen *before* the broker is touched. A process that will not
 be allowed to trade must never open a session that could.
 
 WHAT THIS IS NOT
@@ -115,7 +118,9 @@ class ExecutionHost:
         )
         self.witness = JournalWitness(
             config.witness_path
-            or config.fence_path.with_name("journal-witness.json")
+            or config.fence_path.with_name("journal-witness.json"),
+            journal_path=config.journal_path,
+            require_separate_domain=config.require_separate_fence_domain,
         )
         self._stop = False
         self._heartbeat_failed = False
@@ -128,11 +133,13 @@ class ExecutionHost:
         except CalendarCoverageError as exc:
             raise HostStartupRefused(EXIT_CALENDAR, str(exc)) from exc
 
-    def _gate_fence_configuration(self) -> None:
-        try:
-            self.fence.verify_domain()
-        except Exception as exc:  # noqa: BLE001 - FenceDomainError and OSError alike
-            raise HostStartupRefused(EXIT_STARTUP, str(exc)) from exc
+    def _gate_failure_domains(self) -> None:
+        """Both out-of-band files must be able to outlive the journal's volume."""
+        for check in (self.fence.verify_domain, self.witness.verify_domain):
+            try:
+                check()
+            except Exception as exc:  # noqa: BLE001 - domain and OS errors alike
+                raise HostStartupRefused(EXIT_STARTUP, str(exc)) from exc
 
     def _gate_ownership(self) -> Journal:
         try:
@@ -163,7 +170,7 @@ class ExecutionHost:
     def start(self) -> Controller:
         """Run every gate, then build the controller. Broker untouched until the end."""
         calendar_state = self._gate_calendar()
-        self._gate_fence_configuration()
+        self._gate_failure_domains()
         # Fence before ownership: a fenced host should not even briefly hold
         # the journal, so that an operator tool can open it while diagnosing.
         self._gate_fence()

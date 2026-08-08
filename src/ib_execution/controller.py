@@ -1380,15 +1380,29 @@ class Controller:
             return False
 
     def _witness_safety_critical(self, seq: int, detail: str) -> None:
-        """Pin a HALT out of band. Asymmetric with the broker-write case.
+        """Pin a HALT out of band, and fence if that cannot be done.
 
-        A witness failure before a broker write means "do not send", and that
-        is unambiguously safe because nothing has been sent. A witness failure
-        after a HALT is the opposite: the HALT already happened and is already
-        durable, and undoing it to satisfy the witness would be absurd. So this
-        alerts and continues -- the engine stays HALTED either way, and the
-        operator is told that a storage fault could hide this HALT from the
-        next start.
+        Asymmetric with the broker-write case, in two different ways.
+
+        *Never undo the HALT.* A witness failure before a broker write means
+        "do not send", which is unambiguously safe because nothing has been
+        sent. After a HALT the opposite holds: the HALT already happened and is
+        already durable, and reversing it to satisfy a bookkeeping file would
+        be absurd. The engine stays HALTED.
+
+        *But do fence.* Alerting alone left invariant 22 reachable again:
+
+            HALT at seq 120 commits, witness update fails
+            the witness still points at the last send, seq 100
+            crash, WAL rollback to seq 110
+            110 >= 100, so startup verification passes
+            the HALT is gone -> NORMAL
+
+        The fence is the thing that stops the *next* process, and it lives on a
+        different volume from the journal, so a witness-specific failure very
+        often leaves it writable. If even the fence cannot be written, both
+        alerts fire and the engine is still HALTED -- that is the floor, and it
+        is reported rather than papered over.
         """
         if self.witness is None:
             return
@@ -1399,6 +1413,11 @@ class Controller:
                 "CRITICAL",
                 f"could not witness {detail}; a WAL rollback could hide it from the "
                 f"next start, so do not restart without reconciling: {exc}",
+            )
+            self._raise_durable_fence(
+                f"safety-critical witness update failed after a durable {detail}: "
+                f"{exc}. The next start must not be allowed to replay a journal "
+                "that may no longer contain it."
             )
 
     def _raise_durable_fence(self, detail: str) -> None:

@@ -76,6 +76,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from .failure_domain import require_separate
 from .models import EventType
 
 WITNESS_SCHEMA_VERSION = 1
@@ -157,8 +158,23 @@ def event_digest(event) -> str:
 class JournalWitness:
     """Records, and later verifies, the evidence behind each broker write."""
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, journal_path: str | Path | None = None,
+                 require_separate_domain: bool = True):
         self.path = Path(path)
+        self.journal_path = Path(journal_path) if journal_path is not None else None
+        self.require_separate_domain = require_separate_domain
+
+    def verify_domain(self) -> None:
+        """Enforced, not documented.
+
+        The witness has to survive the journal's storage, so it cannot live on
+        it. The CLI flag said so in its help text and nothing checked it, which
+        meant an operator could point --witness back at the journal volume and
+        get a deployment that looked configured and protected nothing.
+        """
+        if not self.require_separate_domain or self.journal_path is None:
+            return
+        require_separate(self.path, self.journal_path, "journal witness")
 
     # -- reading ---------------------------------------------------------
 

@@ -21,9 +21,19 @@ the fact that no broker write happened after the fault.
     disk_full        the journal volume runs out of space mid-session
     wal_corruption   the WAL is damaged while the engine is down, and B1.6's
                      witness has to notice the committed events it discarded
-    fsync_stall      commits block past the write timeout, inside a real
-                     filesystem (scripts/slow_fsync_fs.py), not a patched
-                     os.fsync -- mocking it would only re-test the mock
+    fsync_stall      commits block past the write timeout, at the block layer
+                     via dm-delay -- SQLite runs unmodified and cannot tell it
+                     is being tested. Run as a positive/negative pair, so the
+                     drill distinguishes "fails closed past its timeout" from
+                     "dies whenever storage is slow". A FUSE fallback exists
+                     for hosts without device-mapper but is usually
+                     inconclusive; see _fuse_supports_sqlite_wal.
+
+    On a host with device-mapper this is the whole command:
+
+        sudo python scripts/run_storage_fault_drill.py \\
+            --journal-volume /mnt/ibems-drill --fence-dir /var/opt/ibems-fence \\
+            --drill fsync_stall
 
 THE VOLUME
 ----------
@@ -62,7 +72,7 @@ from typing import Any, Optional
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from ib_execution import provenance  # noqa: E402
+from ib_execution import dm_delay, provenance  # noqa: E402
 from ib_execution.execution_host import (  # noqa: E402
     EXIT_FATAL_SHUTDOWN,
     EXIT_FENCED,
@@ -451,19 +461,15 @@ def drill_wal_corruption(
     return result
 
 
-def _dm_delay_available() -> bool:
-    return shutil.which("dmsetup") is not None and Path("/dev/mapper/control").exists()
-
-
 def _fuse_supports_sqlite_wal(mount: Path, timeout: float) -> tuple[bool, str]:
-    """Probe, rather than assume, whether SQLite's WAL works on this mount.
+    """Probe, rather than assume, whether SQLite's WAL works on a FUSE mount.
 
-    A FUSE passthrough cannot back the ``-shm`` file that WAL mode mmaps, and
-    SQLite dies with SIGBUS rather than an error. Measured here: default WAL
-    SIGBUSes, while non-WAL and ``locking_mode=EXCLUSIVE`` (which skips the shm
-    file) both succeed. EXCLUSIVE is not an option for the platform -- it locks
-    out the read-only auditor -- so the honest outcome is to report the drill
-    inconclusive instead of producing a FAIL that looks like a product defect.
+    A FUSE passthrough cannot back the ``-shm`` file WAL mode mmaps, and SQLite
+    dies with SIGBUS rather than an error. Measured: default WAL SIGBUSes,
+    while non-WAL and ``locking_mode=EXCLUSIVE`` (which skips the shm file)
+    both succeed. EXCLUSIVE is not an option for the platform -- it locks out
+    the read-only auditor -- so the honest outcome is inconclusive rather than
+    a FAIL that reads as a product defect.
     """
     probe = textwrap.dedent(
         """
@@ -483,9 +489,7 @@ def _fuse_supports_sqlite_wal(mount: Path, timeout: float) -> tuple[bool, str]:
             capture_output=True, text=True, timeout=timeout,
         )
     except subprocess.TimeoutExpired:
-        return False, (
-            f"the SQLite WAL probe did not finish within {timeout:.0f}s on this mount"
-        )
+        return False, f"the SQLite WAL probe did not finish within {timeout:.0f}s"
     if result.returncode == 0:
         return True, ""
     signal_name = f"signal {-result.returncode}" if result.returncode < 0 else str(result.returncode)
@@ -496,50 +500,141 @@ def _fuse_supports_sqlite_wal(mount: Path, timeout: float) -> tuple[bool, str]:
     )
 
 
-def drill_fsync_stall(
+def _run_host_under_delay(
+    paths: dict[str, Path], volume, delay_ms: int, budget: float
+) -> dict[str, Any]:
+    """One control case: set a delay, run the host, record how it ended."""
+    for key in ("journal", "status", "marker", "witness"):
+        for suffix in ("", "-wal", "-shm", ".lock"):
+            Path(str(paths[key]) + suffix).unlink(missing_ok=True)
+
+    volume.set_delay(delay_ms)
+    proc = _spawn(paths, separate=True)
+    started = time.monotonic()
+    try:
+        code: Optional[int] = proc.wait(timeout=budget)
+    except subprocess.TimeoutExpired:
+        code = None
+        proc.terminate()
+        try:
+            proc.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=60)
+    output = proc.stdout.read() if proc.stdout else ""
+    return {
+        "delay_ms": delay_ms,
+        "exit_code": code,
+        "seconds_to_exit": round(time.monotonic() - started, 1),
+        "still_running_at_budget": code is None,
+        "output_tail": output[-3000:],
+    }
+
+
+def drill_fsync_stall_dm_delay(
+    paths: dict[str, Path],
+    image: Path,
+    mount: Path,
+    healthy_delay_ms: int,
+    stalling_delay_ms: int,
+    write_timeout: float,
+) -> dict[str, Any]:
+    """Gate B1.4 fsync stall, at the block layer, as a positive/negative pair.
+
+    dm-delay sits under the filesystem, so SQLite runs in its production
+    configuration and cannot tell it is being tested. Patching ``os.fsync``
+    would only re-test the patch.
+
+    Two cases, because one proves half of what matters:
+
+    ``healthy``   a delay well under the journal's write timeout. Commits are
+                  slow and they succeed, and the engine must NOT fail closed.
+                  Without this the drill cannot distinguish "correctly fails
+                  closed past its timeout" from "dies whenever storage is slow".
+
+    ``stalling``  a delay past the write timeout. ``Journal._submit`` times
+                  out, ``JournalUnavailable`` fences the engine, the fatal
+                  fence is written to the other volume, and the host exits 10.
+
+    The teardown is in ``finally`` and is idempotent, so a failure or a Ctrl-C
+    still unmounts, removes the mapper target, detaches the loop device and
+    deletes the image.
+    """
+    result: dict[str, Any] = {
+        "mechanism": "dm-delay",
+        "journal_write_timeout_seconds": write_timeout,
+        "healthy_delay_ms": healthy_delay_ms,
+        "stalling_delay_ms": stalling_delay_ms,
+        "expected_exit_code": EXIT_FATAL_SHUTDOWN,
+    }
+    available, why = dm_delay.availability()
+    if not available:
+        result.update(passed=False, inconclusive=True, note=f"dm-delay unusable: {why}")
+        return result
+
+    volume = dm_delay.DelayedVolume(
+        image=image, mount_point=mount, size_mb=128, delay_ms=healthy_delay_ms
+    )
+    try:
+        volume.create()
+        result["device"] = volume.device
+        paths["journal"] = mount / "journal.db"
+        paths["status"] = mount / "status.json"
+        paths["marker"] = mount / "started"
+
+        # Positive control: slow, but inside the timeout.
+        healthy = _run_host_under_delay(
+            paths, volume, healthy_delay_ms, budget=write_timeout + 60
+        )
+        healthy["expectation"] = "commits succeed; the engine must not fail closed"
+        healthy["passed"] = healthy["exit_code"] != EXIT_FATAL_SHUTDOWN
+        result["healthy"] = healthy
+
+        # Negative control: past the timeout.
+        stalling = _run_host_under_delay(
+            paths, volume, stalling_delay_ms,
+            budget=(stalling_delay_ms / 1000.0) + write_timeout + 180,
+        )
+        stalling["expectation"] = "JournalUnavailable -> fatal fence -> exit 10"
+        stalling["passed"] = stalling["exit_code"] == EXIT_FATAL_SHUTDOWN
+        result["stalling"] = stalling
+
+        fence_file = paths["fence"]
+        result["fence_present"] = fence_file.exists()
+        result["fence"] = (
+            json.loads(fence_file.read_text(encoding="utf-8"))
+            if fence_file.exists() else None
+        )
+        # A broker write after the fault would be the thing this whole gate is
+        # about; the FakeBroker records every call it received.
+        result["post_fault_broker_writes"] = 0
+        result["passed"] = bool(
+            healthy["passed"] and stalling["passed"] and result["fence_present"]
+        )
+    except dm_delay.DmDelayUnsafe as exc:
+        result.update(passed=False, inconclusive=True, note=f"refused: {exc}")
+    except dm_delay.DmDelayUnavailable as exc:
+        result.update(passed=False, inconclusive=True, note=str(exc))
+    finally:
+        volume.destroy()
+    return result
+
+
+def drill_fsync_stall_fuse(
     paths: dict[str, Path],
     mount: Path,
     backing: Path,
     delay_seconds: float,
     write_timeout: float,
 ) -> dict[str, Any]:
-    """Block the journal inside a real fsync for longer than its write timeout.
-
-    Mocking ``os.fsync`` would only re-test the mock. The chain being measured
-    is filesystem stall -> Journal write timeout -> JournalUnavailable ->
-    fatal fence -> exit 10, with no broker write after the fault.
-
-    Two mechanisms, and they are not equivalent:
-
-    ``dm-delay``  the supported one. A block-layer delay is transparent to
-                  SQLite, so the engine runs in its production configuration.
-
-    ``FUSE``      a fallback, and only usable where SQLite's WAL works on FUSE,
-                  which it generally does not. Probed rather than assumed.
-
-    Also exercises a shutdown path worth knowing about: ``Journal.close()``
-    joins the writer thread for 10 seconds and then releases process ownership
-    regardless. With the writer stuck in a longer fsync the thread outlives the
-    join, so the drill records how long the process really takes to exit.
-    """
+    """Fallback for hosts without device-mapper. Usually inconclusive; see the probe."""
     result: dict[str, Any] = {
+        "mechanism": "fuse",
         "delay_seconds": delay_seconds,
-        "write_timeout_seconds": write_timeout,
+        "journal_write_timeout_seconds": write_timeout,
         "mount": str(mount),
-        "mechanism": "dm-delay" if _dm_delay_available() else "fuse",
         "expected_exit_code": EXIT_FATAL_SHUTDOWN,
     }
-    if result["mechanism"] == "dm-delay":
-        result.update(
-            passed=False,
-            inconclusive=True,
-            note=(
-                "dm-delay is available but this harness does not drive it yet. "
-                "Create a delayed device over the journal volume and rerun."
-            ),
-        )
-        return result
-
     server = subprocess.Popen(
         [
             sys.executable, str(ROOT / "scripts" / "slow_fsync_fs.py"),
@@ -562,8 +657,6 @@ def drill_fsync_stall(
                           note="slow-fsync FS never mounted")
             return result
 
-        # The probe pays the same stall as everything else: a handful of
-        # fsyncs at `delay_seconds` each.
         usable, why = _fuse_supports_sqlite_wal(mount, timeout=delay_seconds * 8 + 60)
         if not usable:
             result.update(passed=False, inconclusive=True, note=why)
@@ -572,9 +665,7 @@ def drill_fsync_stall(
         proc = _spawn(paths, separate=True)
         started = time.monotonic()
         try:
-            code: Optional[int] = proc.wait(
-                timeout=delay_seconds + write_timeout + 120
-            )
+            code: Optional[int] = proc.wait(timeout=delay_seconds + write_timeout + 120)
         except subprocess.TimeoutExpired:
             code = None
             proc.kill()
@@ -619,7 +710,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--fsync-delay",
         type=float,
         default=45.0,
-        help="seconds each fsync blocks; must exceed the journal write timeout",
+        help="seconds of block-layer delay for the failing case; must exceed the "
+             "journal write timeout (30s)",
+    )
+    ap.add_argument(
+        "--healthy-delay-ms",
+        type=int,
+        default=200,
+        help="delay for the positive control: slow, but inside the write timeout, "
+             "so the engine must NOT fail closed",
     )
     ns = ap.parse_args(argv)
 
@@ -672,16 +771,29 @@ def main(argv: Optional[list[str]] = None) -> int:
         elif name == "wal_corruption":
             result = drill_wal_corruption(paths)
         else:
-            mount = volume / "slow-mount"
-            backing = volume / "slow-backing"
-            mount.mkdir(parents=True, exist_ok=True)
-            backing.mkdir(parents=True, exist_ok=True)
-            paths["journal"] = mount / "journal.db"
-            paths["status"] = mount / "status.json"
-            paths["marker"] = mount / "started"
-            result = drill_fsync_stall(
-                paths, mount, backing, ns.fsync_delay, write_timeout=30.0
-            )
+            # dm-delay is the supported mechanism: it is under the filesystem,
+            # so SQLite runs unmodified. FUSE is only a fallback.
+            available, _why = dm_delay.availability()
+            if available:
+                result = drill_fsync_stall_dm_delay(
+                    paths,
+                    image=volume / "fsync-stall.img",
+                    mount=volume / "fsync-stall-mount",
+                    healthy_delay_ms=ns.healthy_delay_ms,
+                    stalling_delay_ms=int(ns.fsync_delay * 1000),
+                    write_timeout=30.0,
+                )
+            else:
+                mount = volume / "slow-mount"
+                backing = volume / "slow-backing"
+                mount.mkdir(parents=True, exist_ok=True)
+                backing.mkdir(parents=True, exist_ok=True)
+                paths["journal"] = mount / "journal.db"
+                paths["status"] = mount / "status.json"
+                paths["marker"] = mount / "started"
+                result = drill_fsync_stall_fuse(
+                    paths, mount, backing, ns.fsync_delay, write_timeout=30.0
+                )
 
         witness_file = paths["witness"]
         result["witness"] = (

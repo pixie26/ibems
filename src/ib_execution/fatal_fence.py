@@ -70,6 +70,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from .failure_domain import FailureDomainError, require_separate
+
+# Kept as an alias: callers and tests refer to this name, and the condition is
+# the same one the shared helper raises.
+FenceDomainError = FailureDomainError
+
 FENCE_SCHEMA_VERSION = 1
 
 STATE_RAISED = "RAISED"
@@ -78,10 +84,6 @@ STATE_ACKNOWLEDGED = "ACKNOWLEDGED"
 
 class FenceWriteFailed(RuntimeError):
     """Even the fence could not be persisted. Never silently downgraded."""
-
-
-class FenceDomainError(RuntimeError):
-    """The fence shares a failure domain with the journal it is meant to outlive."""
 
 
 class FenceStillRaised(RuntimeError):
@@ -128,26 +130,6 @@ class FatalFenceRecord:
         return {"schema_version": FENCE_SCHEMA_VERSION, **self.__dict__}
 
 
-def _same_failure_domain(a: Path, b: Path) -> bool:
-    """Best-effort "same volume" test.
-
-    ``st_dev`` is the device id on POSIX and the volume serial number on
-    Windows, which is exactly the granularity that matters: a full or failing
-    volume takes down everything on it.
-    """
-    def anchor(path: Path) -> Path:
-        candidate = path if path.exists() else path.parent
-        while not candidate.exists() and candidate != candidate.parent:
-            candidate = candidate.parent
-        return candidate
-
-    try:
-        return os.stat(anchor(a)).st_dev == os.stat(anchor(b)).st_dev
-    except OSError:
-        # If it cannot be determined, say so by refusing rather than assuming.
-        raise FenceDomainError(f"cannot determine the failure domain of {a} or {b}")
-
-
 class FatalFence:
     """A fence file on its own volume, with two-phase retirement."""
 
@@ -174,12 +156,7 @@ class FatalFence:
         """
         if not self.require_separate_domain:
             return
-        if _same_failure_domain(self.path, self.journal_path):
-            raise FenceDomainError(
-                f"the fatal fence ({self.path}) is on the same volume as the journal "
-                f"({self.journal_path}). The journal's volume filling up is the most "
-                "likely reason to write a fence, so it must live elsewhere."
-            )
+        require_separate(self.path, self.journal_path, "fatal fence")
 
     # -- reading --------------------------------------------------------
 

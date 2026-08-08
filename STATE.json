@@ -43,7 +43,7 @@
       {
         "evidence": "scripts/run_storage_fault_drill.py, artifacts/gate_b1_storage/",
         "id": "B1.4",
-        "note": "On 96MB loop ext4 (-m 0), fence on a separate volume: disk_full PASS (exit 10, fence raised). wal_corruption PASS (real rollback lost 21-138 committed events; loss above the witness correctly tolerated, forced crossing correctly refused with exit 15 and a fence). fsync_stall INCONCLUSIVE -- the FUSE harness cannot back SQLite's WAL -shm mmap (SIGBUS), so it must be rerun with dm-delay on the production host.",
+        "note": "On 96MB loop ext4 (-m 0), fence on a separate volume: disk_full PASS (exit 10, fence raised). wal_corruption PASS (real rollback lost 21-138 committed events; loss above the witness correctly tolerated, forced crossing correctly refused with exit 15 and a fence). fsync_stall NOT RUN -- the dm-delay driver is complete (provisioning, delay reload, healthy/stalling control pair, finally-teardown) but this kernel has no device-mapper, and the FUSE fallback cannot back SQLite's WAL -shm mmap (SIGBUS). One command on a host with dm.",
         "status": "PARTIAL",
         "title": "real storage faults on a constrained volume"
       },
@@ -73,7 +73,7 @@
     ],
     "config_tree_sha256": "2afcb80305ec6de198a911624c05f6e7681326d16d53fe0a268e60594ab26dcf",
     "dependency_lock_sha256": "6156296dd9b10927a0700cc2dfd77d42a19a6c39c0bb2753d982b30045de1a5b",
-    "source_file_count": 58,
-    "source_tree_sha256": "da518e3d092185501e5273edaa1490c1561d483762dcb8fe0d8a436a7f35dae9"
+    "source_file_count": 61,
+    "source_tree_sha256": "682ad5fd8c38a5844ddf1edb2b85746386296fb14328c541cbe7e114d8d541e4"
   }
 }
