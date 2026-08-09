@@ -160,10 +160,6 @@ def _evidence_is_valid(path: Path, freeze: str) -> bool:
         if not HEX64.fullmatch(value) or value != storage.get(key):
             return False
 
-    # The compact transcripts are embedded so the snapshot remains reviewable
-    # after Actions retention expires. Verify every embedded byte string against
-    # the hash recorded beside it, then against the originating manifest/index
-    # where one exists.
     evidence_text = data.get("evidence_text", {})
     required = {
         "deterministic",
@@ -239,14 +235,7 @@ def _evidence_is_valid(path: Path, freeze: str) -> bool:
 
 
 def validate(root: Path, freeze: str) -> Optional[Attestation]:
-    """Return the valid owner attestation for ``freeze`` or ``None``.
-
-    At the tested freeze HEAD the sign-off/evidence files may be untracked while
-    the finalizer prepares STATE. After the attestation commit, the freeze must
-    be an ancestor and the committed diff may contain only STATE, sign-off and
-    evidence snapshot. Any source/config/test/dependency change makes the old
-    PASS non-derivable.
-    """
+    """Return the valid owner attestation for ``freeze`` or ``None``."""
     if not HEX40.fullmatch(freeze):
         return None
     signoff, evidence = paths_for(root, freeze)
@@ -270,7 +259,7 @@ def validate(root: Path, freeze: str) -> Optional[Attestation]:
         "Windows gap acceptance": "ACCEPT",
         "Real IB scope": "DEFER_TO_B2",
         "Additional B1-level hazard identified": "NO",
-        "Decision": "ENTER_B2",
+        "Decision": "PASS",
     }
     for field, expected in required_owner_decisions.items():
         if _table_value(text, field).strip("`") != expected:
