@@ -1,7 +1,7 @@
-"""Finalize Gate B1 after an independent exact-freeze review.
+"""Finalize Gate B1 after exact-freeze owner risk acceptance.
 
-This command does not perform the review and cannot manufacture a signature.
-It validates the completed sign-off and durable evidence snapshot, then asks
+This command does not manufacture the human decision. It validates the
+completed owner acceptance and durable evidence snapshot, then asks
 ``provenance`` to regenerate STATE.json. PASS is never written as an override;
 it must be re-derived from the attestation and therefore survives future
 regeneration only while that attestation remains valid.
@@ -29,7 +29,7 @@ def _git(*args: str) -> subprocess.CompletedProcess[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Finalize an independently reviewed Gate B1")
+    ap = argparse.ArgumentParser(description="Finalize an owner-accepted Gate B1")
     ap.add_argument("--freeze-commit", required=True)
     ns = ap.parse_args(argv)
     freeze = ns.freeze_commit.strip()
@@ -49,7 +49,7 @@ def main(argv: list[str] | None = None) -> int:
 
     signoff, evidence = attestation.paths_for(ROOT, freeze)
     if not signoff.exists():
-        raise SystemExit(f"missing independent sign-off: {signoff.relative_to(ROOT)}")
+        raise SystemExit(f"missing owner acceptance: {signoff.relative_to(ROOT)}")
     if not evidence.exists():
         raise SystemExit(f"missing durable evidence snapshot: {evidence.relative_to(ROOT)}")
 
@@ -79,8 +79,8 @@ def main(argv: list[str] | None = None) -> int:
     validated = attestation.validate(ROOT, freeze)
     if validated is None:
         raise SystemExit(
-            "sign-off/evidence attestation is invalid; verify exact commit, reviewer/time/PASS, "
-            "workflow run, artifact digest and evidence snapshot SHA-256"
+            "owner-acceptance/evidence attestation is invalid; verify exact commit, owner/time, "
+            "scope/risk decisions, workflow run, artifact digest and evidence snapshot SHA-256"
         )
 
     provenance.write_state(ROOT)
@@ -90,7 +90,7 @@ def main(argv: list[str] | None = None) -> int:
     if state["gate_status"].get("signed_off_commit") != freeze:
         raise SystemExit("derived provenance signed_off_commit does not match freeze")
 
-    print(f"validated independent sign-off: {signoff.relative_to(ROOT)}")
+    print(f"validated owner acceptance: {signoff.relative_to(ROOT)}")
     print(f"validated durable evidence: {evidence.relative_to(ROOT)}")
     print("regenerated STATE.json with derived Gate B1 PASS")
     print("commit ONLY STATE.json + sign-off + evidence snapshot as the attestation commit")

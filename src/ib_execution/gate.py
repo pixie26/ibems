@@ -37,10 +37,11 @@ STATUS VALUES
 ``READY_FOR_FREEZE``
     The implementation and its evidence mechanism are complete *as code*. Not
     the same as PASS -- the evidence still has to be regenerated against the
-    frozen commit, and an independent human still has to sign it. For B1.5 in
-    particular, READY_FOR_FREEZE means the attestation protocol is enforceable;
-    the actual reviewer decision is represented by the committed sign-off and
-    evidence snapshot, from which STATE.json re-derives PASS.
+    frozen commit, and the project owner still has to accept the exact-freeze
+    residual risks and scope. For B1.5 in particular, READY_FOR_FREEZE means
+    the attestation protocol is enforceable; the actual owner decision is
+    represented by the committed sign-off and evidence snapshot, from which
+    STATE.json re-derives PASS.
 """
 
 from __future__ import annotations
@@ -113,23 +114,28 @@ B1_REQUIREMENTS: tuple[Requirement, ...] = (
             "rollback plus forced witness crossing -> exit 15 + fence), and "
             "fsync_stall (real dm-delay, healthy control then 45s live stall -> "
             "30s journal timeout -> fence -> exit 10 with zero post-fault broker "
-            "writes). Final sign-off must bind one exact unified freeze campaign; "
+            "writes). Final attestation must bind one exact unified freeze campaign; "
             "the exact run and artifact digest live in its durable evidence snapshot."
         ),
     ),
     Requirement(
         id="B1.5",
-        title="independent sign-off bound to an exact commit",
+        title="owner risk acceptance bound to an exact freeze",
         status=READY_FOR_FREEZE,
         evidence=(
             "docs/GATE_B1_SIGNOFF_TEMPLATE.md, scripts/finalize_gate_b1.py, "
             "src/ib_execution/attestation.py, tests/test_attestation.py"
         ),
         note=(
-            "READY_FOR_FREEZE is not a signature. Gate B1 becomes PASS only when "
-            "a valid exact-freeze sign-off and durable evidence snapshot exist and "
-            "the attestation diff contains metadata only. PASS is re-derived on "
-            "every STATE.json regeneration; it is never carried forward by hand."
+            "B1 technical evidence is produced by the frozen test/fault campaign and "
+            "adversarial code review. The human step is explicitly owner risk acceptance, "
+            "not a claim that the owner independently audited every line of code. The owner "
+            "must accept the B1 scope, invariant-19 overnight limits, the Linux-only Windows "
+            "gap, and the deferral of real-IB behavior to B2; the owner must also state "
+            "whether any additional B1-level hazard is known. Gate B1 becomes PASS only "
+            "when that exact-freeze owner acceptance and durable evidence snapshot exist and "
+            "the attestation diff contains metadata only. PASS is re-derived on every "
+            "STATE.json regeneration; it is never carried forward by hand."
         ),
     ),
     Requirement(
@@ -165,8 +171,8 @@ def as_state(signed_off_commit: Optional[str] = None) -> dict[str, Any]:
     """Derive the Gate section of STATE.json.
 
     ``signed_off_commit`` is itself derived by ``attestation`` from the exact
-    freeze sign-off, durable evidence snapshot and Git history. Passing an
-    attestation cannot override an incomplete registry.
+    freeze owner acceptance, durable evidence snapshot and Git history. Passing
+    an attestation cannot override an incomplete registry.
     """
     passed = signed_off_commit is not None and ready_for_freeze()
     return {

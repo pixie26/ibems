@@ -43,16 +43,16 @@
       {
         "evidence": "scripts/run_storage_fault_drill.py, artifacts/gate_b1_storage/, .github/workflows/b1-freeze-campaign.yml",
         "id": "B1.4",
-        "note": "All three real-storage mechanisms have passed in engineering runs: disk_full (real ENOSPC -> fence -> exit 10), wal_corruption (measured rollback plus forced witness crossing -> exit 15 + fence), and fsync_stall (real dm-delay, healthy control then 45s live stall -> 30s journal timeout -> fence -> exit 10 with zero post-fault broker writes). Final sign-off must bind one exact unified freeze campaign; the exact run and artifact digest live in its durable evidence snapshot.",
+        "note": "All three real-storage mechanisms have passed in engineering runs: disk_full (real ENOSPC -> fence -> exit 10), wal_corruption (measured rollback plus forced witness crossing -> exit 15 + fence), and fsync_stall (real dm-delay, healthy control then 45s live stall -> 30s journal timeout -> fence -> exit 10 with zero post-fault broker writes). Final attestation must bind one exact unified freeze campaign; the exact run and artifact digest live in its durable evidence snapshot.",
         "status": "READY_FOR_FREEZE",
         "title": "real storage faults on a constrained volume"
       },
       {
         "evidence": "docs/GATE_B1_SIGNOFF_TEMPLATE.md, scripts/finalize_gate_b1.py, src/ib_execution/attestation.py, tests/test_attestation.py",
         "id": "B1.5",
-        "note": "READY_FOR_FREEZE is not a signature. Gate B1 becomes PASS only when a valid exact-freeze sign-off and durable evidence snapshot exist and the attestation diff contains metadata only. PASS is re-derived on every STATE.json regeneration; it is never carried forward by hand.",
+        "note": "B1 technical evidence is produced by the frozen test/fault campaign and adversarial code review. The human step is explicitly owner risk acceptance, not a claim that the owner independently audited every line of code. The owner must accept the B1 scope, invariant-19 overnight limits, the Linux-only Windows gap, and the deferral of real-IB behavior to B2; the owner must also state whether any additional B1-level hazard is known. Gate B1 becomes PASS only when that exact-freeze owner acceptance and durable evidence snapshot exist and the attestation diff contains metadata only. PASS is re-derived on every STATE.json regeneration; it is never carried forward by hand.",
         "status": "READY_FOR_FREEZE",
-        "title": "independent sign-off bound to an exact commit"
+        "title": "owner risk acceptance bound to an exact freeze"
       },
       {
         "evidence": "src/ib_execution/journal_witness.py, tests/test_journal_witness.py, artifacts/gate_b1_storage/ (forced_crossing -> exit 15 + fence)",
@@ -74,6 +74,6 @@
     "config_tree_sha256": "2afcb80305ec6de198a911624c05f6e7681326d16d53fe0a268e60594ab26dcf",
     "dependency_lock_sha256": "6156296dd9b10927a0700cc2dfd77d42a19a6c39c0bb2753d982b30045de1a5b",
     "source_file_count": 66,
-    "source_tree_sha256": "2c525a65e009e0fd87f75eef66db300e503b0ddb223526184d98693943e5b41a"
+    "source_tree_sha256": "4b7cecb59d21608bb24a7bd85e560ec3af7885f4d4c1b5a7ba0d7ac3305400c8"
   }
 }

@@ -1,9 +1,14 @@
 """Gate B1 attestation derivation.
 
 A Gate B1 PASS is not mutable state. It is a conclusion that can be recomputed
-from durable facts: a freeze-ready registry, an exact-freeze sign-off, a
-self-contained evidence snapshot, and Git history showing that only attestation
-metadata changed after the tested freeze.
+from durable facts: a freeze-ready registry, an exact-freeze owner acceptance,
+a self-contained evidence snapshot, and Git history showing that only
+attestation metadata changed after the tested freeze.
+
+The human attestation is intentionally an OWNER RISK ACCEPTANCE, not a claim
+that the owner independently audited every implementation line. Technical
+claims remain grounded in the frozen automated/fault evidence. The owner must
+explicitly accept the residual-risk boundaries that tests cannot decide.
 """
 
 from __future__ import annotations
@@ -47,6 +52,16 @@ def _table_value(text: str, field: str) -> str:
         text,
         re.MULTILINE,
     )
+    return match.group(1).strip() if match else ""
+
+
+def _config_scalar(root: Path, key: str) -> str:
+    """Read one simple scalar from the frozen example risk config."""
+    try:
+        text = (root / "config" / "risk.example.yml").read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    match = re.search(rf"^{re.escape(key)}:\s*([^#\n]+?)\s*(?:#.*)?$", text, re.MULTILINE)
     return match.group(1).strip() if match else ""
 
 
@@ -97,6 +112,8 @@ def _evidence_is_valid(path: Path, freeze: str) -> bool:
     workflow = data.get("workflow", {})
     if workflow.get("name") != "b1-freeze-campaign":
         return False
+    if workflow.get("artifact_name") != f"gate-b1-freeze-{freeze}":
+        return False
     if not isinstance(workflow.get("run_id"), int) or workflow["run_id"] <= 0:
         return False
     if not ARTIFACT_DIGEST.fullmatch(str(workflow.get("artifact_digest", ""))):
@@ -134,13 +151,10 @@ def _evidence_is_valid(path: Path, freeze: str) -> bool:
         "dependency_lock_sha256",
         "resolved_environment_sha256",
     ):
-        if not formal.get(key) or formal.get(key) != storage.get(key):
+        value = str(formal.get(key, ""))
+        if not HEX64.fullmatch(value) or value != storage.get(key):
             return False
 
-    # The compact transcripts are embedded so the snapshot remains reviewable
-    # after Actions retention expires. Verify every embedded byte string against
-    # the hash recorded beside it, then against the originating manifest/index
-    # where one exists.
     evidence_text = data.get("evidence_text", {})
     required = {
         "deterministic",
@@ -175,6 +189,40 @@ def _evidence_is_valid(path: Path, freeze: str) -> bool:
         if evidence_text[key]["sha256"] != supplemental.get(source_path):
             return False
 
+    # Semantic checks prevent a structurally valid but empty evidence packet
+    # from satisfying the gate. They do not replace the exact GitHub run/artifact
+    # provenance recorded in the sign-off.
+    property_gate = evidence_text["property_gate"]["text"]
+    if property_gate.count("1500 passing, 0 failing") < 2:
+        return False
+    if "PASS: 20 seeds x 50 actions" not in evidence_text["deterministic_soak_auditor"]["text"]:
+        return False
+    if not re.search(r"^delay\s", evidence_text["dm_targets"]["text"], re.MULTILINE):
+        return False
+
+    drills = storage.get("drills", {})
+    disk = drills.get("disk_full", {})
+    wal = drills.get("wal_corruption", {})
+    fsync = drills.get("fsync_stall", {})
+    if disk.get("passed") is not True or disk.get("exit_code") != 10 or disk.get("fence_present") is not True:
+        return False
+    crossing = wal.get("forced_crossing", {})
+    if wal.get("passed") is not True or crossing.get("passed") is not True or crossing.get("exit_code") != 15:
+        return False
+    stalling = fsync.get("stalling", {})
+    healthy = fsync.get("healthy", {})
+    if (
+        fsync.get("passed") is not True
+        or fsync.get("mechanism") != "dm-delay"
+        or healthy.get("passed") is not True
+        or healthy.get("broker_write_count") != 1
+        or stalling.get("passed") is not True
+        or stalling.get("exit_code") != 10
+        or stalling.get("post_fault_broker_writes") != 0
+        or stalling.get("fence_present") is not True
+    ):
+        return False
+
     scope = data.get("scope_limits", {})
     if scope.get("windows_real_faults") != "NOT_RUN_ACCEPTED_NON_BLOCKER":
         return False
@@ -182,14 +230,7 @@ def _evidence_is_valid(path: Path, freeze: str) -> bool:
 
 
 def validate(root: Path, freeze: str) -> Optional[Attestation]:
-    """Return the valid attestation for ``freeze`` or ``None``.
-
-    At the tested freeze HEAD the sign-off/evidence files may be untracked while
-    the finalizer prepares STATE. After the attestation commit, the freeze must
-    be an ancestor and the committed diff may contain only STATE, sign-off and
-    evidence snapshot. Any source/config/test/dependency change makes the old
-    PASS non-derivable.
-    """
+    """Return the valid owner attestation for ``freeze`` or ``None``."""
     if not HEX40.fullmatch(freeze):
         return None
     signoff, evidence = paths_for(root, freeze)
@@ -199,15 +240,40 @@ def validate(root: Path, freeze: str) -> Optional[Attestation]:
     text = signoff.read_text(encoding="utf-8")
     if _table_value(text, "`commit_sha`") != freeze:
         return None
-    reviewer = _table_value(text, "Reviewer")
-    reviewed_at = _table_value(text, "Reviewed at (UTC)")
-    decision = _table_value(text, "Decision").strip("`")
-    if not reviewer or reviewer in {"—", "TBD"}:
+
+    owner = _table_value(text, "Owner")
+    accepted_at = _table_value(text, "Accepted at (UTC)")
+    if not owner or owner in {"—", "TBD"}:
         return None
-    if not reviewed_at or reviewed_at in {"—", "TBD"}:
+    if not accepted_at or accepted_at in {"—", "TBD"}:
         return None
-    if decision != "PASS":
+
+    required_owner_decisions = {
+        "B1 scope acceptance": "ACCEPT",
+        "Overnight risk acceptance": "ACCEPT",
+        "Windows gap acceptance": "ACCEPT",
+        "Real IB scope": "DEFER_TO_B2",
+        "Additional B1-level hazard identified": "NO",
+        "Decision": "PASS",
+    }
+    for field, expected in required_owner_decisions.items():
+        if _table_value(text, field).strip("`") != expected:
+            return None
+
+    # The owner explicitly accepted the current five-share SPY maximum. The
+    # 15% stress and $500 budget are recorded frozen mechanism parameters, not
+    # overclaimed as separately derived human judgements. All three still bind
+    # the sign-off to the exact risk configuration and force re-review on change.
+    frozen_risk = {
+        "Accepted max_position_shares": _config_scalar(root, "max_position_shares"),
+        "Recorded overnight_gap_stress_pct": _config_scalar(root, "overnight_gap_stress_pct"),
+        "Recorded max_overnight_loss": _config_scalar(root, "max_overnight_loss"),
+    }
+    if not all(frozen_risk.values()):
         return None
+    for field, expected in frozen_risk.items():
+        if _table_value(text, field).strip("`") != expected:
+            return None
 
     evidence_hash = sha256_file(evidence)
     if _table_value(text, "Evidence snapshot sha256") != evidence_hash:
@@ -248,7 +314,7 @@ def validate(root: Path, freeze: str) -> Optional[Attestation]:
 
 
 def derive_signed_off_commit(root: Path) -> Optional[str]:
-    """Find the unique valid Gate B1 signed freeze for this checkout."""
+    """Find the unique valid Gate B1 owner-accepted freeze for this checkout."""
     docs = root / "docs"
     if not docs.exists():
         return None
