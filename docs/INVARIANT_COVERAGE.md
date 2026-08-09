@@ -27,7 +27,7 @@
 | 16 | order/share/notional/position caps | yes | RiskEngine + restart restore | yes | evidence carries frozen limits |
 | 17 | intent stores config hash | yes | intent construction | yes | complete |
 | 18 | callback/bridge failure fail-closed | yes | guarded callbacks + bridge liveness | yes | **B1 仅覆盖 bridge 机制；真实 IB callback/disconnect 行为属 B2** |
-| 19 | overnight survivability | yes | numeric stress | yes | 机器只证明机制执行；风险充分性由 owner 接受冻结参数 |
+| 19 | overnight survivability | yes | numeric stress | yes | 机器证明机制；owner 明确接受 5 股 SPY 最大仓位，stress/budget 作为冻结假设记录 |
 | 20 | every invariant has P/R/A | yes | coverage contract | yes | auditor fails on missing row；不证明清单完整 |
 | 21 | startup must-reject self-test | yes | Controller 构造路径 + calendar coverage | yes | 配置 hash 与日历覆盖必须先于 start/intent |
 | 22 | restart cannot clear HALT | yes | forced restore + exact CAS ack + durable fence | yes | subprocess kill 后重启；存储修复后仍拒绝 |
@@ -68,15 +68,17 @@ Actions artifact 会过期，所以 evidence snapshot 永久保存 formal/storag
 
 `STATE.json` 的 PASS 不是手写 carry-forward。每次运行 `python -m ib_execution.provenance` 都从 registry + owner acceptance + evidence + Git ancestry/diff 重新派生。如果签字后行为代码、测试、配置或依赖发生变化，旧 attestation 自动失效，`STATE.json` 应回到 `NOT_PASSED`。
 
-### Invariant 19：机制验证与风险偏好必须分开
+### Invariant 19：机制验证与 owner 风险接受必须分开
 
-机器测试只能证明风险引擎会按照冻结配置执行 overnight stress，不能证明 stress 和 loss budget 本身“足够安全”。当前 owner 明确接受的参数将写入 exact-freeze sign-off，并由 `attestation.py` 与冻结的 `config/risk.example.yml` 逐项核对：
+机器测试只能证明风险引擎会按照冻结配置执行 overnight stress，不能证明 stress 和 loss budget 本身“足够安全”。当前 owner **明确接受的是 5 股 SPY 最大仓位**：如果系统故障导致日终完全无法平仓，这个仓位规模可以隔夜承担。
 
-- `max_position_shares = 5`（SPY）
-- `overnight_gap_stress_pct = 0.15`
-- `max_overnight_loss = 500`
+Exact-freeze sign-off 同时记录当前机制参数，以便以后追溯和重审：
 
-这代表：如果系统故障导致日终完全无法平仓，owner 接受以当前 5 股 SPY 上限进入隔夜。未来修改这三个参数中的任何一个，都必须重新 freeze 并重新做 owner acceptance。
+- `max_position_shares = 5` —— **owner 明确接受**
+- `overnight_gap_stress_pct = 0.15` —— 当前冻结模型假设
+- `max_overnight_loss = 500` —— 当前冻结模型预算
+
+记录后两项不等于声称 owner 独立验证了 15% / $500 的模型充分性；它们的作用是把“当时系统如何判断 overnight survivability”完整留痕。未来修改最大仓位或这两个模型参数中的任何一个，都必须重新 freeze 并重新做 owner acceptance。
 
 ### Windows 范围限制——owner 接受为非 blocker
 
