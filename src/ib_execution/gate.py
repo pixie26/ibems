@@ -39,14 +39,14 @@ STATUS VALUES
     the same as PASS -- the evidence still has to be regenerated against the
     frozen commit, and an independent human still has to sign it. For B1.5 in
     particular, READY_FOR_FREEZE means the attestation protocol is enforceable;
-    the actual reviewer decision is represented only by the committed sign-off
-    document plus STATE.json.
+    the actual reviewer decision is represented by the committed sign-off and
+    evidence snapshot, from which STATE.json re-derives PASS.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
-from typing import Any
+from dataclasses import asdict, dataclass
+from typing import Any, Optional
 
 OPEN = "OPEN"
 PARTIAL = "PARTIAL"
@@ -113,8 +113,8 @@ B1_REQUIREMENTS: tuple[Requirement, ...] = (
             "rollback plus forced witness crossing -> exit 15 + fence), and "
             "fsync_stall (real dm-delay, healthy control then 45s live stall -> "
             "30s journal timeout -> fence -> exit 10 with zero post-fault broker "
-            "writes). Final sign-off still requires rerunning the unified campaign "
-            "against the exact freeze commit."
+            "writes). Final sign-off must bind one exact unified freeze campaign; "
+            "the exact run and artifact digest live in its durable evidence snapshot."
         ),
     ),
     Requirement(
@@ -123,14 +123,13 @@ B1_REQUIREMENTS: tuple[Requirement, ...] = (
         status=READY_FOR_FREEZE,
         evidence=(
             "docs/GATE_B1_SIGNOFF_TEMPLATE.md, scripts/finalize_gate_b1.py, "
-            "tests/test_provenance.py::"
-            "test_gate_b1_is_not_claimed_passed_without_a_valid_freeze_attestation"
+            "src/ib_execution/attestation.py, tests/test_attestation.py"
         ),
         note=(
-            "The attestation mechanism is freeze-ready, but READY_FOR_FREEZE is "
-            "not a signature. Gate B1 remains NOT_PASSED until an independent "
-            "reviewer signs the exact-freeze document and the metadata-only "
-            "attestation commit is recorded in STATE.json."
+            "READY_FOR_FREEZE is not a signature. Gate B1 becomes PASS only when "
+            "a valid exact-freeze sign-off and durable evidence snapshot exist and "
+            "the attestation diff contains metadata only. PASS is re-derived on "
+            "every STATE.json regeneration; it is never carried forward by hand."
         ),
     ),
     Requirement(
@@ -158,17 +157,23 @@ def open_requirements() -> list[Requirement]:
 
 
 def ready_for_freeze() -> bool:
-    """Every requirement implemented. Still not PASS -- see the module docstring."""
+    """Every requirement implemented. Still not PASS without an attestation."""
     return not open_requirements()
 
 
-def as_state() -> dict[str, Any]:
-    """The gate section of STATE.json, derived rather than remembered."""
+def as_state(signed_off_commit: Optional[str] = None) -> dict[str, Any]:
+    """Derive the Gate section of STATE.json.
+
+    ``signed_off_commit`` is itself derived by ``attestation`` from the exact
+    freeze sign-off, durable evidence snapshot and Git history. Passing an
+    attestation cannot override an incomplete registry.
+    """
+    passed = signed_off_commit is not None and ready_for_freeze()
     return {
-        "gate_b1": "NOT_PASSED",
+        "gate_b1": "PASS" if passed else "NOT_PASSED",
         "gate_b2": "NOT_STARTED",
         "trading_adapter": "NOT_IMPLEMENTED",
-        "signed_off_commit": None,
+        "signed_off_commit": signed_off_commit if passed else None,
         "ready_for_freeze": ready_for_freeze(),
         "requirements": [asdict(r) for r in B1_REQUIREMENTS],
     }
