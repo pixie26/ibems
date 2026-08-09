@@ -35,25 +35,32 @@
 三条一起才构成完整的 fail-closed，缺一条就有缺口：
 
 - **22** 保护**已经落盘**的 HALT。journal 本身失效时，HALT 落不了盘，所以 22 不会被触发——不是被绕过，是被跳过。
-- **B1.6 的 witness** 是同一族的第四块：22 假设「落盘了就还在」，而 WAL 恢复会**丢弃已提交帧而不报错**。对抗性演练证明只钉 broker write 不够——HALT 不是 broker write，丢掉它就绕过了 22——所以 witness 也覆盖 HALT 类事件。
+- **B1.6 的 witness** 是同一族的第四块：22 假设「落盘了就还在」，而 WAL 恢复会**丢弃已提交帧而不报错**。对抗性演练证明只钉 broker write 不够——HALT 不是 broker write，丢掉它就绕过了 22——所以 witness 也覆盖 HALT 类安全事件。
 - **0** 保证同一时刻只有一个进程能写，否则 1–4 全部只在单进程内成立。
 - **B1.3b 的 durable fence** 补上 22 够不到的那一段：把「这次决定停」带过进程边界、重启和存储恢复。
 
 ## Gate B1 的 8 项 blocker
 
-权威状态在 `STATE.json`；本文件不复述。P/R/A 齐备不推导 gate 通过。
+权威状态在 `STATE.json`；本文件不复述。`READY_FOR_FREEZE` 只表示机制可以冻结并重跑，仍不等于独立 reviewer 已签字。
 
 | Blocker | 内容 | 证据位置 |
 |---|---|---|
-| B1.0 | reproducible environment | `uv.lock` + gate manifest 的 `resolved_environment_sha256` |
+| B1.0 | reproducible environment | `uv.lock` + formal campaign manifest 的 `resolved_environment_sha256` |
 | B1.1 | single-writer process ownership | `tests/test_journal_ownership.py`（真实双进程 + SIGKILL） |
 | B1.2 | calendar fail-closed | `tests/test_calendar_coverage.py` |
 | B1.3a | fatal host exit | `tests/test_fatal_fence.py` + `deploy/` + `tests/test_supervisor.py` |
 | B1.3b | durable fatal fence | `tests/test_fatal_fence.py::test_a_repaired_journal_still_refuses_to_trade` |
-| B1.4 | real storage faults | 96MB loop ext4 实跑：`disk_full` PASS，`wal_corruption` PASS，`fsync_stall` INCONCLUSIVE（需 dm-delay） |
-| B1.5 | independent exact-commit sign-off | `docs/GATE_B1_SIGNOFF_TEMPLATE.md`（未签） |
-| B1.6 | journal witness | 已实现。绑定 `journal_id`+seq+event identity+digest；覆盖 broker write 与 HALT 类事件；`tests/test_journal_witness.py` |
+| B1.4 | real storage faults | unified freeze campaign：`disk_full`、`wal_corruption`、真实 `dm-delay fsync_stall` 均要求 PASS，且 `inconclusive=[]` |
+| B1.5 | independent exact-freeze sign-off | `docs/GATE_B1_SIGNOFF_TEMPLATE.md` + `scripts/finalize_gate_b1.py` + attestation CI |
+| B1.6 | journal witness | 绑定 `journal_id`+seq+event identity+digest；覆盖 broker write 与 HALT 类事件；`tests/test_journal_witness.py` + WAL crossing drill |
 
-之前那次 1,500-example campaign（seed `2026080601`、source-tree `4990d57c…`）证明的是**当时那棵树**。A/B/C 三个 commit 已经改变了 source tree，所以它不能作为当前 HEAD 的签字证据；campaign 必须在 freeze commit 上重跑。
+### Freeze 与签字的 commit 语义
+
+被完整 campaign 测试的是 **freeze commit**。独立 reviewer 在该 commit 的 artifact 上完成审阅后，允许生成一个后继 **attestation commit**，但它只能包含：
+
+- `STATE.json`
+- `docs/GATE_B1_SIGNOFF_<freeze-sha[:12]>.md`
+
+原因是 Git commit 不可能把“包含自己的 commit SHA”写进自己。要求 signed commit 必须等于包含签字文件的 HEAD 会形成不可满足的自引用。新的 provenance test 会验证 freeze 是 attestation 的祖先，并拒绝两者之间任何行为代码、测试、配置或依赖变化。
 
 Gate B2 的 IB stable-snapshot、permId、1101/1102 和 callback observed matrix 不倒灌进 B1，也不因 B1 的 FakeBroker 证据而预判通过。
