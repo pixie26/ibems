@@ -116,7 +116,7 @@ whether any additional B1-level hazard is currently known.
 | 16 | order/share/notional/position caps | yes | RiskEngine + restart restore | yes | B1 core |
 | 17 | intent stores config hash | yes | intent construction | yes | B1 core |
 | 18 | callback/bridge failure fail-closed | yes | guarded callbacks + bridge liveness | yes | **real IB callbacks deferred to B2** |
-| 19 | overnight survivability | yes | numeric stress | yes | mechanism tested; **risk adequacy requires owner acceptance** |
+| 19 | overnight survivability | yes | numeric stress | yes | mechanism tested; **5-share risk acceptance is human** |
 | 20 | every invariant has P/R/A | yes | coverage contract | yes | does not prove list completeness |
 | 21 | startup must-reject self-test | yes | controller construction + calendar coverage | yes | B1 core |
 | 22 | restart cannot clear HALT | yes | forced restore + exact CAS ack + durable fence | yes | B1 core |
@@ -150,8 +150,8 @@ that every code path is bug-free.
 | B1 scope acceptance | `ACCEPT` / `REJECT` |
 | Overnight risk acceptance | `ACCEPT` / `REJECT` |
 | Accepted max_position_shares | copy exact frozen value |
-| Accepted overnight_gap_stress_pct | copy exact frozen value |
-| Accepted max_overnight_loss | copy exact frozen value |
+| Recorded overnight_gap_stress_pct | copy exact frozen value |
+| Recorded max_overnight_loss | copy exact frozen value |
 | Windows gap acceptance | `ACCEPT` / `REJECT` |
 | Real IB scope | `DEFER_TO_B2` / `REJECT` |
 | Additional B1-level hazard identified | `NO` / describe blocker |
@@ -162,8 +162,11 @@ Interpretation of the required positive decision:
 
 - `B1 scope acceptance=ACCEPT`: B1 core evidence is sufficient to move to the
   next protocol-validation phase; this is not authorization to send an order.
-- `Overnight risk acceptance=ACCEPT`: the owner accepts the exact frozen
-  invariant-19 values if the system cannot flatten and must hold overnight.
+- `Overnight risk acceptance=ACCEPT` + `Accepted max_position_shares`: the owner
+  explicitly accepts the frozen maximum position if the system cannot flatten
+  and must hold overnight. The current 15% stress and $500 loss budget are
+  recorded alongside that decision as model assumptions; recording them does
+  **not** overstate that the owner separately validated those model choices.
 - `Windows gap acceptance=ACCEPT`: Linux-only fault evidence does not block B2,
   but Windows order-capable deployment still requires production-OS validation.
 - `Real IB scope=DEFER_TO_B2`: FakeBroker evidence is not read as coverage of
