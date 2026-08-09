@@ -1,10 +1,9 @@
-"""Build the durable Gate B1 evidence snapshot from one workflow artifact ZIP.
+"""Build a durable, self-contained Gate B1 evidence snapshot from one artifact ZIP.
 
-The Actions artifact is useful operationally but expires. This script extracts
-only the compact, review-critical records and stores them in git as
-``docs/GATE_B1_EVIDENCE_<freeze[:12]>.json``. The sign-off records the SHA-256
-of this file, so future reviewers can still reconstruct what was signed even
-after GitHub deletes the original artifact.
+GitHub Actions artifacts expire. The signed evidence snapshot therefore embeds
+the exact formal/storage manifest bytes plus the compact human-reviewable
+transcripts that establish Hypothesis, crash-window, auditor and storage-domain
+results. Their hashes are checked while building the snapshot.
 """
 
 from __future__ import annotations
@@ -48,6 +47,14 @@ def _supplemental_hashes(zf: zipfile.ZipFile) -> dict[str, str]:
     return out
 
 
+def _read_text(zf: zipfile.ZipFile, path: str) -> str:
+    try:
+        raw = zf.read(path)
+    except KeyError as exc:
+        raise SystemExit(f"artifact missing required evidence text: {path}") from exc
+    return raw.decode("utf-8")
+
+
 def build_snapshot(
     artifact_zip: Path,
     *,
@@ -66,7 +73,25 @@ def build_snapshot(
         storage_name, storage_raw = _single(zf, "gate_b1_storage/", "/manifest.json")
         formal = json.loads(formal_raw)
         storage = json.loads(storage_raw)
-        supplemental = _supplemental_hashes(zf)
+        supplemental_hashes = _supplemental_hashes(zf)
+
+        formal_dir = formal_name.rsplit("/", 1)[0]
+        formal_paths = {
+            "deterministic": f"{formal_dir}/deterministic.txt",
+            "property_default": f"{formal_dir}/property_default.txt",
+            "property_gate": f"{formal_dir}/property_gate.txt",
+        }
+        supplemental_paths = {
+            "process_crash": "gate_b1_extra/process_crash.txt",
+            "deterministic_soak_auditor": "gate_b1_extra/deterministic_soak_auditor.txt",
+            "dm_targets": "gate_b1_extra/dm-targets.txt",
+            "storage_domains": "gate_b1_extra/storage_domains.txt",
+        }
+        evidence_text: dict[str, dict[str, str]] = {}
+        for key, path in {**formal_paths, **supplemental_paths}.items():
+            text = _read_text(zf, path)
+            digest = _sha256(text.encode("utf-8"))
+            evidence_text[key] = {"path": path, "sha256": digest, "text": text}
 
     if formal.get("commit_sha") != freeze_commit or storage.get("commit_sha") != freeze_commit:
         raise SystemExit("artifact manifests do not bind to the requested freeze commit")
@@ -80,6 +105,19 @@ def build_snapshot(
         if formal.get(key) != storage.get(key):
             raise SystemExit(f"formal/storage manifests disagree on {key}")
 
+    artifact_hashes = formal.get("artifact_hashes", {})
+    for key, filename in (
+        ("deterministic", "deterministic.txt"),
+        ("property_default", "property_default.txt"),
+        ("property_gate", "property_gate.txt"),
+    ):
+        if evidence_text[key]["sha256"] != artifact_hashes.get(filename):
+            raise SystemExit(f"formal transcript hash mismatch: {filename}")
+    for key in ("process_crash", "deterministic_soak_auditor", "dm_targets", "storage_domains"):
+        path = "artifacts/" + evidence_text[key]["path"]
+        if evidence_text[key]["sha256"] != supplemental_hashes.get(path):
+            raise SystemExit(f"supplemental transcript hash mismatch: {path}")
+
     return {
         "schema_version": 1,
         "freeze_commit": freeze_commit,
@@ -91,9 +129,10 @@ def build_snapshot(
         },
         "manifest_paths": {"formal": formal_name, "storage": storage_name},
         "manifest_sha256": {"formal": _sha256(formal_raw), "storage": _sha256(storage_raw)},
-        "formal_manifest": formal,
-        "storage_manifest": storage,
-        "supplemental_sha256": supplemental,
+        "formal_manifest_raw": formal_raw.decode("utf-8"),
+        "storage_manifest_raw": storage_raw.decode("utf-8"),
+        "evidence_text": evidence_text,
+        "supplemental_sha256": supplemental_hashes,
         "scope_limits": {
             "windows_real_faults": "NOT_RUN_ACCEPTED_NON_BLOCKER",
             "windows_note": (
