@@ -35,9 +35,12 @@ STATUS VALUES
     and collapsing them is how a gate creeps forward on vibes.
 
 ``READY_FOR_FREEZE``
-    The implementation and its evidence are complete *as code*. Not the same
-    as PASS -- the evidence still has to be regenerated against the frozen
-    commit, and a human still has to sign it.
+    The implementation and its evidence mechanism are complete *as code*. Not
+    the same as PASS -- the evidence still has to be regenerated against the
+    frozen commit, and an independent human still has to sign it. For B1.5 in
+    particular, READY_FOR_FREEZE means the attestation protocol is enforceable;
+    the actual reviewer decision is represented only by the committed sign-off
+    document plus STATE.json.
 """
 
 from __future__ import annotations
@@ -102,32 +105,33 @@ B1_REQUIREMENTS: tuple[Requirement, ...] = (
         status=READY_FOR_FREEZE,
         evidence=(
             "scripts/run_storage_fault_drill.py, artifacts/gate_b1_storage/, "
-            "GitHub Actions b1-storage-fsync run 31268292501"
+            ".github/workflows/b1-freeze-campaign.yml"
         ),
         note=(
-            "All three real-storage sub-drills have passed. On 96MB loop ext4 "
-            "(-m 0), fence on a separate volume: disk_full PASS (real ENOSPC -> "
-            "fence -> exit 10); wal_corruption PASS (real WAL rollback measured, "
-            "loss above the witness tolerated and forced crossing refused with "
-            "exit 15 + fence). fsync_stall PASS on Ubuntu 24.04 / Linux 6.17 Azure "
-            "with real dm-delay v1.5.0 and separate constrained filesystems: 200ms "
-            "healthy control reached one observed place_order while remaining alive "
-            "and unfenced; live reload to 45s before the target crossed the 30s "
-            "journal timeout, raised the durable fence, exited 10, and recorded zero "
-            "broker writes after the fault. The first real dm-delay run also found "
-            "and fixed a teardown defect: unmounting while delay remained 45s could "
-            "time out and mask the behavioral result; teardown now resets delay to "
-            "0 and is bounded/best-effort. This is pre-freeze engineering evidence; "
-            "the complete campaign must still be regenerated against the exact "
-            "freeze commit for B1.5."
+            "All three real-storage mechanisms have passed in engineering runs: "
+            "disk_full (real ENOSPC -> fence -> exit 10), wal_corruption (measured "
+            "rollback plus forced witness crossing -> exit 15 + fence), and "
+            "fsync_stall (real dm-delay, healthy control then 45s live stall -> "
+            "30s journal timeout -> fence -> exit 10 with zero post-fault broker "
+            "writes). Final sign-off still requires rerunning the unified campaign "
+            "against the exact freeze commit."
         ),
     ),
     Requirement(
         id="B1.5",
         title="independent sign-off bound to an exact commit",
-        status=OPEN,
-        evidence="docs/GATE_B1_SIGNOFF_TEMPLATE.md",
-        note="unsigned; must be redone against the freeze commit",
+        status=READY_FOR_FREEZE,
+        evidence=(
+            "docs/GATE_B1_SIGNOFF_TEMPLATE.md, scripts/finalize_gate_b1.py, "
+            "tests/test_provenance.py::"
+            "test_gate_b1_is_not_claimed_passed_without_a_valid_freeze_attestation"
+        ),
+        note=(
+            "The attestation mechanism is freeze-ready, but READY_FOR_FREEZE is "
+            "not a signature. Gate B1 remains NOT_PASSED until an independent "
+            "reviewer signs the exact-freeze document and the metadata-only "
+            "attestation commit is recorded in STATE.json."
+        ),
     ),
     Requirement(
         id="B1.6",
