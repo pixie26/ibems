@@ -1,18 +1,10 @@
 """Finalize Gate B1 after an independent exact-freeze review.
 
 This command does not perform the review and cannot manufacture a signature.
-It validates a completed sign-off document, then writes the only machine-readable
-PASS claim to STATE.json.
-
-The tested commit and the attestation commit are deliberately different:
-
-    freeze commit      -- code/config/dependencies/tests exercised by campaign
-    attestation commit -- only STATE.json + docs/GATE_B1_SIGNOFF_<freeze>.md
-
-A commit cannot contain its own hash, so requiring those identities to be the
-same is impossible. tests/test_provenance.py enforces that the freeze commit is
-an ancestor of the attestation commit and that no behavioural file changed in
-between.
+It validates the completed sign-off and durable evidence snapshot, then asks
+``provenance`` to regenerate STATE.json. PASS is never written as an override;
+it must be re-derived from the attestation and therefore survives future
+regeneration only while that attestation remains valid.
 """
 
 from __future__ import annotations
@@ -22,7 +14,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from ib_execution import gate, provenance
+from ib_execution import attestation, gate, provenance
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -34,32 +26,6 @@ def _git(*args: str) -> subprocess.CompletedProcess[str]:
         text=True,
         timeout=30,
     )
-
-
-def _table_value(text: str, field: str) -> str:
-    match = re.search(
-        rf"^\|\s*{re.escape(field)}\s*\|\s*(.*?)\s*\|\s*$",
-        text,
-        re.MULTILINE,
-    )
-    return match.group(1).strip() if match else ""
-
-
-def _validate_signoff(path: Path, freeze: str) -> None:
-    if not path.exists():
-        raise SystemExit(f"missing independent sign-off: {path.relative_to(ROOT)}")
-    text = path.read_text(encoding="utf-8")
-    if _table_value(text, "`commit_sha`") != freeze:
-        raise SystemExit("sign-off commit_sha does not match --freeze-commit")
-    reviewer = _table_value(text, "Reviewer")
-    reviewed_at = _table_value(text, "Reviewed at (UTC)")
-    decision = _table_value(text, "Decision").strip("`")
-    if not reviewer or reviewer in {"—", "TBD"}:
-        raise SystemExit("sign-off requires a named independent reviewer")
-    if not reviewed_at or reviewed_at in {"—", "TBD"}:
-        raise SystemExit("sign-off requires Reviewed at (UTC)")
-    if decision != "PASS":
-        raise SystemExit(f"sign-off Decision must be PASS, got {decision!r}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -81,34 +47,53 @@ def main(argv: list[str] | None = None) -> int:
         open_ids = [r.id for r in gate.open_requirements()]
         raise SystemExit(f"Gate B1 is not ready for freeze; open requirements: {open_ids}")
 
-    signoff = ROOT / "docs" / f"GATE_B1_SIGNOFF_{freeze[:12]}.md"
-    _validate_signoff(signoff, freeze)
+    signoff, evidence = attestation.paths_for(ROOT, freeze)
+    if not signoff.exists():
+        raise SystemExit(f"missing independent sign-off: {signoff.relative_to(ROOT)}")
+    if not evidence.exists():
+        raise SystemExit(f"missing durable evidence snapshot: {evidence.relative_to(ROOT)}")
 
-    # Before writing STATE, only the sign-off document may differ from the
-    # tested freeze. This catches an operator who edited code after the campaign
-    # but before running this command.
-    status = _git("status", "--porcelain")
+    # Before STATE is regenerated, only the two attestation inputs may differ
+    # from the exact tested freeze. Any implementation/config/test/dependency
+    # edit invalidates the campaign and requires a new freeze.
+    status = _git("status", "--porcelain", "--untracked-files=all")
     if status.returncode != 0:
         raise SystemExit(status.stderr.strip() or "git status failed")
     changed: set[str] = set()
     for line in status.stdout.splitlines():
         if len(line) >= 4:
-            changed.add(line[3:])
-    expected = {signoff.relative_to(ROOT).as_posix()}
+            path = line[3:]
+            if " -> " in path:
+                path = path.split(" -> ", 1)[1]
+            changed.add(path)
+    expected = {
+        signoff.relative_to(ROOT).as_posix(),
+        evidence.relative_to(ROOT).as_posix(),
+    }
     if changed - expected:
         raise SystemExit(
             "refusing to attest a dirty freeze; unexpected changes: "
             + ", ".join(sorted(changed - expected))
         )
 
-    gate_status = gate.as_state()
-    gate_status["gate_b1"] = "PASS"
-    gate_status["signed_off_commit"] = freeze
-    provenance.write_state(ROOT, gate_status=gate_status)
+    validated = attestation.validate(ROOT, freeze)
+    if validated is None:
+        raise SystemExit(
+            "sign-off/evidence attestation is invalid; verify exact commit, reviewer/time/PASS, "
+            "workflow run, artifact digest and evidence snapshot SHA-256"
+        )
+
+    provenance.write_state(ROOT)
+    state = provenance.load_state(ROOT)
+    if state is None or state["gate_status"].get("gate_b1") != "PASS":
+        raise SystemExit("derived provenance did not produce Gate B1 PASS")
+    if state["gate_status"].get("signed_off_commit") != freeze:
+        raise SystemExit("derived provenance signed_off_commit does not match freeze")
 
     print(f"validated independent sign-off: {signoff.relative_to(ROOT)}")
-    print("wrote STATE.json with Gate B1 PASS")
-    print("commit ONLY the sign-off document and STATE.json as the attestation commit")
+    print(f"validated durable evidence: {evidence.relative_to(ROOT)}")
+    print("regenerated STATE.json with derived Gate B1 PASS")
+    print("commit ONLY STATE.json + sign-off + evidence snapshot as the attestation commit")
     return 0
 
 

@@ -2,7 +2,7 @@
 
 `COMPLETE` 要求三层同时存在：Property/adversarial test（P）、runtime assertion/structural enforcement（R）、offline journal auditor（A）。
 
-**P/R/A 齐备不推导 `gate_b1: PASS`。** 正式 campaign、8 项 B1 blocker 和独立评审签字都是独立的退出条件。权威状态只有一个来源：仓库根目录的 `STATE.json`（由 `python -m ib_execution.provenance` 生成，`tests/test_provenance.py` 强制它与工作树一致）。本文件不复述该状态。
+**P/R/A 齐备不推导 `gate_b1: PASS`。** 正式 campaign、8 项 B1 blocker 和独立评审签字都是独立的退出条件。权威状态只有一个来源：仓库根目录的 `STATE.json`（由 `python -m ib_execution.provenance` 生成，`tests/test_provenance.py` 强制它与工作树和有效 attestation 一致）。本文件不复述该状态。
 
 | # | 简述 | P | R | A | 当前证据 |
 |---|---|---|---|---|---|
@@ -50,17 +50,28 @@
 | B1.2 | calendar fail-closed | `tests/test_calendar_coverage.py` |
 | B1.3a | fatal host exit | `tests/test_fatal_fence.py` + `deploy/` + `tests/test_supervisor.py` |
 | B1.3b | durable fatal fence | `tests/test_fatal_fence.py::test_a_repaired_journal_still_refuses_to_trade` |
-| B1.4 | real storage faults | unified freeze campaign：`disk_full`、`wal_corruption`、真实 `dm-delay fsync_stall` 均要求 PASS，且 `inconclusive=[]` |
-| B1.5 | independent exact-freeze sign-off | `docs/GATE_B1_SIGNOFF_TEMPLATE.md` + `scripts/finalize_gate_b1.py` + attestation CI |
+| B1.4 | real storage faults | unified freeze campaign：`disk_full`、`wal_corruption`、真实 `dm-delay fsync_stall` 均要求 PASS，且 `inconclusive=[]`；exact run/digest 固化进 durable evidence snapshot |
+| B1.5 | independent exact-freeze sign-off | `docs/GATE_B1_SIGNOFF_TEMPLATE.md` + `scripts/build_gate_b1_evidence.py` + `scripts/finalize_gate_b1.py` + `src/ib_execution/attestation.py` |
 | B1.6 | journal witness | 绑定 `journal_id`+seq+event identity+digest；覆盖 broker write 与 HALT 类事件；`tests/test_journal_witness.py` + WAL crossing drill |
 
-### Freeze 与签字的 commit 语义
+### Freeze、证据与签字的 commit 语义
 
 被完整 campaign 测试的是 **freeze commit**。独立 reviewer 在该 commit 的 artifact 上完成审阅后，允许生成一个后继 **attestation commit**，但它只能包含：
 
 - `STATE.json`
 - `docs/GATE_B1_SIGNOFF_<freeze-sha[:12]>.md`
+- `docs/GATE_B1_EVIDENCE_<freeze-sha[:12]>.json`
 
-原因是 Git commit 不可能把“包含自己的 commit SHA”写进自己。要求 signed commit 必须等于包含签字文件的 HEAD 会形成不可满足的自引用。新的 provenance test 会验证 freeze 是 attestation 的祖先，并拒绝两者之间任何行为代码、测试、配置或依赖变化。
+Actions artifact 会过期，所以 evidence snapshot 永久保存 formal/storage manifests、supplemental hashes、exact workflow run 和 artifact digest；sign-off 再绑定 evidence snapshot 自身的 SHA-256。
+
+`STATE.json` 的 PASS 不是手写 carry-forward。每次运行 `python -m ib_execution.provenance` 都从 registry + sign-off + evidence + Git ancestry/diff 重新派生。如果签字后行为代码、测试、配置或依赖发生变化，旧 attestation 自动失效，`STATE.json` 应回到 `NOT_PASSED`。
+
+### Windows 范围限制——已接受为非 blocker
+
+当前 B1 的真实存储/故障证据全部来自 Linux。Windows-specific 的 `msvcrt.locking`、卷序列号 failure-domain 检查、NTFS ENOSPC/stall 语义，以及 `deploy/ibems-execution-service.ps1` 尚未经过真实故障演练。
+
+**Owner decision：记录该缺口，但不把它设为进入 B2 read-only / paper progression 的 blocker。** 这不等于允许在 Windows 上发单；在任何 order-capable Windows deployment 之前，必须补生产 OS 的真实验证。
+
+另外，GitHub-hosted 的 fsync drill 使用真实 block-layer `dm-delay`，但 constrained filesystem 由 tmpfs 支撑；B1 仍使用 FakeBroker，不变量 10/14/18 的真实 IB 部分属于 B2；Recorder 也不在 B1 中声称已有完整 Full-RTH session。
 
 Gate B2 的 IB stable-snapshot、permId、1101/1102 和 callback observed matrix 不倒灌进 B1，也不因 B1 的 FakeBroker 证据而预判通过。

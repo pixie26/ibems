@@ -7,8 +7,9 @@
 **A sign-off binds to one exact tested freeze commit.** If code, config,
 dependencies or tests change, take a new freeze and rerun the complete campaign.
 The later commit that records the signature is an **attestation commit**, not a
-new tested freeze. It may contain only this sign-off document and `STATE.json`.
-`tests/test_provenance.py` enforces that restriction.
+new tested freeze. It may contain only `STATE.json`, this sign-off document and
+the exact-freeze durable evidence snapshot. `tests/test_provenance.py` enforces
+that restriction.
 
 ---
 
@@ -26,10 +27,15 @@ new tested freeze. It may contain only this sign-off document and `STATE.json`.
 | Platform | |
 | Freeze campaign run | |
 | Freeze artifact digest | |
+| Evidence snapshot sha256 | |
 
-The hashes come from `artifacts/gate_b1/<stamp>/manifest.json` and must agree
-with the B1.4 storage manifest. The lock hash says what should be installed;
-the resolved-environment hash records what actually was installed.
+The formal and storage manifests must agree on the exact commit, source tree,
+dependency lock and resolved environment. The original GitHub Actions artifact
+is useful but expires; before signing, build and commit
+`docs/GATE_B1_EVIDENCE_<freeze[:12]>.json` with
+`scripts/build_gate_b1_evidence.py`. The sign-off records that file's SHA-256 so
+the reviewed evidence remains reconstructable after the Actions artifact
+expires.
 
 ## 2. Gate requirements
 
@@ -44,7 +50,7 @@ template contains exactly the same set.
 | B1.3a | fatal host exit + supervisor policy | deterministic JUnit :: fatal fence + supervisor | |
 | B1.3b | durable fatal fence | deterministic JUnit :: repaired journal still refuses | |
 | B1.4 | real storage faults | storage manifest: disk-full + WAL corruption + fsync stall | |
-| B1.5 | independent exact-freeze review and this signed document | this document | |
+| B1.5 | independent exact-freeze review and this signed document | sign-off + durable evidence snapshot | |
 | B1.6 | out-of-band witness that committed events still exist | witness tests + WAL crossing evidence | |
 
 ### B1.4 real-storage detail
@@ -134,10 +140,10 @@ proves the invariant stated.
 | 21 | startup must-reject self-test | | | | |
 | 22 | restart cannot clear HALT | | | | |
 
-## 5. Scope limits
+## 5. Scope limits and accepted residual risk
 
-A B1 PASS is deliberately narrower than “safe to trade”. Record these limits
-rather than allowing later readers to infer coverage that was never tested.
+A B1 PASS is deliberately narrower than “safe to trade”. These limits are part
+of the signed claim, not footnotes.
 
 - The trading IB adapter remains unverified; B1 uses `FakeBroker` for broker
   behaviour. Gate B2 exists to replace documentation assumptions with observed
@@ -147,8 +153,19 @@ rather than allowing later readers to infer coverage that was never tested.
   handlers.
 - Invariant 0 is one-host/process ownership on a shared local filesystem, not a
   distributed lock. Network filesystems are outside the frozen architecture.
+- **All B1 real-storage/fault evidence is Linux-only.** The Windows-specific
+  `msvcrt.locking` ownership path, Windows volume-serial failure-domain checks,
+  NTFS ENOSPC/stall behaviour and `deploy/ibems-execution-service.ps1` have not
+  been exercised with real failures.
+- **Owner decision for this gate:** the Windows gap above is recorded and
+  accepted as a **non-blocker for B2 read-only / paper progression**. It does
+  not authorize order-capable Windows deployment; production-OS validation is
+  required before relying on those Windows-specific controls for orders.
+- The GitHub-hosted fsync drill uses real block-layer `dm-delay`, but its
+  constrained filesystem is tmpfs-backed rather than persistent physical
+  media.
 - Recorder cross-stream diagnostics are measurements, not execution safety
-  authorization.
+  authorization; no complete Full-RTH recorder session is claimed by B1.
 - Known historical repository exposures or other accepted limitations must be
   stated explicitly in reviewer notes.
 
@@ -167,24 +184,39 @@ order.
 
 ## 7. Attestation procedure after a PASS
 
-Start from the exact tested freeze commit at `HEAD`. The completed sign-off
-file may be untracked/modified, but no other file may have changed. Run:
+Start from the exact tested freeze commit at `HEAD`.
+
+First build the durable evidence snapshot from the downloaded workflow artifact:
+
+```bash
+python scripts/build_gate_b1_evidence.py \
+  --artifact-zip <gate-b1-freeze.zip> \
+  --freeze-commit <full-40-char-freeze-sha> \
+  --run-id <workflow-run-id> \
+  --artifact-name <artifact-name> \
+  --artifact-digest sha256:<artifact-digest>
+```
+
+Copy the printed evidence snapshot SHA-256 into this sign-off, together with the
+exact workflow run and artifact digest. Complete the reviewer decision, then run:
 
 ```bash
 python scripts/finalize_gate_b1.py --freeze-commit <full-40-char-freeze-sha>
 ```
 
-The command validates the reviewer, timestamp, `PASS` decision and exact SHA,
-then writes `STATE.json` with `gate_b1=PASS` and `signed_off_commit=<freeze>`.
+The finalizer validates the sign-off, evidence snapshot, exact freeze and dirty
+worktree, then calls provenance regeneration. It does **not** manually set PASS;
+`STATE.json` must re-derive `gate_b1=PASS` and `signed_off_commit=<freeze>`.
 Commit **only**:
 
 ```text
 STATE.json
 docs/GATE_B1_SIGNOFF_<first-12-chars-of-freeze-sha>.md
+docs/GATE_B1_EVIDENCE_<first-12-chars-of-freeze-sha>.json
 ```
 
-That new commit is the attestation commit. CI then verifies that the signed
-freeze is its ancestor and that the diff from freeze to attestation contains
-only those two metadata files. If anything under source, tests, scripts,
-configuration or dependencies changed, PASS is rejected and the whole campaign
-must be rerun on a new freeze.
+That new commit is the attestation commit. CI verifies that the signed freeze is
+its ancestor, the diff contains only those metadata files, the evidence SHA is
+correct, and a later `python -m ib_execution.provenance` regeneration preserves
+PASS. Any source/test/script/config/dependency change invalidates the old PASS
+and requires a new freeze campaign.
