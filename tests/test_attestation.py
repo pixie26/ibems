@@ -156,7 +156,7 @@ def _write_signoff(
         "Windows gap acceptance": "ACCEPT",
         "Real IB scope": "DEFER_TO_B2",
         "Additional B1-level hazard identified": "NO",
-        "Decision": "ENTER_B2",
+        "Decision": "PASS",
     }
     if overrides:
         values.update(overrides)
@@ -261,7 +261,7 @@ def test_tampered_embedded_manifest_cannot_derive_pass(tmp_path: Path):
         ("Windows gap acceptance", ""),
         ("Real IB scope", "TREAT_AS_VERIFIED"),
         ("Additional B1-level hazard identified", "UNKNOWN"),
-        ("Decision", "PASS"),
+        ("Decision", "ENTER_B2"),
     ],
 )
 def test_owner_decision_fields_are_mandatory(tmp_path: Path, field: str, bad_value: str):
@@ -283,7 +283,7 @@ def test_invariant_19_acceptance_must_match_frozen_risk_config(tmp_path: Path):
     assert attestation.derive_signed_off_commit(tmp_path) is None
 
 
-def test_self_consistent_but_semantically_empty_storage_packet_is_rejected(tmp_path: Path):
+def test_self_consistent_but_semantically_wrong_storage_packet_is_rejected(tmp_path: Path):
     freeze = _init_repo(tmp_path)
     evidence, _ = _write_evidence(tmp_path, freeze)
     data = json.loads(evidence.read_text(encoding="utf-8"))
