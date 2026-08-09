@@ -151,8 +151,8 @@ def _write_signoff(
         "B1 scope acceptance": "ACCEPT",
         "Overnight risk acceptance": "ACCEPT",
         "Accepted max_position_shares": "5",
-        "Accepted overnight_gap_stress_pct": "0.15",
-        "Accepted max_overnight_loss": "500",
+        "Recorded overnight_gap_stress_pct": "0.15",
+        "Recorded max_overnight_loss": "500",
         "Windows gap acceptance": "ACCEPT",
         "Real IB scope": "DEFER_TO_B2",
         "Additional B1-level hazard identified": "NO",
@@ -271,7 +271,7 @@ def test_owner_decision_fields_are_mandatory(tmp_path: Path, field: str, bad_val
     assert attestation.derive_signed_off_commit(tmp_path) is None
 
 
-def test_invariant_19_acceptance_must_match_frozen_risk_config(tmp_path: Path):
+def test_owner_accepted_position_must_match_frozen_risk_config(tmp_path: Path):
     freeze = _init_repo(tmp_path)
     _, evidence_sha = _write_evidence(tmp_path, freeze)
     _write_signoff(
@@ -280,6 +280,22 @@ def test_invariant_19_acceptance_must_match_frozen_risk_config(tmp_path: Path):
         evidence_sha,
         overrides={"Accepted max_position_shares": "6"},
     )
+    assert attestation.derive_signed_off_commit(tmp_path) is None
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("Recorded overnight_gap_stress_pct", "0.20"),
+        ("Recorded max_overnight_loss", "600"),
+    ],
+)
+def test_recorded_overnight_model_parameters_must_match_freeze(
+    tmp_path: Path, field: str, bad_value: str
+):
+    freeze = _init_repo(tmp_path)
+    _, evidence_sha = _write_evidence(tmp_path, freeze)
+    _write_signoff(tmp_path, freeze, evidence_sha, overrides={field: bad_value})
     assert attestation.derive_signed_off_commit(tmp_path) is None
 
 
