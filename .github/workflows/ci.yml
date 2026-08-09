@@ -35,11 +35,18 @@ jobs:
       - name: Byte-compile every source file
         run: uv run python -m compileall -q src tests scripts
 
+      # JUnit files are runtime artifacts. Put them below artifacts/ (gitignored)
+      # so the exact-freeze attestation can inspect the real worktree rather than
+      # CI-generated root files. Otherwise a valid PASS is falsely rejected as
+      # a dirty attestation checkout.
+      - name: Prepare CI artifact directory
+        run: mkdir -p artifacts/ci
+
       - name: Deterministic suite
-        run: uv run pytest -m "not property" --junitxml=deterministic.xml
+        run: uv run pytest -m "not property" --junitxml=artifacts/ci/deterministic.xml
 
       - name: Generated tests, default profile
-        run: uv run pytest -m property --junitxml=property_default.xml
+        run: uv run pytest -m property --junitxml=artifacts/ci/property_default.xml
 
       - name: STATE.json describes this worktree
         run: uv run python -m ib_execution.provenance --check
@@ -48,4 +55,4 @@ jobs:
         if: always()
         with:
           name: junit
-          path: "*.xml"
+          path: "artifacts/ci/*.xml"
