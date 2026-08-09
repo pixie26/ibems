@@ -56,12 +56,7 @@ def _table_value(text: str, field: str) -> str:
 
 
 def _config_scalar(root: Path, key: str) -> str:
-    """Read one simple scalar from the frozen example risk config.
-
-    These three fields are deliberately parsed without loading arbitrary YAML;
-    they are plain scalar lines in ``config/risk.example.yml`` and are part of
-    the config tree hashed by the freeze campaign.
-    """
+    """Read one simple scalar from the frozen example risk config."""
     try:
         text = (root / "config" / "risk.example.yml").read_text(encoding="utf-8")
     except OSError:
@@ -265,12 +260,14 @@ def validate(root: Path, freeze: str) -> Optional[Attestation]:
         if _table_value(text, field).strip("`") != expected:
             return None
 
-    # Invariant 19 is partly a risk-preference decision, not a test result.
-    # Bind the owner's acceptance to the exact frozen risk parameters.
+    # The owner explicitly accepted the current five-share SPY maximum. The
+    # 15% stress and $500 budget are recorded frozen mechanism parameters, not
+    # overclaimed as separately derived human judgements. All three still bind
+    # the sign-off to the exact risk configuration and force re-review on change.
     frozen_risk = {
         "Accepted max_position_shares": _config_scalar(root, "max_position_shares"),
-        "Accepted overnight_gap_stress_pct": _config_scalar(root, "overnight_gap_stress_pct"),
-        "Accepted max_overnight_loss": _config_scalar(root, "max_overnight_loss"),
+        "Recorded overnight_gap_stress_pct": _config_scalar(root, "overnight_gap_stress_pct"),
+        "Recorded max_overnight_loss": _config_scalar(root, "max_overnight_loss"),
     }
     if not all(frozen_risk.values()):
         return None
