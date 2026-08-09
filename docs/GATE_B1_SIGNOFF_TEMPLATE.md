@@ -155,7 +155,7 @@ that every code path is bug-free.
 | Windows gap acceptance | `ACCEPT` / `REJECT` |
 | Real IB scope | `DEFER_TO_B2` / `REJECT` |
 | Additional B1-level hazard identified | `NO` / describe blocker |
-| Decision | `ENTER_B2` / `STOP` |
+| Decision | `PASS` / `STOP` |
 | Notes | |
 
 Interpretation of the required positive decision:
@@ -170,8 +170,8 @@ Interpretation of the required positive decision:
   invariants 10/14/18 against real IB; those observations are B2 work.
 - `Additional B1-level hazard identified=NO`: after considering known failure
   classes, the owner is not currently aware of another B1-level safety hole.
-- `Decision=ENTER_B2`: permits **B2 read-only / paper protocol validation**. It
-  does not authorize a paper or live order by itself.
+- `Decision=PASS`: closes B1 and permits **B2 read-only / paper protocol
+  validation**. It does not authorize a paper or live order by itself.
 
 ## 7. Attestation procedure
 
