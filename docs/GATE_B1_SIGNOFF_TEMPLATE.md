@@ -1,13 +1,14 @@
 # Gate B1 sign-off
 
-> Copy to `docs/GATE_B1_SIGNOFF_<commit-sha-short>.md`, fill in every field
-> from generated artifacts, and commit it. Do not fill anything in by reading
-> a previous sign-off.
+> Copy this file to `docs/GATE_B1_SIGNOFF_<first-12-chars-of-freeze-sha>.md`.
+> Fill every evidence field from the artifacts generated for that exact freeze.
+> Do not copy values from a previous sign-off.
 
-**A sign-off binds to one exact commit.** Any change to code, config,
-dependencies or tests after the freeze invalidates it — there is no
-cherry-picking a small fix and keeping the old proof. If a bug is found during
-the campaign, fix it, take a new freeze commit, and rerun the whole campaign.
+**A sign-off binds to one exact tested freeze commit.** If code, config,
+dependencies or tests change, take a new freeze and rerun the complete campaign.
+The later commit that records the signature is an **attestation commit**, not a
+new tested freeze. It may contain only this sign-off document and `STATE.json`.
+`tests/test_provenance.py` enforces that restriction.
 
 ---
 
@@ -23,84 +24,89 @@ the campaign, fix it, take a new freeze commit, and rerun the whole campaign.
 | `resolved_environment_sha256` | |
 | Python | must be 3.12.x |
 | Platform | |
+| Freeze campaign run | |
+| Freeze artifact digest | |
 
-Every value above comes from `artifacts/gate_b1/<stamp>/manifest.json`. The
-last two hashes are not redundant: the lockfile says what *should* be
-installed, the resolved environment says what *was*, and Gate B1 is an
-argument about observations.
+The hashes come from `artifacts/gate_b1/<stamp>/manifest.json` and must agree
+with the B1.4 storage manifest. The lock hash says what should be installed;
+the resolved-environment hash records what actually was installed.
 
-## 2. Blockers
+## 2. Gate requirements
 
-The rows below are the ids in `ib_execution.gate.B1_REQUIREMENTS`, and
-`tests/test_provenance.py` fails if this table and that registry disagree.
+These ids are defined by `ib_execution.gate.B1_REQUIREMENTS`; CI checks this
+template contains exactly the same set.
 
 | # | Blocker | Artifact | Verdict |
 |---|---|---|---|
-| B1.0 | reproducible environment | `artifacts/gate_b1/<stamp>/manifest.json` | |
-| B1.1 | single-writer process ownership | `deterministic.xml` :: `test_journal_ownership` | |
-| B1.2 | calendar fail-closed | `deterministic.xml` :: `test_calendar_coverage` | |
-| B1.3a | fatal host exit + supervisor policy | `deterministic.xml` :: `test_fatal_fence`, `test_supervisor` | |
-| B1.3b | durable fatal fence | `deterministic.xml` :: `test_a_repaired_journal_still_refuses_to_trade` | |
-| B1.4 | real storage faults | `artifacts/gate_b1_storage/<stamp>/manifest.json` | |
-| B1.5 | this document, signed | — | |
-| B1.6 | out-of-band witness that committed events still exist | `deterministic.xml` :: `test_journal_witness`, `artifacts/gate_b1_storage/<stamp>/manifest.json` | |
+| B1.0 | reproducible environment | formal campaign manifest | |
+| B1.1 | single-writer process ownership | deterministic JUnit + process-lock tests | |
+| B1.2 | calendar fail-closed | deterministic JUnit :: calendar coverage | |
+| B1.3a | fatal host exit + supervisor policy | deterministic JUnit :: fatal fence + supervisor | |
+| B1.3b | durable fatal fence | deterministic JUnit :: repaired journal still refuses | |
+| B1.4 | real storage faults | storage manifest: disk-full + WAL corruption + fsync stall | |
+| B1.5 | independent exact-freeze review and this signed document | this document | |
+| B1.6 | out-of-band witness that committed events still exist | witness tests + WAL crossing evidence | |
 
-### B1.6 detail
+### B1.4 real-storage detail
 
-`commit()` returning success under `synchronous=FULL` does not mean the event
-is still there after a crash: WAL recovery discards frames whose checksums do
-not verify, leaving a database that is internally consistent and simply
-shorter. Measured on a real volume: **27 of 4,406 committed events gone, no
-error reported, engine started normally.**
+Injected exceptions are not sufficient evidence. Review the actual constrained
+filesystem campaign and record the observed results.
 
 | Field | Value |
 |---|---|
-| Witness covers | every broker write (`place_order`, `cancel_order`) |
-| Witness binds | `journal_id`, `seq`, event type, intent id, order ref, payload digest |
-| Startup refuses on | missing seq, digest mismatch, wrong `journal_id`, `max_seq < witness.seq` |
-| Witness write failure before a broker write | must fence; must not send |
-| HALT tail-loss drill | does broker-write-only coverage still satisfy invariant 22? |
-
-The HALT drill is the open question, not a formality. `HALT` and
-`HALT_CAUSE_ADDED` are not broker writes, so a broker-write-only witness does
-not pin them; if a WAL rollback can drop a HALT while leaving `max_seq` above
-the witness, invariant 22 breaks and the witness has to cover safety-critical
-events too. Record the answer here rather than assuming it.
-
-### B1.4 detail
-
-Injected faults prove the handler is correct; only the operating system
-actually refusing proves the handler is reached.
-
-| Field | Value |
-|---|---|
-| Journal volume (device, size) | |
-| Fence volume (device) | must differ from the journal volume |
-| `disk_full` exit code | expect `10` (`EXIT_FATAL_SHUTDOWN`) |
+| Journal volume (device / size) | |
+| Fence volume (device) | must differ from journal volume |
+| `disk_full` exit code | expect `10` |
 | `disk_full` fence raised | |
-| `wal_corruption` exit code | expect `10` or `12` |
-| Broker writes after the fault | must be `0` |
-| Fault → fence latency | |
+| `wal_corruption` rollback observed | |
+| Forced witness crossing exit code | expect `15` |
+| Forced witness crossing fence raised | |
+| `fsync_stall` mechanism | expect real `dm-delay` |
+| Healthy delay / observed broker writes | |
+| Stalling delay / journal timeout | |
+| `fsync_stall` exit code | expect `10` |
+| Broker writes after fsync fault | must be `0` |
+| Storage manifest `passed` | must be `true` |
+| Storage manifest `inconclusive` | must be `[]` |
 
-## 3. Campaign
+### B1.6 witness detail
 
-| Stage | Result | Artifact sha256 |
+SQLite WAL recovery can discard a committed tail after later WAL damage while
+leaving an internally valid, shorter database. The reviewer must verify that
+the out-of-band witness pins both broker-write boundaries and safety-critical
+HALT events.
+
+| Field | Value |
+|---|---|
+| Witness covers | broker writes and safety-critical HALT events |
+| Witness binds | `journal_id`, `seq`, event type, intent id, order ref, payload digest |
+| Startup refuses on | missing seq, digest mismatch, wrong journal id, rollback below witness |
+| Witness write failure before broker write | must fence and not send |
+| Forced WAL crossing | must refuse startup / exit 15 and raise fence |
+| HALT tail-loss protection | reviewer verdict |
+
+## 3. Formal campaign
+
+| Stage | Result | Artifact sha256 / reference |
 |---|---|---|
 | deterministic suite | | |
 | generated tests, default profile | | |
 | generated tests, gate profile (≥1,500 examples each) | | |
+| Hypothesis version | | — |
 | Hypothesis seed | | — |
 | subprocess force-kill windows | | |
-| journal auditor over campaign journals | | |
-
-The seed is only meaningful alongside the exact Hypothesis version — seeds do
-not reproduce across versions, which is why B1.0 is a blocker and not a
-nice-to-have.
+| deterministic lifecycle soak | | |
+| journal auditor over soak journals | | |
+| real disk-full | | |
+| real WAL corruption | | |
+| real dm-delay fsync stall | | |
 
 ## 4. Invariants
 
-Each row is signed independently. `COMPLETE` in
-`docs/INVARIANT_COVERAGE.md` means P/R/A entries exist; it is not a verdict.
+Each row is reviewed independently. `P`, `R`, and `A` mean property test,
+runtime assertion/control, and auditor/evidence respectively. Presence of all
+three is not itself a PASS; the reviewer checks that the evidence actually
+proves the invariant stated.
 
 | # | Invariant | P | R | A | Reviewer verdict |
 |---|---|---|---|---|---|
@@ -128,28 +134,25 @@ Each row is signed independently. `COMPLETE` in
 | 21 | startup must-reject self-test | | | | |
 | 22 | restart cannot clear HALT | | | | |
 
-## 5. Scope, stated as limits
+## 5. Scope limits
 
-Sign-off is a claim about what was tested. Record what was not, so nobody
-later mistakes silence for coverage.
+A B1 PASS is deliberately narrower than “safe to trade”. Record these limits
+rather than allowing later readers to infer coverage that was never tested.
 
-- The trading IB adapter is **unverified**. Every behavioural claim in
-  `ib_adapter.py` comes from IB documentation, not measurement. Gate B2 exists
-  to replace those assumptions, and B1 evidence is entirely `FakeBroker`.
-- Invariants 10, 14 and 18 have real-broker components that remain B2:
-  restart reconciliation against IB, the observed `permId` matrix, and real
-  adapter callback handlers.
-- Ownership (invariant 0) is mutual exclusion between processes on one host
-  sharing one filesystem. It is not a distributed lock, and ADR-001 assumes a
-  single host. Network filesystems implement neither lock backend reliably.
-- The cross-stream recorder diagnostics are observations, not a gate: the
-  bar/tick transform is uncalibrated.
-- Known and accepted: a paper account identifier appears in git history at
-  commit `15e8000`. History was deliberately not rewritten — the exposure
-  cannot be recalled from a public repository, and a rewrite would change
-  every commit sha a sign-off binds to.
+- The trading IB adapter remains unverified; B1 uses `FakeBroker` for broker
+  behaviour. Gate B2 exists to replace documentation assumptions with observed
+  IB protocol behaviour.
+- Invariants 10, 14 and 18 retain real-broker components for B2: restart
+  reconciliation against IB, observed `permId` behaviour, and real callback
+  handlers.
+- Invariant 0 is one-host/process ownership on a shared local filesystem, not a
+  distributed lock. Network filesystems are outside the frozen architecture.
+- Recorder cross-stream diagnostics are measurements, not execution safety
+  authorization.
+- Known historical repository exposures or other accepted limitations must be
+  stated explicitly in reviewer notes.
 
-## 6. Decision
+## 6. Independent decision
 
 | Field | Value |
 |---|---|
@@ -158,18 +161,30 @@ later mistakes silence for coverage.
 | Decision | `PASS` / `FAIL` |
 | Notes | |
 
-A `PASS` here permits Gate B2 to begin. **It does not permit an order.** B2's
-first phase is read-only: connect, server clock, positions, open orders,
-executions, dynamic stable snapshot, 1100/1101/1102, Gateway restart, late
-callbacks — producing `DOCUMENTED_VS_OBSERVED.md`. Only after that does a
-one-share paper target become defensible.
+The reviewer must be independent of the implementation being signed. A `PASS`
+permits **B2 read-only protocol validation to begin**; it does not permit an
+order.
 
-After signing, set `gate_status.gate_b1` and `gate_status.signed_off_commit`
-in `STATE.json` and regenerate:
+## 7. Attestation procedure after a PASS
+
+Start from the exact tested freeze commit at `HEAD`. The completed sign-off
+file may be untracked/modified, but no other file may have changed. Run:
 
 ```bash
-python -m ib_execution.provenance
+python scripts/finalize_gate_b1.py --freeze-commit <full-40-char-freeze-sha>
 ```
 
-`tests/test_provenance.py` asserts that a `PASS` names a commit and that the
-commit is HEAD, so the claim cannot outlive the tree it was made about.
+The command validates the reviewer, timestamp, `PASS` decision and exact SHA,
+then writes `STATE.json` with `gate_b1=PASS` and `signed_off_commit=<freeze>`.
+Commit **only**:
+
+```text
+STATE.json
+docs/GATE_B1_SIGNOFF_<first-12-chars-of-freeze-sha>.md
+```
+
+That new commit is the attestation commit. CI then verifies that the signed
+freeze is its ancestor and that the diff from freeze to attestation contains
+only those two metadata files. If anything under source, tests, scripts,
+configuration or dependencies changed, PASS is rejected and the whole campaign
+must be rerun on a new freeze.

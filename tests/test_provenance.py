@@ -188,17 +188,74 @@ def test_docs_agree_with_the_registry_on_how_many_blockers_there_are():
         )
 
 
-def test_gate_b1_is_not_claimed_passed_without_a_signed_off_commit():
-    """The one status claim that must never drift optimistically."""
+def _signoff_table_value(text: str, field: str) -> str:
+    match = re.search(
+        rf"^\|\s*{re.escape(field)}\s*\|\s*(.*?)\s*\|\s*$",
+        text,
+        re.MULTILINE,
+    )
+    return match.group(1).strip() if match else ""
+
+
+def test_gate_b1_is_not_claimed_passed_without_a_valid_freeze_attestation():
+    """PASS binds tested code, while a later attestation commit may record the proof.
+
+    A git commit cannot contain its own hash. Therefore requiring the signed-off
+    freeze SHA to equal the commit that *contains* the signature is impossible:
+    writing STATE/sign-off changes HEAD. The safe model is two identities:
+
+    * signed_off_commit = exact commit exercised by the frozen campaign;
+    * current HEAD = an attestation descendant that may change only STATE.json
+      and that frozen commit's sign-off document.
+
+    Any behaviour/config/dependency/test edit between them invalidates PASS.
+    """
     state = provenance.load_state(ROOT)
     assert state is not None
-    gate = state["gate_status"]
-    if gate["gate_b1"] == "PASS":
-        assert gate["signed_off_commit"], "Gate B1 PASS requires an exact signed-off commit"
-        assert gate["signed_off_commit"] == provenance.commit_sha(ROOT), (
-            "Gate B1 was signed off against a different commit; any code, config, "
-            "dependency or test change invalidates the sign-off"
-        )
+    status = state["gate_status"]
+    if status["gate_b1"] != "PASS":
+        return
+
+    freeze = status.get("signed_off_commit")
+    assert freeze, "Gate B1 PASS requires an exact frozen signed_off_commit"
+    assert all(r.status == gate.READY_FOR_FREEZE for r in gate.requirements()), (
+        "Gate B1 PASS requires every registry requirement READY_FOR_FREEZE"
+    )
+
+    ancestor = subprocess.run(
+        ["git", "-C", str(ROOT), "merge-base", "--is-ancestor", freeze, "HEAD"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert ancestor.returncode == 0, f"signed_off_commit {freeze} is not an ancestor of HEAD"
+
+    signoff_rel = f"docs/GATE_B1_SIGNOFF_{freeze[:12]}.md"
+    allowed = {"STATE.json", signoff_rel}
+    diff = subprocess.run(
+        ["git", "-C", str(ROOT), "diff", "--name-only", f"{freeze}..HEAD"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+    )
+    changed = {line for line in diff.stdout.splitlines() if line}
+    assert changed <= allowed, (
+        "Gate B1 attestation changed files outside the allowed metadata-only set: "
+        f"{sorted(changed - allowed)}"
+    )
+    assert signoff_rel in changed, "PASS requires a committed exact-freeze sign-off document"
+
+    signoff = ROOT / signoff_rel
+    assert signoff.exists(), f"missing sign-off document {signoff_rel}"
+    text = signoff.read_text(encoding="utf-8")
+    assert _signoff_table_value(text, "`commit_sha`") == freeze
+    reviewer = _signoff_table_value(text, "Reviewer")
+    reviewed_at = _signoff_table_value(text, "Reviewed at (UTC)")
+    decision = _signoff_table_value(text, "Decision").strip("`")
+    assert reviewer and reviewer not in {"—", "TBD"}, "PASS requires a named reviewer"
+    assert reviewed_at and reviewed_at not in {"—", "TBD"}, "PASS requires review time"
+    assert decision == "PASS", "STATE cannot claim PASS unless the sign-off decision is PASS"
 
 
 # Only *strong affirmative* claim forms. Trying to parse negation out of free

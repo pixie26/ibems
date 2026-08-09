@@ -1,13 +1,9 @@
 name: ci
 
-# Deliberately excluded from CI: the formal Hypothesis campaign, the real
-# storage-fault drills, and anything that touches an IB Gateway.
-#
-# The formal campaign is Gate B1 sign-off evidence and must bind to an exact
-# frozen commit in a controlled environment -- a hosted runner cannot make
-# that claim. A real Gateway must never be reachable from a public runner at
-# all. CI's job is to stop regressions between those campaigns, not to
-# produce gate evidence.
+# Fast regression CI. The formal freeze campaign and real storage-fault
+# artifacts live in b1-freeze-campaign.yml; this workflow checks ordinary
+# deterministic/property regressions and repository provenance on every PR/main
+# update. It never connects to an IB Gateway.
 
 on:
   pull_request:
@@ -19,6 +15,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Gate B1 PASS validation must prove that signed_off_commit is an
+          # ancestor of the metadata-only attestation commit and inspect their
+          # diff. A depth-1 checkout cannot prove that relation.
+          fetch-depth: 0
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
