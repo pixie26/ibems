@@ -1,0 +1,165 @@
+name: b1-freeze-campaign
+
+# Formal Gate B1 evidence. A successful run is evidence for exactly the
+# checked-out commit and must not be reused after any behaviour/config/dependency
+# change. B1.5 independent review remains a separate human decision.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  freeze-campaign:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out exact freeze candidate
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Record exact commit
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git rev-parse HEAD
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          test -z "$(git status --porcelain)"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install pinned Python environment
+        run: uv sync --locked --extra dev --extra ib
+
+      - name: Verify environment and STATE
+        shell: bash
+        run: |
+          set -euxo pipefail
+          .venv/bin/python --version
+          .venv/bin/python -m ib_execution.provenance --check
+          uv lock --check
+
+      - name: Run formal B1 pytest and Hypothesis campaign
+        shell: bash
+        run: |
+          set -euxo pipefail
+          .venv/bin/python scripts/run_gate_b1.py --seed 20260809
+
+      - name: Preserve subprocess crash-window evidence
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p artifacts/gate_b1_extra
+          .venv/bin/python -m pytest -q tests/test_process_crash.py \
+            --junitxml=artifacts/gate_b1_extra/process_crash.xml \
+            2>&1 | tee artifacts/gate_b1_extra/process_crash.txt
+
+      - name: Run lifecycle soak with journal auditor
+        shell: bash
+        run: |
+          set -euxo pipefail
+          .venv/bin/python scripts/deterministic_soak.py --seeds 20 --actions 50 \
+            2>&1 | tee artifacts/gate_b1_extra/deterministic_soak_auditor.txt
+
+      - name: Provision real block-layer fault tooling
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if ! command -v dmsetup >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y dmsetup
+          fi
+          if ! command -v mkfs.ext4 >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y e2fsprogs
+          fi
+          sudo modprobe dm_delay || sudo modprobe dm-delay
+          sudo mkdir -p /dev/mapper
+          sudo dmsetup mknodes
+          test -e /dev/mapper/control
+          sudo dmsetup targets | tee artifacts/gate_b1_extra/dm-targets.txt
+          grep -Eq '^delay[[:space:]]' artifacts/gate_b1_extra/dm-targets.txt
+
+      - name: Create constrained separate journal and fence filesystems
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo mkdir -p /mnt/ibems-freeze-journal /mnt/ibems-freeze-fence
+          sudo mount -t tmpfs -o size=256m ibems-freeze-journal /mnt/ibems-freeze-journal
+          sudo mount -t tmpfs -o size=64m ibems-freeze-fence /mnt/ibems-freeze-fence
+          sudo "$PWD/.venv/bin/python" - <<'PY' | tee artifacts/gate_b1_extra/storage_domains.txt
+          import os, shutil
+          from pathlib import Path
+          journal = Path('/mnt/ibems-freeze-journal')
+          fence = Path('/mnt/ibems-freeze-fence')
+          print('journal_st_dev=', os.stat(journal).st_dev)
+          print('journal_free=', shutil.disk_usage(journal).free)
+          print('fence_st_dev=', os.stat(fence).st_dev)
+          print('fence_free=', shutil.disk_usage(fence).free)
+          assert os.stat(journal).st_dev != os.stat(fence).st_dev
+          assert shutil.disk_usage(journal).free <= 2 * 1024**3
+          PY
+
+      - name: Run all real B1.4 storage faults
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo -E "$PWD/.venv/bin/python" scripts/run_storage_fault_drill.py \
+            --journal-volume /mnt/ibems-freeze-journal \
+            --fence-dir /mnt/ibems-freeze-fence \
+            --drill all \
+            --healthy-delay-ms 200 \
+            --fsync-delay 45
+
+      - name: Show evidence manifests
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          find artifacts/gate_b1 artifacts/gate_b1_storage -name manifest.json \
+            -print -exec cat {} \;
+
+      - name: Hash supplemental evidence
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          find artifacts/gate_b1_extra -type f -print0 2>/dev/null \
+            | sort -z \
+            | xargs -0 -r sha256sum \
+            | tee artifacts/gate_b1_extra/SHA256SUMS
+
+      - name: Upload complete Gate B1 freeze evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-b1-freeze-${{ github.sha }}
+          path: |
+            artifacts/gate_b1/**
+            artifacts/gate_b1_storage/**
+            artifacts/gate_b1_extra/**
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Safe storage cleanup
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          if command -v dmsetup >/dev/null 2>&1; then
+            sudo dmsetup ls --noheadings 2>/dev/null \
+              | awk '{print $1}' \
+              | grep '^ibems-drill-' \
+              | while read -r name; do sudo dmsetup remove "$name" || true; done
+          fi
+          sudo umount -l /mnt/ibems-freeze-journal 2>/dev/null || true
+          sudo umount -l /mnt/ibems-freeze-fence 2>/dev/null || true
