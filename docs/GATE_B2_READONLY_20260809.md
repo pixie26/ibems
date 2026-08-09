@@ -1,5 +1,7 @@
 # Gate B2 第一轮真实 IB Gateway 只读证据（2026-08-09）
 
+> 当前状态入口：[`GATE_B2_STATUS_20260810_ZH.md`](GATE_B2_STATUS_20260810_ZH.md)。本文保留各轮实验过程、直接观测和证据细节；截至 2026-08-10，Gate B2 仍未 PASS。
+
 ## 1. 范围与安全边界
 
 - Gateway：IB Gateway paper account，本机 `127.0.0.1:4002`。
@@ -75,32 +77,139 @@ asyncio.windows_events._poll
 
 - 所有同步 IB 请求使用 `IB.RequestTimeout=10s`（可通过 `--request-timeout` 下调或显式调整，禁止 0）；
 - clock 请求之间至少间隔 1.1 秒；
-- `tests/test_preflight.py` 验证 pacing，当前 10 tests PASS；
+- `tests/test_preflight.py` 验证 pacing 与请求超时的 UNKNOWN 表示，当前 12 tests PASS；
 - `git diff --check` PASS。
 
 这项观测说明 B2 不能只测试 broker facts，也必须测试“请求没有 completion”时客户端是否有界失败。
 
-## 5. 没有被本轮证明的事项
+## 5. 2026-08-10 休市期补测
+
+### 5.1 Account summary 与 read-only order-information 边界
+
+扩展 preflight 后，真实 Gateway 的 `reqAccountSummary` 在 `0.141s` 内收到 completion，返回 71 项；报告只保存数量与 canonical hash，不保存账户名或余额。
+
+随后尝试 `reqCompletedOrders(apiOnly=False)` 时出现了新的重要边界：
+
+- 第一次请求在 10 秒内没有收到 `completedOrdersEnd`，客户端按硬 deadline 抛出 `TimeoutError`；这不能解释为“零条 completed orders”，只能记为 `UNKNOWN`；
+- 再次开始复核时，Gateway 弹出要求更改 Read-Only API 设置的提示；操作者没有关闭只读设置，测试立即终止；
+- 脚本没有调用 `placeOrder` 或 `cancelOrder`，事后复核也仍为零持仓、零挂单、零成交；
+- IB 官方旧版 TWS API setup 文档明确说明：启用 Read-Only 时 API 无法取得 order information。这与本次直接观测一致。因此 `reqCompletedOrders` 已从默认零写入 preflight 路径移除，并明确记录为 `BLOCKED_BY_GATEWAY_READ_ONLY_POLICY`，不能为了补齐读取覆盖而关闭保护。
+
+操作者随后使用隔离的最小复现命令再次调用同一个请求，Gateway 稳定复现提示：
+
+> 某API客户端正在尝试发送需要API写入权限的请求。要允许此操作和后续类似操作，请在全局配置的API/设置下取消勾选“只读API”复选框。
+
+复现会话使用 `clientId=939`、`readonly=True`、`StartupFetchNONE`，只调用 `reqCompletedOrders(apiOnly=False)`；复现代码不包含 `placeOrder` 或 `cancelOrder`。因此该截图证明的是 **Gateway 将此请求分类并拦截为需要 API 写入权限**，不是“API 已提交订单”的证据。严格只读 B2 不接受取消 Read-Only；该请求保持 blocked。
+
+提示截图及结构化说明：
+
+- `artifacts/ib_preflight/20260810_readonly_completed_orders_prompt/gateway_readonly_prompt.png`
+- 截图 SHA-256：`63c4ecd568d97563949cdc43011020b273eb243f9daa9f9bc58ec3f3ceb98ddc`
+- `artifacts/ib_preflight/20260810_readonly_completed_orders_prompt/observation.json`
+
+安全复核报告：
+
+- `artifacts/ib_preflight/20260810_b2_post_prompt_safety_check/report.json`
+- SHA-256：`7b8d0e5fe1491feed70a7b1b7578eea8da4f597b05ed021e07132e48c576cede`
+- account summary：71 项；三轮 positions/open orders/executions 均为 `0 / 0 / 0`，整体 hash 一致；
+- `passed=false` 仅因为休市期三路行情计数为 0，不是账户事实或连接检查失败。
+
+### 5.2 两个 client 与只读 client 异常死亡
+
+新增的故障探针不包含下单、撤单或 completed-orders 请求。直接观测结果：
+
+- `clientId=934` 与 `935` 同时连接成功，均为 `readonly=True`；
+- 两个 client 读取的 positions/open orders/executions 均为 `0 / 0 / 0`，snapshot hash 相同；
+- 第一个 `clientId=937` 保持连接时，第二个同 ID 连接被拒绝并返回错误 326；没有同时存活的两个同 ID 会话；
+- `clientId=936` 的子进程在已连接后被 Windows 强制终止，没有执行正常 `disconnect`；
+- 第一次重连尝试即成功，约 `0.110s` 后同一 `clientId=936` 可重新连接；恢复快照仍为 `0 / 0 / 0`。
+
+证据：
+
+- `artifacts/ib_preflight/20260810_b2_client_fault_v2/report.json`
+- SHA-256：`a20f51f843330ef67a2f8ba955059905980ee2a19a94e0338824bd26e59c61ac`
+
+这证明 API client 进程死亡后 Gateway 释放了该 client ID，且静态零事实可重新读取；该轮本身不证明 Gateway restart、外网断线、动态订单 reconciliation 或 cross-client order visibility，其他故障形态见后续独立轮次。
+
+### 5.3 Gateway 正常退出、Task Manager End task 与 `TerminateProcess`
+
+在仍为零订单且 Read-Only API 保持开启的条件下，分别完成了三个独立场景：
+
+1. Gateway 正常退出后重新启动；
+2. Windows Task Manager `End task` 后重新启动；
+3. 对精确的 `ibgateway.exe` PID 执行 `Stop-Process -Force`，即 Windows `TerminateProcess` 级终止，然后重新启动。
+
+三轮均直接观察到 API socket 断开，随后使用原 client ID 重新连接，并在连接后重新请求 positions、all-open-orders、executions。结果：
+
+- 正常退出：`clientId=938`；重启前后均为 `0 / 0 / 0`，snapshot hash 相同；
+- Task Manager End task：`clientId=940`；重启前后均为 `0 / 0 / 0`，snapshot hash 相同；由于 Gateway 表现出保存/退出过程，这一轮不声称是无清理窗口的 hard kill；
+- `TerminateProcess`：`clientId=941`；重启前后均为 `0 / 0 / 0`，snapshot hash 相同；
+- 三轮重启过程中都出现错误 10141，表示 paper API 在 disclaimer 被接受前尚未 ready；
+- 正常退出轮前两次连接各 10 秒超时，第三次完成连接和 snapshot；
+- Task Manager End task 轮第一次恢复尝试 10 秒超时，第二次在约 `0.156s` 内同时完成连接和 snapshot；
+- `TerminateProcess` 轮前两次恢复尝试各 10 秒超时，第三次在约 `0.140s` 内同时完成连接和 snapshot；
+- 直接观测证明 API handshake、paper disclaimer 与 broker-state request completion 是不同阶段。恢复判定因此被加固为：**同一 client ID 连接成功且完整 broker snapshot 成功**，仅 socket connected 不足以恢复为 ready/synced。
+
+正式成功证据：
+
+- 正常退出：`artifacts/ib_preflight/20260810_b2_gateway_restart_v3/report.json`
+- SHA-256：`90fc489e55d23e69f7295827950945e85c3f25b52d8d2c6607600afefc633329`
+- Task Manager End task：`artifacts/ib_preflight/20260810_b2_gateway_hard_kill_v2/report.json`
+- SHA-256：`b954367be4f976acf3ffca02eb7e4e71bb82eac1dadb609b5a64128ea5b4c441`
+- `TerminateProcess`：`artifacts/ib_preflight/20260810_b2_gateway_terminateprocess/report.json`
+- SHA-256：`2097c4fb5461b15a523879ee4cc7b7765e204db4d38d921a9a8b0e4c457a52d8`
+
+本地 Gateway 正常退出、End task 和 `TerminateProcess` 产生的是 socket EOF / `ConnectionError`，没有观察到 1100/1101/1102；这与下面“Gateway 进程保持运行、仅中断其外网连接”的故障形态不同。
+
+### 5.4 Gateway 进程存活时的受控外网断线 / 恢复
+
+2026-08-10 使用 Windows Defender Firewall 创建唯一、临时、仅针对 `D:\tws\ibgateway\ibgateway.exe` 的 outbound block；没有关闭网卡、没有阻断其他进程、没有关闭 Gateway，也没有改动 Read-Only API。规则在 `2026-08-09T17:01:59.4564022Z` 创建，45 秒后清理；operator console 显示 `RuleStillPresent=False`，随后本机再次确认该规则不存在。Gateway 全程保持原 PID `33988`。
+
+只读观测器 `clientId=942` 的直接结果：
+
+- 故障前完成 broker server time 与 positions / all-open-orders / executions 快照，计数为 `0 / 0 / 0`；
+- `17:02:02Z` 先收到 market-data farm 断开 2103，`17:02:08Z` 收到真实 1100；
+- 本地 API socket 在外网故障期间保持连接；
+- firewall 清理后，先收到 farm 恢复，`17:03:35Z` 收到 1102（连接恢复、数据保持）；本轮没有收到 1101；
+- 1102 后重新请求 broker server time 成功，并重新完成 positions / all-open-orders / executions 快照；计数仍为 `0 / 0 / 0`，前后 snapshot hash 相同；
+- `broker_write_calls=[]`；没有订单、撤单或 completed-orders 请求。
+
+判定：**此项 PASS。** 这直接验证了该 paper Gateway build 在“进程存活、外网短暂中断”场景下的 1100 → 1102 路径，以及恢复后只读空状态 reconciliation completion。它不证明 1101 路径，不证明持仓/挂单/成交非空时的动态 reconciliation，也不证明 late/duplicate/out-of-order order callback。
+
+证据：
+
+- `artifacts/ib_preflight/20260810_b2_gateway_network_fault_v2/report.json`
+- report SHA-256：`f8c88498a74402d59a49f80a0cdf9b61903a8d361b80b7045457f467f30c8bc2`
+- Gateway reconnect banner screenshot SHA-256：`6f470c8f80ee17492738b1270e4d86a016031ee366b52d3b2a2ece4ddac8a5a6`
+- Gateway connection-status screenshot SHA-256：`2b25e9447cda566d75f3effa77530489e963e0c76cb391fe49bed4db7fd7b8ff`
+- operator console transcript 明确标注为用户提供内容的逐字转录，不冒充 probe 自动输出。
+- `SHA256SUMS` 同时固定 report、截图、转录以及本轮实际执行的 Python / PowerShell 脚本副本。
+
+## 6. 没有被本轮证明的事项
 
 - 休市零 tick 不证明 RTH stream 正常或异常；必须在 RTH 重跑 90 秒或更长采样。
 - 零持仓、零挂单、零成交时的 hash 稳定，不证明动态 broker snapshot 是原子的，也不证明双快照屏障足以恢复 `SYNCED`。
-- 没有验证 Gateway restart、断线重连、1100/1101/1102、late/duplicate/out-of-order callback。
+- Gateway 正常退出、Task Manager End task、`TerminateProcess` 及 Gateway 保持运行时的外网断线已经验证；外网断线轮直接观察到 1100 → 1102，但尚未观察到 1101，也未验证 late/duplicate/out-of-order order callback。
 - 没有验证 `orderId / permId / clientId / orderRef`。
-- 没有发 paper order；B1 PASS 仍不构成订单授权。
+- 没有发 paper order；Read-Only 权限提示也不构成订单尝试或订单授权；B1 PASS 仍不构成订单授权。
 
-## 6. 仓库状态说明
+## 7. 仓库状态说明
 
 本轮修改了 B2 preflight 行为与其测试，因此当前工作树不再等同于 B1 exact-freeze source tree。`docs/GATE_B1_SIGNOFF_117188cea539.md` 仍是历史冻结证据，但不能自动证明这些新改动。进入任何 paper-order 测试前，必须把 B2 变更纳入新的可复查 tree 并重新满足相应的回归 / attestation 要求。
 
 Windows 上还观察到一个独立的 provenance 表示问题：`uv.lock` Git 内容未变，但 checkout 的 CRLF 原始字节 SHA-256 为 `4050...`；LF 归一化后为 STATE 记录的 `615629...`。当前 provenance 对 worktree 原始字节取 hash，因此 Linux 生成的 STATE 在 Windows clean checkout 也会显示 stale。这个问题不改变本轮 Gateway 观测，但必须在下一次正式 freeze 前修复，不能通过手改 STATE 掩盖。
 
-## 7. 结论与下一步
+2026-08-10 在当前 Windows checkout 启动完整 `pytest -q`；外层 120 秒限时前已经出现失败。随后以 `pytest -x -vv` 定位第一个失败：`tests/test_fatal_fence.py::test_a_fence_is_durable_and_readable` 在 64 passed、1 skipped 后，因 Windows 对目录执行 `os.open(path, O_RDONLY)` 返回 `PermissionError` 而失败。该结果与已接受但尚未完成真实故障验证的 Windows gap 一致；本轮不能宣称完整回归通过。B2 preflight 专项测试为 12 passed，三个新增 B2 脚本均通过 Python compile 检查和 broker-write-path 静态搜索。
+
+## 8. 结论与下一步
 
 本轮结论：**B2 已开始；只读 round 1 部分通过；Gate B2 未通过。**
 
 下一步按顺序执行：
 
-1. 在 SPY RTH 使用 event-driven 计数重跑至少 90 秒，要求 LIVE 且 BidAsk / AllLast / 5s bars 均非零；
-2. 在仍为零订单的前提下做受控 disconnect/reconnect 与 Gateway restart，保存前后 snapshot 和完整 error/callback 时间线；
-3. 基于真实 completion 行为设计动态 stable-snapshot barrier；
-4. 完成官方文档逐项复核后再讨论 1 股 paper order 子阶段。
+1. 周末、零订单、Read-Only 边界下有明显安全价值的主要 Gateway 实测已经完成；completed-orders 保持 `BLOCKED_BY_GATEWAY_READ_ONLY_POLICY`，不得为补测而关闭 Read-Only；
+2. 香港时间约 08:00 后运行一次明确标注为 `OVERNIGHT` 的 SPY 行情/Recorder 试验；overnight 结果不能替代 RTH；
+3. 香港时间约 21:30 后在 SPY RTH 使用 event-driven 计数重跑至少 90 秒，要求 LIVE 且 BidAsk / AllLast / 5s bars 均非零；
+4. 保留 1101 为尚未观察到的分支；不得由已观察到的 1102 推断 1101；
+5. 完成官方文档逐项复核，并把 B2 source、tests、docs 和 evidence 纳入新的可复查 freeze；
+6. 只读证据封存后，再由 owner 单独决定是否授权 1 股 SPY paper-order protocol；非空 dynamic snapshot、订单身份和订单 callback 均留在该子阶段。

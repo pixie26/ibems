@@ -109,3 +109,26 @@ def test_clock_skew_is_round_trip_compensated():
     assert ib.sleeps == [preflight.CLOCK_REQUEST_MIN_INTERVAL_SECONDS] * 5
     assert abs(statistics.median(samples)) < abs(naive)
     assert abs(statistics.median(samples)) < 0.05
+
+
+def test_identifier_coverage_does_not_expose_identifiers():
+    rows = [
+        {"order_id": 17, "perm_id": 9001, "client_id": 933, "order_ref": "owned"},
+        {"order_id": 0, "perm_id": 9002, "client_id": 0, "order_ref": ""},
+    ]
+    assert preflight._identifier_coverage(rows) == {
+        "order_id": 1,
+        "perm_id": 2,
+        "client_id": 1,
+        "order_ref": 1,
+    }
+
+
+def test_bounded_read_marks_missing_completion_unknown():
+    def times_out():
+        raise TimeoutError()
+
+    rows, status = preflight._bounded_read("completed_orders", times_out)
+    assert rows is None
+    assert status["completed"] is False
+    assert status["exception_type"] == "TimeoutError"

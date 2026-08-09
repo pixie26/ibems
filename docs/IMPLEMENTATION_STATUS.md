@@ -1,12 +1,22 @@
 # Implementation status — v0.1.5.dev0
 
-## 冻结标签
+> 本文主体是 Phase 0/B1 工程过程记录，部分冻结标签和 B2 blocker 描述保留了当时语境。当前权威的人类可读状态见 [`GATE_B2_STATUS_20260810_ZH.md`](GATE_B2_STATUS_20260810_ZH.md)：Gate B1 已在 commit `117188cea539...` PASS；Gate B2 为 `READ-ONLY IN PROGRESS`，尚未 PASS，也未授权订单。
+
+## 历史 Phase 0 冻结标签
 
 ```text
 Phase 0 reviewed baseline
 Specification frozen
 Gate B1 not passed
 DO NOT CONNECT THE TRADING ADAPTER TO IB PAPER OR LIVE
+```
+
+上面的代码块是该工程记录创建时的历史标签，不是当前 Gate 判定。当前标签为：
+
+```text
+Gate B1 PASS at exact-freeze commit 117188cea539...
+Gate B2 READ-ONLY IN PROGRESS; NOT PASS
+NO PAPER-ORDER OR LIVE-ORDER AUTHORIZATION
 ```
 
 ## 已实现并在 Python 3.12.13 验证
@@ -119,6 +129,7 @@ Recorder 可以在 Gate A/B1 之外独立上线，但只能保持 Read-Only API�
 ## Gate B2 blockers
 
 - `IbAdapter.place_order/cancel_order` 和完整 callback/error mapping；
-- 静态账户的三轮 stable-snapshot 候选读取已观察；仍缺成交/回调并发、Gateway restart、1101/1102 和 late callback 下的 barrier 实测；
-- orderRef/permId/clientId、1100/1101/1102、fee delay/correction/cancel race/Gateway restart 的 documented-vs-observed matrix；
-- 人工 1–5 股 paper target/cancel（只能在 B1 正式通过后）。
+- 空状态 stable-snapshot、Gateway 正常 restart、Task Manager End task、Windows `TerminateProcess`、API client 异常死亡及 Gateway 存活时的 `1100 -> 1102` 已直接观察；仍缺 1101、非空动态 broker facts、成交/回调并发和 late callback 下的 barrier 实测；
+- SPY overnight 和正式 RTH 三路行情尚未完成；休市零 tick 不形成结论；
+- orderRef/permId/clientId、fee delay/correction/cancel race 仍未产生真实订单证据；
+- 只读证据封存后，才由 owner 单独决定是否授权 1 股 SPY paper-order protocol；当前没有该授权。

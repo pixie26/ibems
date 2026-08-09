@@ -8,7 +8,7 @@
 
 > **安全状态：禁止把交易 Adapter 连接到 IB Paper 或 Live。**
 >
-> 当前版本是 `v0.1.5.dev0 / Phase 0 reviewed baseline / Specification frozen`，但 **Gate B1 尚未通过**。只读 Recorder 可以连接 Gateway 做预检；在实时行情权限和整日数据健康报告通过前，不得视为可上线。
+> **Gate B1 已在 exact-freeze commit `117188cea539...` 正式 PASS；这不证明真实 IB Gateway 行为，也不授权订单。Gate B2 当前为 `READ-ONLY IN PROGRESS`，尚未 PASS。** 当前工作树包含 B1 freeze 之后的 B2 只读测试改动，因此不能用 B1 attestation 为这些新改动背书。最新状态、证据边界和下一步见 [Gate B2 当前状态摘要](docs/GATE_B2_STATUS_20260810_ZH.md)。
 
 核心原则只有一句：**安全优先于可用性；无法证明状态可信时就停止。**
 
@@ -16,16 +16,19 @@
 
 | 模块 | 状态 |
 |---|---|
-| 无 IB 依赖的执行核心 | 已审查原型。包含子进程强杀窗口、journal/queue fail-closed 场景、跨进程所有权和 durable fence 的真实多进程测试。测试计数不在此手抄——运行 `pytest -q` 或看 gate manifest。 |
-| Hypothesis Gate campaign | **需要在 freeze commit 上重跑。** 此前 seed `2026080601` 的 1,500-example campaign 证明的是当时那棵树；A/B/C 三个 commit 已改变 source tree，且 Hypothesis 的 seed 不跨版本复现（依赖现已 `==` pin）。 |
-| 不变量 0 + 22 条安全不变量 | Property / Runtime / Auditor 三重入口已齐，新增不变量 0（单写者进程所有权）。**不变量 2 尚不完整**：B1.4 演练实测 WAL 损坏会静默丢弃已提交事件，见 B1.6。 |
-| 只读 SPY Recorder | 4002 Gateway 握手、server time、SPY 合约解析（`conId=756733`）和静态三轮账户快照读取成功。2026-08-07 实测：IB `10089` entitlement 阻塞已解除，`marketDataType=1`（Live）。同一次预检的 `AllLast=0` **不构成任何结论**——当时的采样口径已被证明无效（见下）。尚无合格 Full-RTH session。 |
-| 交易型 IB Adapter | 未实现、未连接。`placeOrder`、`cancelOrder`、完整 callback/error mapping 和动态 stable-snapshot protocol 均属于 Gate B2。 |
+| 无 IB 依赖的执行核心 | Gate B1 已在 exact-freeze commit `117188cea539...` 完成正式 campaign、真实存储故障证据和 owner acceptance，结论为 PASS。当前 B2 工作树已有 freeze 后改动，必须单独验证，不能沿用 B1 attestation。 |
+| Hypothesis Gate campaign | B1 exact-freeze campaign 已通过；详细计数与 artifact digest 见 `docs/GATE_B1_SIGNOFF_117188cea539.md`。任何 B2 行为代码改动都需要绑定新的 tree 重新验证。 |
+| 不变量 0 + 22 条安全不变量 | B1 exact-freeze 的 Property / Runtime / Auditor 与 B1.6 journal witness 已闭环。真实 IB reconciliation、unknown broker facts 和 callback 行为明确留给 B2，不属于 B1 PASS 的证明范围。 |
+| 只读 SPY Recorder / B2 preflight | Gateway 4002、server time、SPY `conId=756733`、account summary、空状态 broker snapshot、多 client、Gateway restart / `TerminateProcess` 与 `1100 -> 1102` 已有直接观测。尚无 overnight 或合格 RTH 三路行情证据；详见 B2 当前状态摘要。 |
+| 交易型 IB Adapter | 未授权连接下单路径。`placeOrder`、`cancelOrder`、订单身份、完整 callback/error mapping 和非空动态 reconciliation 尚未在真实 Gateway 验证。 |
 | Emergency flatten broker path | 未实现。现有代码只覆盖计划生成与人工确认边界。 |
 
 详细状态与可复查证据：
 
 - **[`STATE.json`](STATE.json) —— 唯一权威的机器可读状态**（gate 状态、source/config/lock 三个树 hash）
+- [Gate B2 当前状态摘要](docs/GATE_B2_STATUS_20260810_ZH.md)（当前真实 Gateway 只读测试状态、证据索引和下一步）
+- [Gate B2 只读详细证据](docs/GATE_B2_READONLY_20260809.md)
+- [IB documented-vs-observed 矩阵](docs/DOCUMENTED_VS_OBSERVED.md)
 - [实施状态](docs/IMPLEMENTATION_STATUS.md)
 - [22 条不变量覆盖矩阵](docs/INVARIANT_COVERAGE.md)
 - [审查与执行结论](docs/REVIEW_AND_EXECUTION_20260806_ZH.md)
@@ -204,9 +207,9 @@ python -m ib_execution.execution_host --journal D:\ibems-data\journal.db \
 ## 下一步
 
 1. **策略 Gate A 独立推进。** 在策略仓库完成真实成本、数据质量和统计不确定性判断；若结论为 `NO_GO` 或 `INSUFFICIENT_EVIDENCE`，且没有独立第二消费者，就停止投资交易型 IB Adapter。
-2. **在 RTH 内复测预检并启动 Recorder。** entitlement 已确认解除；预检的 tick 计数与时钟偏差口径已修好。下一步是在正常交易时段做 90–120 秒预检，取得**第一份关于 `AllLast` 的有效观测**，三路 sample 与时钟偏差中位数都满足后，从下一个完整 RTH 开始采集。第一天只做数据验收，不跑策略；cross-stream diagnostics 先标定 bar/tick 转换关系，标定完成前不作为硬 Gate。
-3. **完成 Gate B1 的 8 项 blocker。** B1.0–B1.3b 已就位。B1.4 已在 96MB loop ext4 上实跑：`disk_full` PASS，`wal_corruption` **FAIL** —— 由此新增 **B1.6**（WAL 恢复会静默丢弃已提交事件，需要带外单调见证者，未实现）。B1.5 仍需评审签字。
-4. **冻结后再跑正式 campaign。** 所有代码、配置、依赖和测试改动必须先全部落地，然后取 freeze commit，再在那个 commit 上跑 deterministic suite、formal Hypothesis campaign、真实存储故障演练和 journal auditor。**campaign 是最后的证明，不是开发过程中的阶段性测试。** 期间发现 bug 就修、重取 freeze commit、整个 campaign 重跑——不 cherry-pick 一个小修然后沿用旧证明。
-5. **B1 签字后才进入 Gate B2，且第一阶段仍然不下单。** 先做只连接、只读账户事实、动态 stable-snapshot protocol 和 `DOCUMENTED_VS_OBSERVED.md`，再做人工 1 股 paper target/cancel；MOC、多策略和自动 watchdog takeover 继续推迟。
+2. **完成 Gate B2 只读行情证据。** 香港时间约 08:00 后做一次明确标注为 overnight 的 SPY 行情/Recorder；约 21:30 后做至少 90 秒的正式 RTH BidAsk / AllLast / 5s bars 验证。overnight 不能替代 RTH。
+3. **完成 documented-vs-observed 复核与 B2 freeze。** 周末空状态、client/Gateway 故障和 `1100 -> 1102` 已有直接观测；仍需官方文档逐项复核、Windows/provenance gap 处置，并把 B2 source、tests、docs 和 evidence 绑定到新的可复查 tree。
+4. **只读阶段不下单。** `completed orders` 被 Gateway Read-Only policy 阻断；不关闭保护追测。非空 reconciliation、订单身份和 callback 保留到另行授权的 paper-order 子阶段。
+5. **paper order 必须重新授权。** 只读证据封存后，owner 才单独决定是否运行 1 股 SPY paper-order protocol；B1 PASS 或 B2 只读结果都不自动构成该授权。MOC、多策略、live capital 和自动 watchdog takeover 继续推迟。
 
 当前第二个独立使用者仍为 `NONE_CONFIRMED`。QQQ 与 SPY 属于同一日内动量命题，不能单独证明继续建设交易 Adapter 的经济必要性。**平台越成熟，越不能反过来成为「所以策略应该交易」的理由。**

@@ -110,7 +110,40 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _snapshot(ib: IB, index: int) -> dict[str, Any]:
+def _trade_row(trade) -> dict[str, Any]:
+    """Canonical broker order fact used only as input to a local digest."""
+    return {
+        "account": trade.order.account,
+        "con_id": trade.contract.conId,
+        "order_id": trade.order.orderId,
+        "perm_id": trade.order.permId,
+        "client_id": trade.order.clientId,
+        "order_ref": trade.order.orderRef,
+        "parent_id": trade.order.parentId,
+        "action": trade.order.action,
+        "quantity": str(trade.order.totalQuantity),
+        "order_type": trade.order.orderType,
+        "limit_price": trade.order.lmtPrice,
+        "aux_price": trade.order.auxPrice,
+        "status": trade.orderStatus.status,
+        "filled": str(trade.orderStatus.filled),
+        "remaining": str(trade.orderStatus.remaining),
+    }
+
+
+def _identifier_coverage(rows: list[dict[str, Any]]) -> dict[str, int]:
+    """Report whether broker identifiers exist without persisting the IDs."""
+    return {
+        name: sum(value not in (None, "", 0) for value in (row[name] for row in rows))
+        for name in ("order_id", "perm_id", "client_id", "order_ref")
+    }
+
+
+def _snapshot(
+    ib: IB,
+    index: int,
+    account_summary: list[Any] | None,
+) -> dict[str, Any]:
     started = datetime.now(timezone.utc)
     positions = sorted(
         [
@@ -125,24 +158,7 @@ def _snapshot(ib: IB, index: int) -> dict[str, Any]:
         key=lambda row: (row["account"], row["con_id"]),
     )
     orders = sorted(
-        [
-            {
-                "account": trade.order.account,
-                "con_id": trade.contract.conId,
-                "order_id": trade.order.orderId,
-                "perm_id": trade.order.permId,
-                "client_id": trade.order.clientId,
-                "action": trade.order.action,
-                "quantity": str(trade.order.totalQuantity),
-                "order_type": trade.order.orderType,
-                "limit_price": trade.order.lmtPrice,
-                "aux_price": trade.order.auxPrice,
-                "status": trade.orderStatus.status,
-                "filled": str(trade.orderStatus.filled),
-                "remaining": str(trade.orderStatus.remaining),
-            }
-            for trade in ib.reqAllOpenOrders()
-        ],
+        [_trade_row(trade) for trade in ib.reqAllOpenOrders()],
         key=lambda row: (row["account"], row["perm_id"], row["order_id"]),
     )
     executions = sorted(
@@ -164,19 +180,42 @@ def _snapshot(ib: IB, index: int) -> dict[str, Any]:
         key=lambda row: row["exec_id"],
     )
     ended = datetime.now(timezone.utc)
+    account_values = sorted(
+        [
+            {
+                "account": value.account,
+                "tag": value.tag,
+                "value": value.value,
+                "currency": value.currency,
+            }
+            for value in account_summary
+        ],
+        key=lambda row: (row["account"], row["tag"], row["currency"]),
+    ) if account_summary is not None else None
     components = {
+        "account_summary": account_values,
         "positions": positions,
         "open_orders": orders,
         "executions": executions,
     }
+    complete = all(rows is not None for rows in components.values())
     return {
         "index": index,
         "started_utc": started.isoformat(),
         "ended_utc": ended.isoformat(),
         "duration_seconds": (ended - started).total_seconds(),
-        "counts": {name: len(rows) for name, rows in components.items()},
-        "hashes": {name: _digest(rows) for name, rows in components.items()},
-        "snapshot_hash": _digest(components),
+        "counts": {
+            name: len(rows) if rows is not None else None for name, rows in components.items()
+        },
+        "hashes": {
+            name: _digest(rows) if rows is not None else None
+            for name, rows in components.items()
+        },
+        "missing_components": [name for name, rows in components.items() if rows is None],
+        "identifier_coverage": {
+            "open_orders": _identifier_coverage(orders),
+        },
+        "snapshot_hash": _digest(components) if complete else None,
     }
 
 
@@ -184,6 +223,27 @@ def _fatal_entitlement_error(error: dict[str, Any]) -> bool:
     if error["code"] in ENTITLEMENT_CODES:
         return True
     return error["code"] == 420 and "market data permissions" in error["message"].casefold()
+
+
+def _bounded_read(name: str, request) -> tuple[list[Any] | None, dict[str, Any]]:
+    """Turn an absent IB completion callback into explicit UNKNOWN evidence."""
+    started = time.monotonic()
+    try:
+        rows = list(request())
+    except Exception as exc:
+        return None, {
+            "name": name,
+            "completed": False,
+            "duration_seconds": time.monotonic() - started,
+            "exception_type": type(exc).__name__,
+            "exception_message": str(exc),
+        }
+    return rows, {
+        "name": name,
+        "completed": True,
+        "duration_seconds": time.monotonic() - started,
+        "count": len(rows),
+    }
 
 
 def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
@@ -194,7 +254,7 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     ib.RequestTimeout = args.request_timeout
     errors: list[dict[str, Any]] = []
     report: dict[str, Any] = {
-        "schema_version": 2,
+        "schema_version": 3,
         "started_utc": datetime.now(timezone.utc).isoformat(),
         "host": args.host,
         "port": args.port,
@@ -260,18 +320,44 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             "details_count": len(details),
         }
 
+        # This request has an explicit accountSummaryEnd completion callback.
+        # Values are then read from ib_async's cache; raw values enter only the
+        # canonical digest and are never serialized in the report.
+        account_summary, account_summary_completion = _bounded_read(
+            "account_summary",
+            lambda: (ib.reqAccountSummary(), ib.accountSummary())[1],
+        )
+        report["request_completions"] = {
+            "account_summary": account_summary_completion,
+            "completed_orders": {
+                "completed": False,
+                "status": "BLOCKED_BY_GATEWAY_READ_ONLY_POLICY",
+                "note": (
+                    "not requested: a live 2026-08-10 probe caused Gateway to prompt "
+                    "for disabling read-only API; operator kept read-only enabled"
+                ),
+            },
+        }
         rounds = []
         for index in range(1, args.snapshot_rounds + 1):
-            rounds.append(_snapshot(ib, index))
+            rounds.append(_snapshot(ib, index, account_summary))
             if index < args.snapshot_rounds:
                 ib.sleep(args.snapshot_interval)
         pairs = [
             {
                 "left": left["index"],
                 "right": right["index"],
-                "equal": left["snapshot_hash"] == right["snapshot_hash"],
+                "equal": (
+                    left["snapshot_hash"] is not None
+                    and right["snapshot_hash"] is not None
+                    and left["snapshot_hash"] == right["snapshot_hash"]
+                ),
                 "component_equal": {
-                    name: left["hashes"][name] == right["hashes"][name]
+                    name: (
+                        left["hashes"][name] is not None
+                        and right["hashes"][name] is not None
+                        and left["hashes"][name] == right["hashes"][name]
+                    )
                     for name in left["hashes"]
                 },
             }
@@ -279,7 +365,11 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         ]
         stable = any(pair["equal"] for pair in pairs)
         report["stable_snapshot"] = {
-            "protocol": "positions -> all-open-orders -> executions; require two consecutive equal canonical snapshots",
+            "protocol": (
+                "account-summary completion -> positions -> all-open-orders -> "
+                "executions; require two consecutive "
+                "equal canonical snapshots"
+            ),
             "rounds": rounds,
             "pairs": pairs,
             "observed_stable": stable,
