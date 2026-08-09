@@ -29,9 +29,29 @@ def _init_repo(root: Path) -> str:
     return _git(root, "rev-parse", "HEAD")
 
 
+def _digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def _write_evidence(root: Path, freeze: str, run_id: int = 12345) -> tuple[Path, str]:
-    signoff, evidence = attestation.paths_for(root, freeze)
+    _, evidence = attestation.paths_for(root, freeze)
     evidence.parent.mkdir(parents=True, exist_ok=True)
+
+    texts = {
+        "deterministic": {"path": "gate_b1/x/deterministic.txt", "text": "300 passed\n"},
+        "property_default": {"path": "gate_b1/x/property_default.txt", "text": "5 passed\n"},
+        "property_gate": {"path": "gate_b1/x/property_gate.txt", "text": "1500 examples\n"},
+        "process_crash": {"path": "gate_b1_extra/process_crash.txt", "text": "PASS\n"},
+        "deterministic_soak_auditor": {
+            "path": "gate_b1_extra/deterministic_soak_auditor.txt",
+            "text": "auditor PASS\n",
+        },
+        "dm_targets": {"path": "gate_b1_extra/dm-targets.txt", "text": "delay v1\n"},
+        "storage_domains": {"path": "gate_b1_extra/storage_domains.txt", "text": "separate\n"},
+    }
+    for item in texts.values():
+        item["sha256"] = _digest(item["text"])
+
     common = {
         "commit_sha": freeze,
         "passed": True,
@@ -39,6 +59,22 @@ def _write_evidence(root: Path, freeze: str, run_id: int = 12345) -> tuple[Path,
         "source_tree_sha256": "1" * 64,
         "dependency_lock_sha256": "2" * 64,
         "resolved_environment_sha256": "3" * 64,
+    }
+    formal = {
+        **common,
+        "artifact_hashes": {
+            "deterministic.txt": texts["deterministic"]["sha256"],
+            "property_default.txt": texts["property_default"]["sha256"],
+            "property_gate.txt": texts["property_gate"]["sha256"],
+        },
+    }
+    storage = {**common, "inconclusive": []}
+    formal_raw = json.dumps(formal, indent=2, sort_keys=True) + "\n"
+    storage_raw = json.dumps(storage, indent=2, sort_keys=True) + "\n"
+
+    supplemental = {
+        "artifacts/" + texts[key]["path"]: texts[key]["sha256"]
+        for key in ("process_crash", "deterministic_soak_auditor", "dm_targets", "storage_domains")
     }
     payload = {
         "schema_version": 1,
@@ -49,9 +85,12 @@ def _write_evidence(root: Path, freeze: str, run_id: int = 12345) -> tuple[Path,
             "artifact_name": f"gate-b1-freeze-{freeze}",
             "artifact_digest": "sha256:" + "4" * 64,
         },
-        "manifest_sha256": {"formal": "5" * 64, "storage": "6" * 64},
-        "formal_manifest": dict(common),
-        "storage_manifest": {**common, "inconclusive": []},
+        "manifest_sha256": {"formal": _digest(formal_raw), "storage": _digest(storage_raw)},
+        "formal_manifest_raw": formal_raw,
+        "storage_manifest_raw": storage_raw,
+        "evidence_text": texts,
+        "supplemental_sha256": supplemental,
+        "scope_limits": {"windows_real_faults": "NOT_RUN_ACCEPTED_NON_BLOCKER"},
     }
     evidence.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     digest = hashlib.sha256(evidence.read_bytes()).hexdigest()
@@ -87,7 +126,6 @@ def test_pass_is_derived_and_survives_state_regeneration(tmp_path: Path):
     evidence, evidence_sha = _write_evidence(tmp_path, freeze)
     signoff = _write_signoff(tmp_path, freeze, evidence_sha)
 
-    # At the exact tested freeze, only the two attestation inputs are dirty.
     assert attestation.derive_signed_off_commit(tmp_path) == freeze
     provenance.write_state(tmp_path)
     first = provenance.load_state(tmp_path)
@@ -95,11 +133,15 @@ def test_pass_is_derived_and_survives_state_regeneration(tmp_path: Path):
     assert first["gate_status"]["gate_b1"] == "PASS"
     assert first["gate_status"]["signed_off_commit"] == freeze
 
-    _git(tmp_path, "add", "STATE.json", signoff.relative_to(tmp_path).as_posix(), evidence.relative_to(tmp_path).as_posix())
+    _git(
+        tmp_path,
+        "add",
+        "STATE.json",
+        signoff.relative_to(tmp_path).as_posix(),
+        evidence.relative_to(tmp_path).as_posix(),
+    )
     _git(tmp_path, "commit", "-m", "attest B1")
 
-    # The attestation commit has a different HEAD, but regeneration must derive
-    # the same PASS instead of silently resetting it to NOT_PASSED.
     provenance.write_state(tmp_path)
     second = provenance.load_state(tmp_path)
     assert second is not None
@@ -113,7 +155,13 @@ def test_any_behavior_commit_after_attestation_invalidates_old_pass(tmp_path: Pa
     evidence, evidence_sha = _write_evidence(tmp_path, freeze)
     signoff = _write_signoff(tmp_path, freeze, evidence_sha)
     provenance.write_state(tmp_path)
-    _git(tmp_path, "add", "STATE.json", signoff.relative_to(tmp_path).as_posix(), evidence.relative_to(tmp_path).as_posix())
+    _git(
+        tmp_path,
+        "add",
+        "STATE.json",
+        signoff.relative_to(tmp_path).as_posix(),
+        evidence.relative_to(tmp_path).as_posix(),
+    )
     _git(tmp_path, "commit", "-m", "attest B1")
 
     (tmp_path / "src").mkdir()
@@ -136,4 +184,14 @@ def test_bad_evidence_hash_cannot_derive_pass(tmp_path: Path):
     freeze = _init_repo(tmp_path)
     _write_evidence(tmp_path, freeze)
     _write_signoff(tmp_path, freeze, "0" * 64)
+    assert attestation.derive_signed_off_commit(tmp_path) is None
+
+
+def test_tampered_embedded_manifest_cannot_derive_pass(tmp_path: Path):
+    freeze = _init_repo(tmp_path)
+    evidence, evidence_sha = _write_evidence(tmp_path, freeze)
+    _write_signoff(tmp_path, freeze, evidence_sha)
+    data = json.loads(evidence.read_text(encoding="utf-8"))
+    data["formal_manifest_raw"] += " "
+    evidence.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     assert attestation.derive_signed_off_commit(tmp_path) is None
