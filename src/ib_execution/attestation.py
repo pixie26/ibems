@@ -1,18 +1,9 @@
 """Gate B1 attestation derivation.
 
 A Gate B1 PASS is not mutable state. It is a conclusion that can be recomputed
-from three durable facts:
-
-* every B1 registry requirement is freeze-ready (enforced by ``gate.as_state``);
-* an exact-freeze sign-off document records a named reviewer, UTC review time,
-  PASS decision and the evidence snapshot hash;
-* the current commit is either that freeze (while finalizing) or a descendant
-  whose diff from the freeze contains only the approved metadata files.
-
-This module deliberately does not import ``gate`` to avoid a cycle. It answers
-only the factual question "is there a valid signed freeze attestation here?".
-``gate.as_state`` decides whether the registry is complete enough for that
-attestation to imply PASS.
+from durable facts: a freeze-ready registry, an exact-freeze sign-off, a
+self-contained evidence snapshot, and Git history showing that only attestation
+metadata changed after the tested freeze.
 """
 
 from __future__ import annotations
@@ -111,13 +102,24 @@ def _evidence_is_valid(path: Path, freeze: str) -> bool:
     if not ARTIFACT_DIGEST.fullmatch(str(workflow.get("artifact_digest", ""))):
         return False
 
-    formal = data.get("formal_manifest", {})
-    storage = data.get("storage_manifest", {})
+    formal_raw = data.get("formal_manifest_raw")
+    storage_raw = data.get("storage_manifest_raw")
+    if not isinstance(formal_raw, str) or not isinstance(storage_raw, str):
+        return False
+    try:
+        formal = json.loads(formal_raw)
+        storage = json.loads(storage_raw)
+    except json.JSONDecodeError:
+        return False
+
     hashes = data.get("manifest_sha256", {})
-    if not HEX64.fullmatch(str(hashes.get("formal", ""))):
+    formal_hash = hashlib.sha256(formal_raw.encode("utf-8")).hexdigest()
+    storage_hash = hashlib.sha256(storage_raw.encode("utf-8")).hexdigest()
+    if hashes.get("formal") != formal_hash or hashes.get("storage") != storage_hash:
         return False
-    if not HEX64.fullmatch(str(hashes.get("storage", ""))):
+    if not HEX64.fullmatch(formal_hash) or not HEX64.fullmatch(storage_hash):
         return False
+
     if formal.get("commit_sha") != freeze or storage.get("commit_sha") != freeze:
         return False
     if formal.get("passed") is not True or formal.get("worktree_clean") is not True:
@@ -127,7 +129,6 @@ def _evidence_is_valid(path: Path, freeze: str) -> bool:
     if storage.get("inconclusive") != []:
         return False
 
-    # These identities must describe the same tested tree/environment.
     for key in (
         "source_tree_sha256",
         "dependency_lock_sha256",
@@ -135,6 +136,48 @@ def _evidence_is_valid(path: Path, freeze: str) -> bool:
     ):
         if not formal.get(key) or formal.get(key) != storage.get(key):
             return False
+
+    # The compact transcripts are embedded so the snapshot remains reviewable
+    # after Actions retention expires. Verify every embedded byte string against
+    # the hash recorded beside it, then against the originating manifest/index
+    # where one exists.
+    evidence_text = data.get("evidence_text", {})
+    required = {
+        "deterministic",
+        "property_default",
+        "property_gate",
+        "process_crash",
+        "deterministic_soak_auditor",
+        "dm_targets",
+        "storage_domains",
+    }
+    if set(evidence_text) != required:
+        return False
+    for item in evidence_text.values():
+        if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+            return False
+        digest = hashlib.sha256(item["text"].encode("utf-8")).hexdigest()
+        if item.get("sha256") != digest:
+            return False
+
+    artifact_hashes = formal.get("artifact_hashes", {})
+    for key, filename in (
+        ("deterministic", "deterministic.txt"),
+        ("property_default", "property_default.txt"),
+        ("property_gate", "property_gate.txt"),
+    ):
+        if evidence_text[key]["sha256"] != artifact_hashes.get(filename):
+            return False
+
+    supplemental = data.get("supplemental_sha256", {})
+    for key in ("process_crash", "deterministic_soak_auditor", "dm_targets", "storage_domains"):
+        source_path = "artifacts/" + str(evidence_text[key].get("path", ""))
+        if evidence_text[key]["sha256"] != supplemental.get(source_path):
+            return False
+
+    scope = data.get("scope_limits", {})
+    if scope.get("windows_real_faults") != "NOT_RUN_ACCEPTED_NON_BLOCKER":
+        return False
     return True
 
 
@@ -142,10 +185,10 @@ def validate(root: Path, freeze: str) -> Optional[Attestation]:
     """Return the valid attestation for ``freeze`` or ``None``.
 
     At the tested freeze HEAD the sign-off/evidence files may be untracked while
-    the finalizer is preparing STATE. After the attestation commit, the freeze
-    must be an ancestor and the committed diff may contain only STATE, sign-off
-    and evidence snapshot. Any source/config/test/dependency change makes the
-    old PASS non-derivable.
+    the finalizer prepares STATE. After the attestation commit, the freeze must
+    be an ancestor and the committed diff may contain only STATE, sign-off and
+    evidence snapshot. Any source/config/test/dependency change makes the old
+    PASS non-derivable.
     """
     if not HEX40.fullmatch(freeze):
         return None
