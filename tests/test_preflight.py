@@ -86,6 +86,7 @@ def test_clock_skew_is_round_trip_compensated():
     class FakeIB:
         def __init__(self, rtt: float):
             self.rtt = rtt
+            self.sleeps = []
 
         def reqCurrentTime(self):
             time.sleep(self.rtt / 2)
@@ -94,6 +95,7 @@ def test_clock_skew_is_round_trip_compensated():
             return reply
 
         def sleep(self, seconds):
+            self.sleeps.append(seconds)
             time.sleep(min(seconds, 0.01))
 
     ib = FakeIB(rtt=0.2)
@@ -104,5 +106,6 @@ def test_clock_skew_is_round_trip_compensated():
     import statistics
 
     assert len(samples) == 5
+    assert ib.sleeps == [preflight.CLOCK_REQUEST_MIN_INTERVAL_SECONDS] * 5
     assert abs(statistics.median(samples)) < abs(naive)
     assert abs(statistics.median(samples)) < 0.05

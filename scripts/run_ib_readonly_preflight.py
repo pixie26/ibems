@@ -47,6 +47,7 @@ ENTITLEMENT_CODES = {354, 10089, 10189, 10197}
 # The health verdict uses a median because IB's server clock is quantized to
 # whole seconds and a single sample cannot separate drift from quantization.
 CLOCK_SKEW_SAMPLES = 7
+CLOCK_REQUEST_MIN_INTERVAL_SECONDS = 1.1
 MAX_MEDIAN_CLOCK_SKEW_SECONDS = 2.0
 
 
@@ -85,7 +86,12 @@ class StreamCounter:
 def measure_clock_skew(ib: IB, samples: int = CLOCK_SKEW_SAMPLES) -> list[float]:
     """Round-trip-compensated skew samples; see quote_recorder.measure_clock_skew."""
     out: list[float] = []
-    for index in range(samples):
+    for _ in range(samples):
+        # The real Gateway can leave rapid repeated reqCurrentTime requests
+        # unanswered.  ib_async's blocking wrapper otherwise waits forever
+        # when RequestTimeout is zero.  Pace every request, including the first
+        # one after the separate server-time observation made by run().
+        ib.sleep(CLOCK_REQUEST_MIN_INTERVAL_SECONDS)
         t0 = time.time()
         server = ib.reqCurrentTime()
         t1 = time.time()
@@ -94,8 +100,6 @@ def measure_clock_skew(ib: IB, samples: int = CLOCK_SKEW_SAMPLES) -> list[float]
         if server.tzinfo is None:
             server = server.replace(tzinfo=timezone.utc)
         out.append(((t0 + t1) / 2.0) - server.timestamp())
-        if index + 1 < samples:
-            ib.sleep(0.2)
     return out
 
 
@@ -184,6 +188,10 @@ def _fatal_entitlement_error(error: dict[str, Any]) -> bool:
 
 def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     ib = IB()
+    # Bound every synchronous IB request.  readonly=True prevents broker
+    # writes; RequestTimeout prevents a missing callback from hanging the
+    # operator's preflight indefinitely.
+    ib.RequestTimeout = args.request_timeout
     errors: list[dict[str, Any]] = []
     report: dict[str, Any] = {
         "schema_version": 2,
@@ -369,11 +377,14 @@ def main() -> int:
     parser.add_argument("--snapshot-rounds", type=int, default=3)
     parser.add_argument("--snapshot-interval", type=float, default=1.0)
     parser.add_argument("--market-data-timeout", type=float, default=10.0)
+    parser.add_argument("--request-timeout", type=float, default=10.0)
     parser.add_argument("--sample-seconds", type=float, default=90.0)
     parser.add_argument("--output")
     args = parser.parse_args()
     if args.snapshot_rounds < 2:
         parser.error("--snapshot-rounds must be at least 2")
+    if args.request_timeout <= 0:
+        parser.error("--request-timeout must be greater than zero")
 
     report, exit_code = run(args)
     report["finished_utc"] = datetime.now(timezone.utc).isoformat()
