@@ -64,8 +64,11 @@ import hashlib
 import json
 import math
 import os
+import queue
 import statistics
+import threading
 import time
+from collections import defaultdict
 from dataclasses import asdict, dataclass, field, fields
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -179,6 +182,31 @@ def parquet_schema():
     return pa.schema([(name, mapping[PARQUET_FIELD_TYPES[name]]) for name in declared])
 
 
+class RecorderWriteFailed(RuntimeError):
+    """The async raw writer failed; the capture must not be reported healthy."""
+
+
+class RecorderQueueFull(RecorderWriteFailed):
+    """The bounded recorder queue overflowed; at least one event was rejected."""
+
+
+@dataclass(frozen=True)
+class _QueuedTick:
+    tick: RawTick
+    now_mono: float
+    enqueued_mono: float
+
+
+class _WriterBarrier:
+    def __init__(self, publish: bool):
+        self.publish = publish
+        self.done = threading.Event()
+        self.error: Optional[BaseException] = None
+
+
+_WRITER_STOP = object()
+
+
 class RawEventLog:
     """
     Append-only rolling event log for exactly one exchange session.
@@ -196,9 +224,24 @@ class RawEventLog:
     rename the file the first one is still writing to.
     """
 
-    def __init__(self, root: str | Path, session: Optional[date] = None,
-                 roll_seconds: int = 300, sync_seconds: float = 1.0,
-                 run_id: Optional[str] = None, lock: bool = True):
+    def __init__(
+        self,
+        root: str | Path,
+        session: Optional[date] = None,
+        roll_seconds: int = 300,
+        sync_seconds: float = 1.0,
+        run_id: Optional[str] = None,
+        lock: bool = True,
+        *,
+        queue_capacity: int = 100_000,
+        batch_records: int = 512,
+        batch_max_latency_seconds: float = 0.05,
+        close_timeout_seconds: float = 30.0,
+    ):
+        if queue_capacity <= 0 or batch_records <= 0:
+            raise ValueError("recorder queue_capacity and batch_records must be positive")
+        if batch_max_latency_seconds <= 0 or close_timeout_seconds <= 0:
+            raise ValueError("recorder batch/close timeouts must be positive")
         self.root = Path(root)
         self.session = session or datetime.now(timezone.utc).date()
         self.dir = self.root / self.session.isoformat()
@@ -211,6 +254,21 @@ class RawEventLog:
         self._seq = 0
         self._count = 0
         self._last_sync: Optional[float] = None
+        self.queue_capacity = int(queue_capacity)
+        self.batch_records = int(batch_records)
+        self.batch_max_latency_seconds = float(batch_max_latency_seconds)
+        self.close_timeout_seconds = float(close_timeout_seconds)
+        self._queue: queue.Queue[object] = queue.Queue(maxsize=self.queue_capacity)
+        self._state_lock = threading.Lock()
+        self._failure: Optional[BaseException] = None
+        self._accepting = True
+        self._closed = False
+        self._accepted = 0
+        self._dropped = 0
+        self._queue_high_water = 0
+        self._max_writer_lag_ms = 0.0
+        self._accepted_by_stream: dict[str, int] = defaultdict(int)
+        self._persisted_by_stream: dict[str, int] = defaultdict(int)
         # A same-day process restart must not overwrite earlier segments.
         self.run_id = run_id or uuid4().hex[:10]
         self._lock: Optional[ProcessLock] = None
@@ -218,6 +276,12 @@ class RawEventLog:
             self._lock = ProcessLock(self.dir / ".recorder.lock")
             self._lock.acquire(note=f"session={self.session.isoformat()} run={self.run_id}")
         self._recover_crashed_segments()
+        self._thread = threading.Thread(
+            target=self._writer_loop,
+            name=f"raw-event-writer-{self.run_id}",
+            daemon=True,
+        )
+        self._thread.start()
 
     def _recover_crashed_segments(self) -> None:
         """Preserve abruptly-terminated gzip streams for best-effort row salvage.
@@ -237,39 +301,203 @@ class RawEventLog:
         )
         self._fh = gzip.open(self._current, "wt", encoding="utf-8")
         self._opened_at = now_mono
-        self._last_sync = now_mono
+        self._last_sync = time.monotonic()
         self._seq += 1
 
     def _close_segment(self) -> None:
         if self._fh is None or self._current is None:
             return
         self._fh.close()
+        # gzip.close writes the footer. Flush the complete stream before the
+        # atomic rename rather than fsyncing a prefix and then adding a footer.
+        sync_flags = os.O_RDWR if os.name == "nt" else os.O_RDONLY
+        fd = os.open(self._current, sync_flags)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
         final = self._current.with_name(self._current.name.replace(".partial-", "segment-"))
         os.replace(self._current, final)   # atomic
         self._fh = None
         self._current = None
 
-    def append(self, tick: RawTick, now_mono: float) -> None:
-        if self._fh is None or (
-            self._opened_at is not None and now_mono - self._opened_at >= self.roll_seconds
-        ):
-            self._open_segment(now_mono)
-        assert self._fh is not None
-        self._fh.write(json.dumps(asdict(tick), separators=(",", ":")) + "\n")
-        self._count += 1
+    def _latch_failure(self, exc: BaseException) -> None:
+        with self._state_lock:
+            if self._failure is None:
+                self._failure = exc
+
+    def raise_if_failed(self) -> None:
+        with self._state_lock:
+            failure = self._failure
+        if failure is not None:
+            raise RecorderWriteFailed(f"raw event writer failed: {failure}") from failure
+
+    def _flush_file(self, *, force_sync: bool = False) -> None:
+        if self._fh is None:
+            return
         self._fh.flush()
-        if self._last_sync is None or now_mono - self._last_sync >= self.sync_seconds:
-            # Bound crash loss without forcing one fsync for every market tick.
+        now = time.monotonic()
+        if force_sync or self._last_sync is None or now - self._last_sync >= self.sync_seconds:
             raw = getattr(getattr(self._fh, "buffer", None), "fileobj", None)
             if raw is not None:
                 os.fsync(raw.fileno())
-            self._last_sync = now_mono
+            self._last_sync = now
+
+    def _write_batch(self, batch: list[_QueuedTick]) -> None:
+        for item in batch:
+            if self._fh is None or (
+                self._opened_at is not None
+                and item.now_mono - self._opened_at >= self.roll_seconds
+            ):
+                self._open_segment(item.now_mono)
+            assert self._fh is not None
+            self._fh.write(json.dumps(asdict(item.tick), separators=(",", ":")) + "\n")
+        self._flush_file()
+        written_at = time.monotonic()
+        with self._state_lock:
+            for item in batch:
+                self._count += 1
+                self._persisted_by_stream[item.tick.event_type] += 1
+                self._max_writer_lag_ms = max(
+                    self._max_writer_lag_ms,
+                    (written_at - item.enqueued_mono) * 1000.0,
+                )
+
+    def _finish_control(self, control: object) -> bool:
+        if control is _WRITER_STOP:
+            self._close_segment()
+            return True
+        assert isinstance(control, _WriterBarrier)
+        try:
+            self._flush_file(force_sync=True)
+            if control.publish:
+                self._close_segment()
+        except BaseException as exc:
+            control.error = exc
+            raise
+        finally:
+            control.done.set()
+        return False
+
+    def _writer_loop(self) -> None:
+        try:
+            while True:
+                try:
+                    first = self._queue.get(timeout=self.batch_max_latency_seconds)
+                except queue.Empty:
+                    self._flush_file()
+                    continue
+
+                if not isinstance(first, _QueuedTick):
+                    self._queue.task_done()
+                    if self._finish_control(first):
+                        return
+                    continue
+
+                batch = [first]
+                control: Optional[object] = None
+                while len(batch) < self.batch_records:
+                    try:
+                        item = self._queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if isinstance(item, _QueuedTick):
+                        batch.append(item)
+                    else:
+                        control = item
+                        break
+
+                self._write_batch(batch)
+                for _ in batch:
+                    self._queue.task_done()
+                if control is not None:
+                    self._queue.task_done()
+                    if self._finish_control(control):
+                        return
+        except BaseException as exc:
+            self._latch_failure(exc)
+            # Release any caller waiting on a publication barrier. Accepted
+            # ticks remain accounted as not persisted and make the run fail.
+            while True:
+                try:
+                    pending = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                if isinstance(pending, _WriterBarrier):
+                    pending.error = exc
+                    pending.done.set()
+                self._queue.task_done()
+
+    def append(self, tick: RawTick, now_mono: float) -> None:
+        item = _QueuedTick(tick, float(now_mono), time.monotonic())
+        with self._state_lock:
+            if not self._accepting:
+                raise RecorderWriteFailed("raw event log is closing or closed")
+            if self._failure is not None:
+                raise RecorderWriteFailed(
+                    f"raw event writer failed: {self._failure}"
+                ) from self._failure
+            try:
+                self._queue.put_nowait(item)
+            except queue.Full as exc:
+                self._dropped += 1
+                failure = RecorderQueueFull(
+                    f"raw event queue reached capacity {self.queue_capacity}; capture is incomplete"
+                )
+                self._failure = failure
+                raise failure from exc
+            self._accepted += 1
+            self._accepted_by_stream[tick.event_type] += 1
+            self._queue_high_water = max(self._queue_high_water, self._queue.qsize())
+
+    def flush(self, *, publish: bool = True, timeout: Optional[float] = None) -> None:
+        timeout = self.close_timeout_seconds if timeout is None else float(timeout)
+        self.raise_if_failed()
+        with self._state_lock:
+            if self._closed:
+                return
+            if not self._accepting:
+                raise RecorderWriteFailed("raw event log is already closing")
+        barrier = _WriterBarrier(publish)
+        try:
+            self._queue.put(barrier, timeout=timeout)
+        except queue.Full as exc:
+            raise RecorderWriteFailed("timed out enqueueing raw writer flush barrier") from exc
+        if not barrier.done.wait(timeout):
+            failure = TimeoutError(f"raw event writer flush timed out after {timeout}s")
+            self._latch_failure(failure)
+            raise RecorderWriteFailed(str(failure)) from failure
+        if barrier.error is not None:
+            raise RecorderWriteFailed(
+                f"raw event writer flush failed: {barrier.error}"
+            ) from barrier.error
+        self.raise_if_failed()
 
     def close(self) -> None:
-        self._close_segment()
+        with self._state_lock:
+            if self._closed:
+                return
+            self._accepting = False
+        try:
+            self._queue.put(_WRITER_STOP, timeout=self.close_timeout_seconds)
+        except queue.Full:
+            self._latch_failure(
+                TimeoutError("raw event writer queue did not drain before close timeout")
+            )
+        self._thread.join(self.close_timeout_seconds)
+        if self._thread.is_alive():
+            self._latch_failure(
+                TimeoutError("raw event writer did not stop before close timeout")
+            )
+            # Do not release session ownership while the writer can still touch
+            # its segment; the kernel will release it when the process exits.
+            self.raise_if_failed()
+        with self._state_lock:
+            self._closed = True
         if self._lock is not None:
             self._lock.release()
             self._lock = None
+        self.raise_if_failed()
 
     def segments(self) -> list[Path]:
         return sorted(
@@ -278,6 +506,10 @@ class RawEventLog:
         )
 
     def read_all(self) -> Iterator[dict[str, Any]]:
+        with self._state_lock:
+            open_for_writes = self._accepting and not self._closed
+        if open_for_writes:
+            self.flush(publish=True)
         for seg in self.segments():
             with gzip.open(seg, "rt", encoding="utf-8") as fh:
                 try:
@@ -293,7 +525,23 @@ class RawEventLog:
 
     @property
     def count(self) -> int:
-        return self._count
+        with self._state_lock:
+            return self._count
+
+    def write_stats(self) -> dict[str, Any]:
+        with self._state_lock:
+            failure = None if self._failure is None else repr(self._failure)
+            return {
+                "accepted": self._accepted,
+                "persisted": self._count,
+                "dropped": self._dropped,
+                "queue_capacity": self.queue_capacity,
+                "queue_high_water": self._queue_high_water,
+                "max_writer_lag_ms": self._max_writer_lag_ms,
+                "accepted_by_stream": dict(sorted(self._accepted_by_stream.items())),
+                "persisted_by_stream": dict(sorted(self._persisted_by_stream.items())),
+                "writer_error": failure,
+            }
 
 
 # ----------------------------------------------------------------------------
@@ -708,6 +956,17 @@ def finalize_day(
     different runs distinguishable.
     """
     log.close()
+    write_accounting = log.write_stats()
+    if (
+        write_accounting["accepted"] != write_accounting["persisted"]
+        or write_accounting["dropped"]
+        or write_accounting["writer_error"] is not None
+        or write_accounting["accepted_by_stream"]
+        != write_accounting["persisted_by_stream"]
+    ):
+        raise RecorderWriteFailed(
+            f"raw writer accounting mismatch: {write_accounting}"
+        )
     rows = list(log.read_all())
     parquet = log.dir / "events.parquet"
     parquet_tmp = log.dir / ".events.parquet.tmp"
@@ -756,6 +1015,7 @@ def finalize_day(
         "recorder_run_ids": sorted(health.recorder_run_ids),
         "health_ok": health.ok(),
         "problems": health.problems(),
+        "write_accounting": write_accounting,
         "files": {**hashes, health_path.name: _sha256(health_path)},
     }
     manifest_path = log.dir / "manifest.json"
@@ -918,6 +1178,10 @@ class RecorderConfig:
     short_reconnect_limit: int = 5
     session_reconnect_limit: int = 20
     request_deadline_seconds: float = REQUEST_DEADLINE_SECONDS
+    queue_capacity: int = 100_000
+    writer_batch_records: int = 512
+    writer_batch_max_latency_seconds: float = 0.05
+    writer_close_timeout_seconds: float = 30.0
 
 
 class QuoteRecorder:
@@ -996,6 +1260,8 @@ class QuoteRecorder:
         contract testable and keeps entitlement and data-integrity failures on
         the same non-retryable path.
         """
+        if self.log is not None:
+            self.log.raise_if_failed()
         if self._fatal_prerequisite_error is not None:
             raise RecorderPrerequisiteError(self._fatal_prerequisite_error)
 
@@ -1187,7 +1453,12 @@ class QuoteRecorder:
                 if self.log is None:
                     self.log = RawEventLog(
                         cfg.root, session=session.start.date(),
-                        roll_seconds=cfg.roll_seconds, run_id=self.run_id,
+                        roll_seconds=cfg.roll_seconds,
+                        run_id=self.run_id,
+                        queue_capacity=cfg.queue_capacity,
+                        batch_records=cfg.writer_batch_records,
+                        batch_max_latency_seconds=cfg.writer_batch_max_latency_seconds,
+                        close_timeout_seconds=cfg.writer_close_timeout_seconds,
                     )
                 self._clock_skew_samples.extend(measure_clock_skew(ib))
                 self._append(
@@ -1269,6 +1540,19 @@ class QuoteRecorder:
                 assert session is not None
                 return self._finalize(session)
 
+            except RecorderWriteFailed:
+                # The storage path itself is poisoned, so trying to append a
+                # RECORDER_ERROR row through it would only mask the first
+                # failure. Disconnect and surface the error to the supervisor.
+                if ib.isConnected():
+                    self._intentional_disconnect = True
+                    ib.disconnect()
+                if self.log is not None:
+                    try:
+                        self.log.close()
+                    except RecorderWriteFailed:
+                        pass
+                raise
             except (RecorderPrerequisiteError, SessionRolloverError, ProcessLockUnavailable) as exc:
                 self._append(
                     "SYSTEM", datetime.now(timezone.utc),
@@ -1311,6 +1595,8 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - operato
     ap.add_argument("--port", type=int, default=4002)
     ap.add_argument("--client-id", type=int, default=33)
     ap.add_argument("--session-reconnect-limit", type=int, default=20)
+    ap.add_argument("--queue-capacity", type=int, default=100_000)
+    ap.add_argument("--writer-batch-records", type=int, default=512)
     ap.add_argument("--no-wait", action="store_true")
     args = ap.parse_args(argv)
     try:
@@ -1321,6 +1607,8 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - operato
             port=args.port,
             client_id=args.client_id,
             session_reconnect_limit=args.session_reconnect_limit,
+            queue_capacity=args.queue_capacity,
+            writer_batch_records=args.writer_batch_records,
             wait_for_rth=not args.no_wait,
         ).run()
     except ProcessLockUnavailable as exc:

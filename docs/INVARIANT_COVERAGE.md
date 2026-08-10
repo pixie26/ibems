@@ -82,7 +82,7 @@ Exact-freeze sign-off 同时记录当前机制参数，以便以后追溯和重�
 
 ### Windows 范围限制——owner 接受为非 blocker
 
-当前 B1 的真实存储/故障证据全部来自 Linux。Windows-specific 的 `msvcrt.locking`、卷序列号 failure-domain 检查、NTFS ENOSPC/stall 语义，以及 `deploy/ibems-execution-service.ps1` 尚未经过真实故障演练。
+当前 B1 的真实存储/故障证据全部来自 Linux。2026-08-11 已修复 Windows 的 durable-file publication 调用形状和 lock diagnostics：fence/witness 不再尝试 POSIX directory `os.open`，Windows 使用 write-through replace；`msvcrt.locking` 的控制文件与可读 owner diagnostics 已分离，Windows 完整测试套件已运行到 100% 并返回 0。但卷序列号 failure-domain 检查、NTFS ENOSPC/stall/中途强杀语义，以及 `deploy/ibems-execution-service.ps1` 仍未经过生产等价真实故障演练。
 
 **Owner decision：记录该缺口，但不把它设为进入 B2 read-only / paper progression 的 blocker。** 这不等于允许在 Windows 上发单；在任何 order-capable Windows deployment 之前，必须补生产 OS 的真实验证。
 

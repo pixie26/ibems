@@ -96,9 +96,12 @@ def test_release_allows_a_successor(tmp_path):
 
 def test_holder_diagnostics_name_the_owning_pid(tmp_path):
     path = tmp_path / "owner.lock"
-    with ProcessLock(path).acquire(note="unit-test"):
-        assert f"pid={os.getpid()}" in path.read_text(encoding="utf-8")
-        assert "unit-test" in path.read_text(encoding="utf-8")
+    lock = ProcessLock(path)
+    with lock.acquire(note="unit-test"):
+        diagnostics = lock.owner_path.read_text(encoding="utf-8")
+        assert f"pid={os.getpid()}" in diagnostics
+        assert "unit-test" in diagnostics
+        assert "start" in diagnostics or "filetime" in diagnostics
 
 
 def test_refusal_reports_the_holder(tmp_path):

@@ -70,12 +70,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from .durable_io import durable_atomic_write
 from .failure_domain import require_separate
 from .models import EventType
 
@@ -227,22 +227,7 @@ class JournalWitness:
 
     def _durable_write(self, record: WitnessRecord) -> None:
         payload = json.dumps(record.as_dict(), indent=2, sort_keys=True).encode("utf-8")
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_name(self.path.name + ".tmp")
-        fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
-        try:
-            os.write(fd, payload)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        os.replace(tmp, self.path)
-        dir_fd = os.open(self.path.parent, os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        except OSError:  # pragma: no cover - unsupported on some platforms
-            pass
-        finally:
-            os.close(dir_fd)
+        durable_atomic_write(self.path, payload)
 
     # -- verification ----------------------------------------------------
 

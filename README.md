@@ -128,15 +128,9 @@ Recorder 与交易路径隔离开发，只采集：
 - IB connection/error、`marketDataType`、server time；
 - local wall-clock 与 monotonic arrival timestamp。
 
-原始事件以 append-only gzip JSONL 滚动保存，收盘后原子生成 Parquet、健康报告和 SHA-256 manifest。健康报告检查 LIVE 数据、三路覆盖、最大 gap、断线、时钟偏差、行数和文件 hash。
+原始事件通过有界内存队列交给独立 writer，按 batch 写入 append-only gzip JSONL；callback 不执行 gzip/flush/fsync。收盘后生成 Parquet、健康报告和 SHA-256 manifest，并强制核对 callback、accepted、persisted 与 readback 计数。队列满、writer 异常或计数不一致都会 fail-closed。该 Recorder 是显式启动的只读研究进程；`execution_host` 不保存每条行情 tick，订单 Journal 的 durable-before-send 语义也没有被异步化。详细边界见 [Recorder 写入、测试与 Windows 部署边界](docs/RECORDER_STORAGE_AND_WINDOWS_POLICY_ZH.md)。
 
-当前实测连接正常。2026-08-07 在 4002（paper 账户已 redact）的预检确认：IB `10089` entitlement 阻塞**已解除**，`marketDataType=1`（Live），`entitlement_blocked=false`。这一条是直接观测，成立。
-
-同一次预检报出的 `AllLast=0` **是无效证据，不能用来推断任何事。** 当时 `run_ib_readonly_preflight.py` 在 sleep 结束后读取 `Ticker.tickByTicks` 的**残余内容**，而 `ib_async` 会在每次网络更新之间清空该缓冲区——所以那个 0 只说明「最后一次 flush 里没有 AllLast」，不说明「20 秒内 IB 没有推送 AllLast」。同一次预检里 `bars_5s=4` 之所以正确，仅仅因为它读的是会累积的 `RealTimeBarList`。
-
-已知的只有一件事：**entitlement 不是原因**（已直接观测到 LIVE）。`AllLast` 订阅路径本身是否正常，要等改成 event-driven 累积计数之后重测才能判断——`reqRealTimeBars` 正常并不能推出 `reqTickByTickData` 正常，两者是不同的请求路径。
-
-在预检得到 `market_data_type=1` 且三路 sample 均非零之前，Recorder 仍会 fail-closed、退出码 2。
+当前实测已在 SPY OVERNIGHT 与正式 `RTH+SMART` bounded run 中直接观察到 LIVE BidAsk、AllLast 和 5 秒 bars 三路非零。早期 sleep 后读取 `Ticker.tickByTicks` 残余缓冲得到的 `AllLast=0` 已被判定为无效测量；现有 preflight 与 Recorder 都在 callback 中累计。两分钟结果证明三路可达，不等于 Full-RTH 全日无损；带 `handler_counts` 的下一轮 RTH probe 仍需关闭此前 Recorder/配对 preflight 的 BidAsk 数量差异。
 
 ```powershell
 # Broker-write-free Gateway 与稳定快照预检
@@ -182,6 +176,7 @@ python scripts\run_storage_fault_drill.py --journal-volume X:\ --fence-dir C:\Pr
 - [系统规格](docs/SPEC.md)：状态、事件、接口和不变量定义。
 - [最终执行计划](docs/FINAL_EXECUTION_PLAN_ZH.md)：Gate A/B/C/D、实施顺序和停止条件。
 - [运行手册](docs/RUNBOOK.md)：环境、凭证、启动、告警和事故处理。
+- [Recorder 写入、测试与 Windows 部署边界](docs/RECORDER_STORAGE_AND_WINDOWS_POLICY_ZH.md)：实际交易的数据边界、异步批量 writer、测试分层和 Windows order-capable 前置证据。
 - [Gate B1 签字模板](docs/GATE_B1_SIGNOFF_TEMPLATE.md)：8 项 blocker、22 条不变量逐条签字、以及明确写下的范围边界。
 - [v0.1.5 变更](docs/CHANGES_v0.1.5.md)：本版本安全修正。
 - [v0.1.4 最终审查](docs/FINAL_REVIEW_V014_ZH.md)：HALT durability 等审查结论。

@@ -37,6 +37,7 @@ implement either backend reliably -- keep journals and recordings local.
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -73,6 +74,7 @@ class ProcessLock:
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
+        self.owner_path = self.path.with_name(self.path.name + ".owner")
         self._fd: Optional[int] = None
 
     @property
@@ -80,10 +82,86 @@ class ProcessLock:
         return self._fd is not None
 
     def _read_holder(self) -> str:
+        # Windows byte-range locking may prevent a second handle from reading
+        # the lock file at all. Ownership therefore stays in the kernel lock,
+        # while diagnostics live in an unlocked sidecar.
+        for candidate in (self.owner_path, self.path):
+            try:
+                text = candidate.read_text(encoding="utf-8").strip()[:500]
+            except OSError:
+                continue
+            if text:
+                return text
+        return ""
+
+    @staticmethod
+    def _process_start_identity() -> str:
+        """Return an OS process-start identity when available.
+
+        The value is diagnostic, not a lease: the kernel lock is always the
+        control. Including it prevents an operator from confusing a reused PID
+        with the process that originally acquired the resource.
+        """
+
+        if os.name == "nt":  # pragma: no cover - Windows runtime only
+            try:
+                import ctypes
+                from ctypes import wintypes
+
+                created = wintypes.FILETIME()
+                exited = wintypes.FILETIME()
+                kernel = wintypes.FILETIME()
+                user = wintypes.FILETIME()
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+                kernel32.GetProcessTimes.argtypes = (
+                    wintypes.HANDLE,
+                    ctypes.POINTER(wintypes.FILETIME),
+                    ctypes.POINTER(wintypes.FILETIME),
+                    ctypes.POINTER(wintypes.FILETIME),
+                    ctypes.POINTER(wintypes.FILETIME),
+                )
+                kernel32.GetProcessTimes.restype = wintypes.BOOL
+                handle = kernel32.GetCurrentProcess()
+                ok = kernel32.GetProcessTimes(
+                    handle,
+                    ctypes.byref(created),
+                    ctypes.byref(exited),
+                    ctypes.byref(kernel),
+                    ctypes.byref(user),
+                )
+                if ok:
+                    value = (created.dwHighDateTime << 32) | created.dwLowDateTime
+                    return f"win_filetime={value}"
+            except (AttributeError, OSError):
+                pass
+        else:
+            try:
+                # /proc/<pid>/stat field 22 is start time in clock ticks since
+                # boot. Split after ')' because the process name may contain spaces.
+                tail = Path(f"/proc/{os.getpid()}/stat").read_text().rsplit(")", 1)[1]
+                return f"proc_start_ticks={tail.split()[19]}"
+            except (OSError, IndexError):
+                pass
+        return f"acquired_wall_ns={time.time_ns()}"
+
+    def _write_diagnostics(self, fd: int, note: str) -> None:
+        payload = f"pid={os.getpid()} {self._process_start_identity()}"
+        if note:
+            payload += f" {note}"
+        encoded = payload.encode("utf-8")
+        os.truncate(fd, 0)
+        os.write(fd, encoded)
+        os.fsync(fd)
+
+        owner_fd = os.open(
+            self.owner_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644
+        )
         try:
-            return self.path.read_text(encoding="utf-8").strip()[:200]
-        except OSError:
-            return ""
+            os.write(owner_fd, encoded)
+            os.fsync(owner_fd)
+        finally:
+            os.close(owner_fd)
 
     def acquire(self, note: str = "") -> "ProcessLock":
         if self._fd is not None:
@@ -101,12 +179,7 @@ class ProcessLock:
 
         self._fd = fd
         try:
-            os.truncate(fd, 0)
-            payload = f"pid={os.getpid()}"
-            if note:
-                payload += f" {note}"
-            os.write(fd, payload.encode("utf-8"))
-            os.fsync(fd)
+            self._write_diagnostics(fd, note)
         except OSError:
             # Diagnostics are best-effort; ownership is already established.
             pass
@@ -132,6 +205,12 @@ class ProcessLock:
         if self._fd is None:
             return
         fd, self._fd = self._fd, None
+        try:
+            # Remove diagnostics while ownership is still held. A successor
+            # cannot race in and have its freshly-written sidecar deleted.
+            self.owner_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         try:
             self._unlock_fd(fd)
         except OSError:

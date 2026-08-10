@@ -70,6 +70,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from .durable_io import durable_atomic_write
 from .failure_domain import FailureDomainError, require_separate
 
 # Kept as an alias: callers and tests refer to this name, and the condition is
@@ -188,24 +189,7 @@ class FatalFence:
 
     def _write(self, record: FatalFenceRecord) -> None:
         payload = json.dumps(record.as_dict(), indent=2, sort_keys=True).encode("utf-8")
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_name(self.path.name + ".tmp")
-        fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
-        try:
-            os.write(fd, payload)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        os.replace(tmp, self.path)
-        # The rename itself has to be durable, or a power loss can lose the
-        # directory entry while the file's contents are safely on disk.
-        dir_fd = os.open(self.path.parent, os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        except OSError:  # pragma: no cover - not supported on some platforms
-            pass
-        finally:
-            os.close(dir_fd)
+        durable_atomic_write(self.path, payload)
 
     def raise_fence(self, reason: str) -> FatalFenceRecord:
         """Persist a fence. Idempotent: an existing fence is never overwritten.

@@ -166,6 +166,7 @@ def test_the_lock_sidecar_names_the_owning_pid(tmp_path):
     try:
         sidecar = path.with_name(path.name + ".lock")
         assert sidecar.exists()
-        assert "journal=journal.db" in sidecar.read_text(encoding="utf-8")
+        owner = sidecar.with_name(sidecar.name + ".owner")
+        assert "journal=journal.db" in owner.read_text(encoding="utf-8")
     finally:
         journal.close()

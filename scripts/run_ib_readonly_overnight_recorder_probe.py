@@ -136,8 +136,7 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         probe, tickers, bars = recorder._subscribe(ib, contract)
         sample_started = time.monotonic()
         while time.monotonic() - sample_started < args.sample_seconds:
-            if recorder._fatal_prerequisite_error:
-                raise RuntimeError(recorder._fatal_prerequisite_error)
+            recorder._raise_if_fatal_error()
             if not ib.isConnected():
                 raise ConnectionError(
                     f"IB disconnected during bounded {session_label} probe"
@@ -170,7 +169,11 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             )
             ib.disconnect()
         if log is not None:
-            log.close()
+            try:
+                log.close()
+            except Exception as close_exc:
+                if exception is None:
+                    exception = close_exc
 
     rows = list(log.read_all()) if log is not None else []
     counts = Counter(str(row.get("event_type")) for row in rows)
@@ -199,6 +202,7 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             # arrived" -- two bounded runs recorded ~40% fewer BidAsk rows than
             # the paired preflight, and one number cannot tell those apart.
             "handler_counts": dict(sorted(recorder.handled_events.items())),
+            "writer_accounting": log.write_stats() if log is not None else None,
             "raw_event_count": len(rows),
             "stream_counts": {
                 "bid_ask": counts["BID_ASK"],
@@ -223,6 +227,7 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         }
     )
     stream_counts = report["stream_counts"]
+    writer_accounting = report["writer_accounting"] or {}
     fatal_errors = [
         error
         for error in errors
@@ -250,6 +255,14 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 ("ALL_LAST", stream_counts["all_last"]),
                 ("BAR_5S", stream_counts["bars_5s"]),
             )
+        ),
+        "writer_accounting_balanced": bool(
+            writer_accounting
+            and writer_accounting.get("accepted") == writer_accounting.get("persisted")
+            and writer_accounting.get("dropped") == 0
+            and writer_accounting.get("writer_error") is None
+            and writer_accounting.get("accepted_by_stream")
+            == writer_accounting.get("persisted_by_stream")
         ),
         "no_exception": exception is None,
         "no_fatal_market_data_error": not fatal_errors,

@@ -10,7 +10,8 @@ are the ones that stop it from reporting a healthy day it did not have.
 from __future__ import annotations
 
 import time
-from dataclasses import replace
+import threading
+from dataclasses import asdict, replace
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -22,7 +23,9 @@ from ib_execution.quote_recorder import (
     QuoteRecorder,
     RawEventLog,
     RawTick,
+    RecorderQueueFull,
     RecorderPrerequisiteError,
+    RecorderWriteFailed,
     ReconnectBudget,
     ReconnectBudgetExhausted,
     SubscriptionLimiter,
@@ -61,7 +64,25 @@ def _tick(i: int, ns: int, **over) -> RawTick:
     return RawTick(**base)
 
 
-def _dense(log: RawEventLog, stream: str, step_seconds: float, **over) -> int:
+class _MemoryLog:
+    """Health fixture: preserve event semantics without exercising storage."""
+
+    def __init__(self, session: date = SESSION):
+        self.session = session
+        self.rows: list[dict] = []
+
+    def append(self, tick: RawTick, now_mono: float) -> None:
+        del now_mono
+        self.rows.append(asdict(tick))
+
+    def close(self) -> None:
+        pass
+
+    def read_all(self):
+        yield from self.rows
+
+
+def _dense(log, stream: str, step_seconds: float, **over) -> int:
     """Fill the whole session window with one stream at a fixed cadence."""
     span = (CLOSE - OPEN).total_seconds()
     n = int(span / step_seconds) + 1
@@ -75,12 +96,42 @@ def _health(log, **kw):
     return compute_health(log, session_open=OPEN, session_close=CLOSE, **kw)
 
 
-def _clean_log(tmp_path) -> RawEventLog:
-    log = RawEventLog(tmp_path, session=SESSION)
-    _dense(log, "BID_ASK", 1.0)
-    _dense(log, "ALL_LAST", 5.0, last=600.0, last_size=100.0)
-    _dense(log, "BAR_5S", 5.0, open=599.9, high=600.1, low=599.8, close=600.0,
+def _clean_log(_tmp_path=None) -> _MemoryLog:
+    log = _MemoryLog()
+    _dense(log, "BID_ASK", DEFAULT_GAP_THRESHOLDS["BID_ASK"])
+    _dense(log, "ALL_LAST", DEFAULT_GAP_THRESHOLDS["ALL_LAST"],
+           last=600.0, last_size=100.0)
+    _dense(log, "BAR_5S", DEFAULT_GAP_THRESHOLDS["BAR_5S"],
+           open=599.9, high=600.1, low=599.8, close=600.0,
            volume=1000.0, wap=599.99, trade_count=25)
+    log.close()
+    return log
+
+
+def _clean_disk_log(tmp_path) -> RawEventLog:
+    """One small integration fixture; storage does not need quote-rate density."""
+
+    log = RawEventLog(tmp_path, session=SESSION, roll_seconds=100_000)
+    _dense(log, "BID_ASK", DEFAULT_GAP_THRESHOLDS["BID_ASK"])
+    _dense(
+        log,
+        "ALL_LAST",
+        DEFAULT_GAP_THRESHOLDS["ALL_LAST"],
+        last=600.0,
+        last_size=100.0,
+    )
+    _dense(
+        log,
+        "BAR_5S",
+        DEFAULT_GAP_THRESHOLDS["BAR_5S"],
+        open=599.9,
+        high=600.1,
+        low=599.8,
+        close=600.0,
+        volume=1000.0,
+        wap=599.99,
+        trade_count=25,
+    )
     log.close()
     return log
 
@@ -126,6 +177,7 @@ def test_a_second_live_recorder_cannot_steal_the_session_directory(tmp_path):
     first = RawEventLog(tmp_path, session=SESSION)
     try:
         first.append(_tick(0, OPEN_NS), now_mono=0)
+        first.flush(publish=False)
         with pytest.raises(ProcessLockUnavailable):
             RawEventLog(tmp_path, session=SESSION)
         assert list(first.dir.glob(".partial-*")), "incumbent's open segment survived"
@@ -151,6 +203,77 @@ def test_row_identity_is_run_scoped_not_event_id(tmp_path):
     assert len(identities) == 2, "run-scoped identity separates them"
 
 
+def test_append_never_waits_for_the_disk_writer(tmp_path, monkeypatch):
+    """The IB callback enqueues; gzip/fsync belong to the writer thread."""
+
+    log = RawEventLog(tmp_path, session=SESSION, batch_records=1)
+    entered = threading.Event()
+    release = threading.Event()
+    original = log._write_batch
+
+    def blocked(batch):
+        entered.set()
+        assert release.wait(5)
+        original(batch)
+
+    monkeypatch.setattr(log, "_write_batch", blocked)
+    started = time.monotonic()
+    log.append(_tick(1, OPEN_NS), now_mono=0.0)
+    elapsed = time.monotonic() - started
+    assert entered.wait(2)
+    assert elapsed < 0.1
+    assert log.write_stats()["accepted"] == 1
+    assert log.write_stats()["persisted"] == 0
+
+    release.set()
+    log.close()
+    stats = log.write_stats()
+    assert stats["accepted"] == stats["persisted"] == 1
+    assert stats["dropped"] == 0
+
+
+def test_queue_overflow_is_fatal_and_accounted(tmp_path, monkeypatch):
+    log = RawEventLog(tmp_path, session=SESSION, queue_capacity=1, batch_records=1)
+    entered = threading.Event()
+    release = threading.Event()
+    original = log._write_batch
+
+    def blocked(batch):
+        entered.set()
+        assert release.wait(5)
+        original(batch)
+
+    monkeypatch.setattr(log, "_write_batch", blocked)
+    log.append(_tick(1, OPEN_NS), now_mono=0.0)
+    assert entered.wait(2)
+    log.append(_tick(2, OPEN_NS + 1), now_mono=1.0)
+    with pytest.raises(RecorderQueueFull):
+        log.append(_tick(3, OPEN_NS + 2), now_mono=2.0)
+
+    release.set()
+    with pytest.raises(RecorderWriteFailed):
+        log.close()
+    stats = log.write_stats()
+    assert stats["accepted"] == stats["persisted"] == 2
+    assert stats["dropped"] == 1
+    assert stats["writer_error"] is not None
+
+
+def test_writer_exception_poisoning_reaches_the_caller(tmp_path, monkeypatch):
+    log = RawEventLog(tmp_path, session=SESSION, batch_records=1)
+
+    def fail(_batch):
+        raise OSError("simulated gzip failure")
+
+    monkeypatch.setattr(log, "_write_batch", fail)
+    log.append(_tick(1, OPEN_NS), now_mono=0.0)
+    assert log._thread.join(2) is None
+    with pytest.raises(RecorderWriteFailed, match="simulated gzip failure"):
+        log.raise_if_failed()
+    with pytest.raises(RecorderWriteFailed, match="simulated gzip failure"):
+        log.close()
+
+
 # --------------------------------------------------------------------------
 # per-stream health
 # --------------------------------------------------------------------------
@@ -171,9 +294,10 @@ def test_a_dead_trade_stream_cannot_hide_behind_a_healthy_quote_stream(tmp_path)
     the stream L2/L3 and every VWAP reconstruction depend on -- has been dead
     since mid-session.
     """
-    log = RawEventLog(tmp_path, session=SESSION)
-    _dense(log, "BID_ASK", 1.0)
-    _dense(log, "BAR_5S", 5.0, volume=1000.0, trade_count=25,
+    log = _MemoryLog()
+    _dense(log, "BID_ASK", DEFAULT_GAP_THRESHOLDS["BID_ASK"])
+    _dense(log, "BAR_5S", DEFAULT_GAP_THRESHOLDS["BAR_5S"],
+           volume=1000.0, trade_count=25,
            open=599.9, high=600.1, low=599.8, close=600.0, wap=599.99)
     # AllLast stops one hour in.
     for i in range(720):
@@ -194,7 +318,7 @@ def test_a_dead_trade_stream_cannot_hide_behind_a_healthy_quote_stream(tmp_path)
 
 def test_coverage_is_not_a_span(tmp_path):
     """A hole in the middle used to score ~100%: (last-first)/session is a span."""
-    log = RawEventLog(tmp_path, session=SESSION)
+    log = _MemoryLog()
     span = (CLOSE - OPEN).total_seconds()
     for i in range(60):                                   # first minute
         log.append(_tick(i, OPEN_NS + int(i * 1e9)), now_mono=float(i))
@@ -211,12 +335,16 @@ def test_coverage_is_not_a_span(tmp_path):
 
 
 def test_late_start_and_early_finish_both_count_as_missing(tmp_path):
-    log = RawEventLog(tmp_path, session=SESSION)
+    log = _MemoryLog()
     offset = 1800.0                                        # 30 min late, 30 min early
     span = (CLOSE - OPEN).total_seconds()
-    n = int((span - 2 * offset))
+    step = DEFAULT_GAP_THRESHOLDS["BID_ASK"]
+    n = int((span - 2 * offset) / step) + 1
     for i in range(n):
-        log.append(_tick(i, OPEN_NS + int((offset + i) * 1e9)), now_mono=float(i))
+        log.append(
+            _tick(i, OPEN_NS + int((offset + i * step) * 1e9)),
+            now_mono=float(i),
+        )
     log.close()
 
     stream = _health(log).streams["BID_ASK"]
@@ -225,8 +353,8 @@ def test_late_start_and_early_finish_both_count_as_missing(tmp_path):
 
 
 def test_absent_required_stream_is_reported_per_stream(tmp_path):
-    log = RawEventLog(tmp_path, session=SESSION)
-    _dense(log, "BID_ASK", 1.0)
+    log = _MemoryLog()
+    _dense(log, "BID_ASK", DEFAULT_GAP_THRESHOLDS["BID_ASK"])
     log.close()
     health = _health(log, clock_skew_samples=[0.0])
     assert not health.ok()
@@ -236,8 +364,13 @@ def test_absent_required_stream_is_reported_per_stream(tmp_path):
 
 def test_health_detects_delayed_data(tmp_path):
     """Three months of delayed data voids every L2/L3 conclusion built on it."""
-    log = RawEventLog(tmp_path, session=SESSION)
-    _dense(log, "BID_ASK", 1.0, market_data_type="DELAYED")
+    log = _MemoryLog()
+    _dense(
+        log,
+        "BID_ASK",
+        DEFAULT_GAP_THRESHOLDS["BID_ASK"],
+        market_data_type="DELAYED",
+    )
     log.close()
     health = _health(log, clock_skew_samples=[0.0])
     assert not health.ok()
@@ -245,8 +378,13 @@ def test_health_detects_delayed_data(tmp_path):
 
 
 def test_health_does_not_hide_a_delayed_interval_behind_a_final_live_tick(tmp_path):
-    log = RawEventLog(tmp_path, session=SESSION)
-    _dense(log, "BID_ASK", 1.0, market_data_type="DELAYED")
+    log = _MemoryLog()
+    _dense(
+        log,
+        "BID_ASK",
+        DEFAULT_GAP_THRESHOLDS["BID_ASK"],
+        market_data_type="DELAYED",
+    )
     log.append(_tick(99999, OPEN_NS, market_data_type="LIVE"), now_mono=0.0)
     log.close()
     assert _health(log).market_data_type.startswith("MIXED:")
@@ -254,7 +392,7 @@ def test_health_does_not_hide_a_delayed_interval_behind_a_final_live_tick(tmp_pa
 
 def test_system_events_cannot_mask_a_market_data_gap(tmp_path):
     """A heartbeat is not a quote. SYSTEM rows must not fabricate availability."""
-    log = RawEventLog(tmp_path, session=SESSION)
+    log = _MemoryLog()
     log.append(_tick(0, OPEN_NS), now_mono=0.0)
     for i in range(100):                                   # heartbeats through the hole
         log.append(
@@ -272,21 +410,18 @@ def test_system_events_cannot_mask_a_market_data_gap(tmp_path):
 
 def test_health_surfaces_a_fatal_recorder_error(tmp_path):
     log = _clean_log(tmp_path)
-    reopened = RawEventLog(tmp_path, session=SESSION)
-    reopened.append(
+    log.append(
         _tick(1, OPEN_NS, event_type="SYSTEM",
               special_conditions="RECORDER_ERROR:RecorderPrerequisiteError:10197"),
         now_mono=0.0,
     )
-    reopened.close()
-    health = _health(reopened, clock_skew_samples=[0.0])
+    health = _health(log, clock_skew_samples=[0.0])
     assert not health.ok()
     assert any("10197" in p for p in health.problems())
-    assert log.session == reopened.session
 
 
 def test_intentional_close_is_not_a_disconnect(tmp_path):
-    log = RawEventLog(tmp_path, session=SESSION)
+    log = _MemoryLog()
     log.append(
         _tick(0, OPEN_NS, event_type="SYSTEM",
               special_conditions="CONNECTION_CLOSED_INTENTIONAL"),
@@ -489,7 +624,7 @@ def test_days_with_and_without_a_stream_still_concatenate(tmp_path):
 
 
 def test_finalize_writes_parquet_health_and_a_verified_manifest(tmp_path):
-    log = _clean_log(tmp_path)
+    log = _clean_disk_log(tmp_path)
     reopened = RawEventLog(tmp_path, session=SESSION)
     manifest = finalize_day(
         reopened, session_open=OPEN, session_close=CLOSE,
@@ -497,6 +632,10 @@ def test_finalize_writes_parquet_health_and_a_verified_manifest(tmp_path):
     )
     assert manifest["health_ok"] is True, manifest["problems"]
     assert manifest["parquet_rows_verified"] == manifest["rows"]
+    accounting = manifest["write_accounting"]
+    assert accounting["accepted"] == accounting["persisted"]
+    assert accounting["accepted_by_stream"] == accounting["persisted_by_stream"]
+    assert accounting["dropped"] == 0
     assert (reopened.dir / "events.parquet").exists()
     assert (reopened.dir / "health.json").exists()
     assert all(len(value) == 64 for value in manifest["files"].values())
