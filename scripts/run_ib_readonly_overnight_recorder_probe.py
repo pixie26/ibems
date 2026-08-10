@@ -194,6 +194,11 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 else None
             ),
             "market_data_types_in_raw_log": market_types,
+            # Counted inside the callback, before _append. Comparing this with
+            # the readback splits "the writer dropped it" from "it never
+            # arrived" -- two bounded runs recorded ~40% fewer BidAsk rows than
+            # the paired preflight, and one number cannot tell those apart.
+            "handler_counts": dict(sorted(recorder.handled_events.items())),
             "raw_event_count": len(rows),
             "stream_counts": {
                 "bid_ask": counts["BID_ASK"],
@@ -234,6 +239,18 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             stream_counts[name] > 0 for name in ("bid_ask", "all_last", "bars_5s")
         ),
         "raw_segment_present": bool(segments),
+        # A callback exception is caught by eventkit and logged, never raised,
+        # so `no_exception` alone cannot see a truncated tick buffer. The
+        # recorder now records it as a fatal prerequisite instead.
+        "no_swallowed_callback_failure": recorder._fatal_prerequisite_error is None,
+        "write_path_lost_nothing": all(
+            report["handler_counts"].get(event_type, 0) == written
+            for event_type, written in (
+                ("BID_ASK", stream_counts["bid_ask"]),
+                ("ALL_LAST", stream_counts["all_last"]),
+                ("BAR_5S", stream_counts["bars_5s"]),
+            )
+        ),
         "no_exception": exception is None,
         "no_fatal_market_data_error": not fatal_errors,
         "sample_window_complete": report["sample_seconds_observed"] >= args.sample_seconds,

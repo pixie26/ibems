@@ -27,6 +27,7 @@ from ib_execution.quote_recorder import (
     SubscriptionLimiter,
     compute_cross_stream_diagnostics,
     compute_health,
+    enforce_request_deadline,
     finalize_day,
     measure_clock_skew,
     parquet_schema,
@@ -622,6 +623,154 @@ def test_ticker_wiring_attaches_exactly_one_handler_per_buffer():
 def test_recorder_config_rejects_unknown_options():
     with pytest.raises(TypeError):
         QuoteRecorder("root", "SPY", nonexistent_option=1)
+
+
+class _FakeEvent:
+    def __init__(self):
+        self.handlers = []
+
+    def __iadd__(self, fn):
+        self.handlers.append(fn)
+        return self
+
+    def emit(self, *args):
+        for handler in list(self.handlers):
+            handler(*args)
+
+
+def _bidask_tick_missing_its_attrib_block():
+    """A real BidAsk tick whose attribute block is absent.
+
+    Shape, not prophecy: the point is that *any* exception from one tick used
+    to be swallowed by eventkit, taking the rest of that TCP update's buffer
+    with it.
+    """
+    from ib_async.objects import TickByTickBidAsk
+
+    return TickByTickBidAsk(
+        time=datetime(2026, 8, 10, 15, 0, tzinfo=timezone.utc),
+        bidPrice=1.0, askPrice=1.01, bidSize=1.0, askSize=1.0,
+        tickAttribBidAsk=None,                # -> AttributeError in the handler
+    )
+
+
+def test_a_swallowed_callback_exception_cannot_pass_as_a_complete_log(tmp_path):
+    """eventkit catches handler exceptions and continues. That must not be silent.
+
+    Without this, a handler that raises loses the remainder of the update's
+    tick buffer, the run keeps going, and the report says the stream was fine.
+    A short log claiming completeness is worse than a failed run.
+    """
+    pytest.importorskip("ib_async")
+
+    class FakeTicker:
+        def __init__(self):
+            self.updateEvent = _FakeEvent()
+            self.contract = type("C", (), {"conId": 756733})()
+            self.tickByTicks = [_bidask_tick_missing_its_attrib_block()]
+
+    rec = QuoteRecorder(tmp_path, "SPY")
+    rec.log = RawEventLog(tmp_path, session=SESSION, roll_seconds=300, run_id=rec.run_id)
+    ticker = FakeTicker()
+    rec._wire_ticker(ticker)
+
+    ticker.updateEvent.emit(ticker)          # eventkit-style: must not propagate
+
+    assert rec._fatal_prerequisite_error is not None
+    assert "tick-by-tick" in rec._fatal_prerequisite_error
+    rec.log.close()
+
+
+def test_a_bar_callback_exception_is_also_fail_closed(tmp_path):
+    pytest.importorskip("ib_async")
+
+    class FakeBars(list):
+        def __init__(self):
+            super().__init__([object()])      # a bar with no open_/high/low
+            self.updateEvent = _FakeEvent()
+            self.contract = type("C", (), {"conId": 756733})()
+
+    rec = QuoteRecorder(tmp_path, "SPY")
+    rec.log = RawEventLog(tmp_path, session=SESSION, roll_seconds=300, run_id=rec.run_id)
+    bars = FakeBars()
+    rec._wire_bars(bars)
+
+    bars.updateEvent.emit(bars, True)
+
+    assert rec._fatal_prerequisite_error is not None
+    assert "realtime-bar" in rec._fatal_prerequisite_error
+    rec.log.close()
+
+
+def test_handled_counts_are_taken_before_the_write_path(tmp_path):
+    """Locates loss on one side of _append.
+
+    Two independent bounded runs recorded ~40% fewer BidAsk rows than the
+    paired preflight over an equal window with identical subscription
+    parameters. A callback-side counter is what makes "the writer dropped it"
+    and "it never arrived" different observations instead of one number.
+    """
+    pytest.importorskip("ib_async")
+    from ib_async.objects import TickByTickAllLast
+
+    class FakeTicker:
+        def __init__(self, ticks):
+            self.updateEvent = _FakeEvent()
+            self.contract = type("C", (), {"conId": 756733})()
+            self.tickByTicks = ticks
+
+    trade = TickByTickAllLast(
+        time=datetime(2026, 8, 10, 15, 0, tzinfo=timezone.utc),
+        tickType=0, price=500.0, size=1.0, tickAttribLast=None,
+        exchange="ARCA", specialConditions="",
+    )
+    rec = QuoteRecorder(tmp_path, "SPY")
+    rec.log = RawEventLog(tmp_path, session=SESSION, roll_seconds=300, run_id=rec.run_id)
+    ticker = FakeTicker([trade, trade])
+    rec._wire_ticker(ticker)
+
+    ticker.updateEvent.emit(ticker)
+    rec.log.close()
+
+    assert rec.handled_events["ALL_LAST"] == 2
+    rows = list(rec.log.read_all())
+    assert sum(1 for row in rows if row["event_type"] == "ALL_LAST") == 2
+    assert rec._fatal_prerequisite_error is None
+
+
+def test_a_zero_request_deadline_is_refused_because_ib_reads_it_as_forever():
+    class FakeIB:
+        RequestTimeout = 0
+
+    ib = FakeIB()
+    assert enforce_request_deadline(ib, 10.0) == 10.0
+    assert ib.RequestTimeout == 10.0
+    with pytest.raises(ValueError):
+        enforce_request_deadline(ib, 0)
+
+
+def test_the_recorder_itself_binds_the_request_deadline():
+    """The deadline must belong to the recorder, not to the test harness.
+
+    Every read-only probe set ``ib.RequestTimeout`` itself, which is why no
+    probe ever hung on the missing ``currentTime`` callback that a real Gateway
+    was observed producing. Production code that forgets it waits forever, and
+    the thing that blocks is the only event loop there is.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from ib_execution import quote_recorder
+
+    source = textwrap.dedent(inspect.getsource(quote_recorder.QuoteRecorder.run))
+    tree = ast.parse(source)
+    called = {
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert "enforce_request_deadline" in called
 
 
 def test_stream_health_replace_keeps_dataclass_contract(tmp_path):

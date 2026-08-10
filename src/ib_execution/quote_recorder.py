@@ -848,6 +848,30 @@ class SessionRolloverError(RuntimeError):
 
 
 CLOCK_REQUEST_MIN_INTERVAL_SECONDS = 1.1
+REQUEST_DEADLINE_SECONDS = 10.0
+
+
+def enforce_request_deadline(ib, seconds: float = REQUEST_DEADLINE_SECONDS) -> float:
+    """Bound every blocking ib_async request. Fail-closed prerequisite.
+
+    ``IB.RequestTimeout`` defaults to ``0``, and ib_async spells ``0`` as "wait
+    forever": ``IB._run`` forwards it straight to ``util.run(..., timeout=...)``.
+    Every blocking call resolves a future that only a broker callback completes,
+    and a real Gateway has been *directly observed* omitting the ``currentTime``
+    callback when requests were paced 0.2s apart.
+
+    Pacing lowers the trigger rate; it does not bound the wait. An unbounded
+    wait is the worst possible failure shape here, because the thing that
+    blocks is the single event loop -- so the recorder stops reading market
+    data, stops running its own health checks, and still looks connected. There
+    is nothing left running that could notice. Every read-only probe set this
+    attribute itself, which is exactly why no probe ever hung; the deadline
+    therefore belonged to the harness rather than to the code under test.
+    """
+    if seconds <= 0:
+        raise ValueError("request deadline must be positive; ib_async reads 0 as 'wait forever'")
+    ib.RequestTimeout = float(seconds)
+    return float(seconds)
 
 
 def measure_clock_skew(
@@ -893,6 +917,7 @@ class RecorderConfig:
     short_window_seconds: float = 900.0
     short_reconnect_limit: int = 5
     session_reconnect_limit: int = 20
+    request_deadline_seconds: float = REQUEST_DEADLINE_SECONDS
 
 
 class QuoteRecorder:
@@ -938,6 +963,28 @@ class QuoteRecorder:
         )
         self._session_key: Optional[str] = None
         self._wired: set[int] = set()
+        # Counted in the callback, before the write path. A readback that
+        # disagrees with these locates the loss on one side of _append.
+        self.handled_events: dict[str, int] = {}
+
+    def _note_handled(self, event_type: str) -> None:
+        self.handled_events[event_type] = self.handled_events.get(event_type, 0) + 1
+
+    def _handler_failed(self, stream: str, exc: BaseException) -> None:
+        """A market-data callback raised. That is fatal, not a log line.
+
+        These handlers run inside eventkit's dispatch, which catches every
+        exception and either forwards it to an unwired ``error_event`` or calls
+        ``logger.exception`` -- then continues. So an exception silently drops
+        the rest of that TCP update's tick buffer and the run still finishes
+        reporting success. A short log that claims to be complete is worse than
+        a failed run, so record it as a fatal prerequisite failure; the run loop
+        and the bounded probes already poll this field.
+        """
+        if self._fatal_prerequisite_error is None:
+            self._fatal_prerequisite_error = (
+                f"{stream} callback raised {type(exc).__name__}: {exc}"
+            )
 
     @staticmethod
     def _is_fatal_market_data_error(code: int, message: str) -> bool:
@@ -1003,23 +1050,28 @@ class QuoteRecorder:
         from ib_async.objects import TickByTickAllLast, TickByTickBidAsk
 
         def on_update(updated) -> None:
-            for tick in updated.tickByTicks:
-                if isinstance(tick, TickByTickBidAsk):
-                    self._append(
-                        "BID_ASK", tick.time, contract_id=updated.contract.conId,
-                        bid=float(tick.bidPrice), ask=float(tick.askPrice),
-                        bid_size=float(tick.bidSize), ask_size=float(tick.askSize),
-                        special_conditions=(
-                            f"bidPastLow={tick.tickAttribBidAsk.bidPastLow};"
-                            f"askPastHigh={tick.tickAttribBidAsk.askPastHigh}"
-                        ),
-                    )
-                elif isinstance(tick, TickByTickAllLast):
-                    self._append(
-                        "ALL_LAST", tick.time, contract_id=updated.contract.conId,
-                        last=float(tick.price), last_size=float(tick.size),
-                        exchange=tick.exchange, special_conditions=tick.specialConditions,
-                    )
+            try:
+                for tick in updated.tickByTicks:
+                    if isinstance(tick, TickByTickBidAsk):
+                        self._note_handled("BID_ASK")
+                        self._append(
+                            "BID_ASK", tick.time, contract_id=updated.contract.conId,
+                            bid=float(tick.bidPrice), ask=float(tick.askPrice),
+                            bid_size=float(tick.bidSize), ask_size=float(tick.askSize),
+                            special_conditions=(
+                                f"bidPastLow={tick.tickAttribBidAsk.bidPastLow};"
+                                f"askPastHigh={tick.tickAttribBidAsk.askPastHigh}"
+                            ),
+                        )
+                    elif isinstance(tick, TickByTickAllLast):
+                        self._note_handled("ALL_LAST")
+                        self._append(
+                            "ALL_LAST", tick.time, contract_id=updated.contract.conId,
+                            last=float(tick.price), last_size=float(tick.size),
+                            exchange=tick.exchange, special_conditions=tick.specialConditions,
+                        )
+            except Exception as exc:  # eventkit would swallow this
+                self._handler_failed("tick-by-tick", exc)
 
         ticker.updateEvent += on_update
 
@@ -1027,13 +1079,17 @@ class QuoteRecorder:
         def on_bar(updated, has_new_bar) -> None:
             if not has_new_bar or not updated:
                 return
-            bar = updated[-1]
-            self._append(
-                "BAR_5S", bar.time, contract_id=updated.contract.conId,
-                open=float(bar.open_), high=float(bar.high), low=float(bar.low),
-                close=float(bar.close), volume=float(bar.volume), wap=float(bar.wap),
-                trade_count=int(bar.count),
-            )
+            try:
+                bar = updated[-1]
+                self._note_handled("BAR_5S")
+                self._append(
+                    "BAR_5S", bar.time, contract_id=updated.contract.conId,
+                    open=float(bar.open_), high=float(bar.high), low=float(bar.low),
+                    close=float(bar.close), volume=float(bar.volume), wap=float(bar.wap),
+                    trade_count=int(bar.count),
+                )
+            except Exception as exc:  # eventkit would swallow this
+                self._handler_failed("realtime-bar", exc)
 
         bars.updateEvent += on_bar
 
@@ -1087,6 +1143,7 @@ class QuoteRecorder:
         session = None
         while True:
             ib = IB()
+            enforce_request_deadline(ib, cfg.request_deadline_seconds)
             self._fatal_prerequisite_error = None
             self._intentional_disconnect = False
             try:
