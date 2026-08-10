@@ -167,19 +167,26 @@ def ready_for_freeze() -> bool:
     return not open_requirements()
 
 
-def as_state(signed_off_commit: Optional[str] = None) -> dict[str, Any]:
+def as_state(
+    signed_off_commit: Optional[str] = None,
+    attested_freeze_commit: Optional[str] = None,
+) -> dict[str, Any]:
     """Derive the Gate section of STATE.json.
 
     ``signed_off_commit`` is itself derived by ``attestation`` from the exact
-    freeze owner acceptance, durable evidence snapshot and Git history. Passing
-    an attestation cannot override an incomplete registry.
+    freeze owner acceptance, durable evidence snapshot and Git history *and*
+    means that attestation still covers the current worktree.  The separate
+    ``attested_freeze_commit`` is the monotonic historical fact that the exact
+    freeze passed at its metadata-only attestation commit.  Passing either
+    value cannot override an incomplete current requirement registry.
     """
-    passed = signed_off_commit is not None and ready_for_freeze()
+    covers_worktree = signed_off_commit is not None and ready_for_freeze()
     return {
-        "gate_b1": "PASS" if passed else "NOT_PASSED",
-        "gate_b2": "NOT_STARTED",
+        "gate_b1_attested_freeze": attested_freeze_commit,
+        "gate_b1_covers_worktree": covers_worktree,
+        "gate_b2": "READ_ONLY_IN_PROGRESS",
+        "order_authorization": "NONE",
         "trading_adapter": "NOT_IMPLEMENTED",
-        "signed_off_commit": signed_off_commit if passed else None,
         "ready_for_freeze": ready_for_freeze(),
         "requirements": [asdict(r) for r in B1_REQUIREMENTS],
     }

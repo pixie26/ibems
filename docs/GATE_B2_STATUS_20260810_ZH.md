@@ -33,20 +33,26 @@
 | Gateway 存活时受控外网中断 | 已完成，空状态限定 | 观察到真实 `1100 -> 1102`；恢复后 server time 与 snapshot 完成 | 没有观察到 1101；不证明动态订单 callback |
 | SPY overnight 三路行情 / Recorder | 已完成 | 正确 `OVERNIGHT` route：preflight `1620/13/25`；落盘 Recorder `923/16/25`，两轮均 PASS | 只证明 overnight；不是 RTH 或 Full-RTH health report |
 | SPY RTH BidAsk / AllLast / 5s bars / Recorder | 已完成 | preflight 120.109 秒 `25665/3168/25`；Recorder 120.360 秒落盘 `15590/2843/25`，均为 LIVE | bounded 两分钟证据；不是 Full-RTH 全日 health |
+| RTH handler→raw readback 一致性 | 已完成 | 2026-08-11 `8972/1707/25` handler counts 与 raw readback 逐项相等 | 只关闭该窗口 handler 后写路径丢失；callback 前差异仍需同步 A/B |
 | 非空动态 reconciliation | 未完成 | 当前没有仓位、挂单或成交事实 | 需要另行授权 paper-order 子阶段 |
 | `orderId / permId / clientId / orderRef` | 未完成 | 尚未产生真实订单身份事实 | 需要另行授权 paper-order 子阶段 |
 | submit / ack / modify / cancel / fill / commission / late callback | 未完成 | 订单路径没有运行 | 不属于当前只读轮次 |
 
-## 3. “周末还能不能继续测”的结论
+## 3. 只读实测的剩余边界（2026-08-11 复核）
 
-在当前安全边界下，**没有发现一个明显的、现在即可安全实测但被遗漏的关键周末 Gateway 场景**。当前不能继续完成的项目均有明确原因：
+原轮次遗漏了一个高价值只读场景：外网中断 probe 没有持有行情订阅，因此没有覆盖
+“连接恢复但既有订阅已失效”的静默失败族。后续仍保持零 broker write，但应在活跃行情期间
+持有三路订阅，直接记录 recovery code、per-stream staleness 和 resubscribe 结果。改进 probe
+已实现但尚未执行；它也不等于 production `QuoteRecorder.run()` 的真实 fault 验证。
 
 1. `completed orders` 被 Gateway Read-Only policy 阻断；继续需要降低保护，不接受。
 2. overnight 与 RTH bounded 行情均已完成；仍未运行 Full-RTH 全日 health。
-3. 1101 不应通过反复断网碰运气；后续可在活跃行情订阅期间观察，但不得从已观察的 1102 推断 1101。
+3. 不应反复断网碰运气；持订阅实验也不得预设必得 1101。官方语义只支持按实际结果区分
+   1101（requests lost，需要重订阅）与 1102（requests recovered），不得互相推断。
 4. 非空 broker facts、订单身份、cross-client order visibility 和订单 callback 必须先获得 paper-order 独立授权。
 
-现在仍可开展官方文档复核、证据索引整理、代码审查和 freeze 准备；这些属于技术审查，不是新的 Gateway 行为实测。
+现在仍可开展官方文档复核、证据索引整理、代码审查和 freeze 准备；持订阅 fault injection
+虽不产生订单，但会中断 Gateway 外网连接，执行前仍应由 operator 单独确认窗口。
 
 ## 4. 已封存的本地证据索引
 
@@ -66,6 +72,7 @@
 | SPY RTH v1（10197，失败证据） | `artifacts/ib_preflight/20260810_b2_rth_market_v1/report.json` | `db640ef3fec57adadac81426b314afcc0cc28ef31cb70f9243ab9d3989d34143` |
 | SPY RTH preflight v2 | `artifacts/ib_preflight/20260810_b2_rth_market_v2/report.json` | `204c979b8c29670a33dfdba111e704f51d6971dddc6989b4214ac0e8ad914c1b` |
 | SPY RTH bounded Recorder | `artifacts/ib_preflight/20260810_b2_rth_recorder_v1/report.json` | `86de43714c1d9fa1f515d01ddc126589b11e1634ff23f1ef57ca439cfa9a543d` |
+| SPY RTH handler-count Recorder | `artifacts/ib_preflight/20260811_b2_rth_recorder_handler_counts_v1/report.json` | `0cb4c95b86d39e054b3c384bf8a225958609cf4c5dff167b49177ed9c4e02edc` |
 
 上述是本地 evidence bundle；网络中断目录的 `SHA256SUMS` 已复核。当前工作树仍有未提交的 B2 脚本和文档修改，因此这里的“封存”表示证据文件及其 digest 已保存，**不表示 B2 已形成最终 Git exact-freeze**。
 

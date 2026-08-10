@@ -37,6 +37,17 @@ class Attestation:
     evidence_sha256: str
 
 
+@dataclass(frozen=True)
+class HistoricalAttestation:
+    """An exact-freeze attestation that was valid at an ancestor commit."""
+
+    freeze_commit: str
+    attestation_commit: str
+    signoff_path: str
+    evidence_path: str
+    evidence_sha256: str
+
+
 def _git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", "-C", str(root), *args],
@@ -44,6 +55,15 @@ def _git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
         text=True,
         timeout=30,
     )
+
+
+def _git_blob(root: Path, ref: str, path: str) -> Optional[bytes]:
+    result = subprocess.run(
+        ["git", "-C", str(root), "show", f"{ref}:{path}"],
+        capture_output=True,
+        timeout=30,
+    )
+    return result.stdout if result.returncode == 0 else None
 
 
 def _table_value(text: str, field: str) -> str:
@@ -55,12 +75,7 @@ def _table_value(text: str, field: str) -> str:
     return match.group(1).strip() if match else ""
 
 
-def _config_scalar(root: Path, key: str) -> str:
-    """Read one simple scalar from the frozen example risk config."""
-    try:
-        text = (root / "config" / "risk.example.yml").read_text(encoding="utf-8")
-    except OSError:
-        return ""
+def _config_scalar_text(text: str, key: str) -> str:
     match = re.search(rf"^{re.escape(key)}:\s*([^#\n]+?)\s*(?:#.*)?$", text, re.MULTILINE)
     return match.group(1).strip() if match else ""
 
@@ -101,12 +116,7 @@ def _changed_worktree_paths(root: Path) -> Optional[set[str]]:
     return changed
 
 
-def _evidence_is_valid(path: Path, freeze: str) -> bool:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-
+def _evidence_data_is_valid(data: dict, freeze: str) -> bool:
     if data.get("schema_version") != 1 or data.get("freeze_commit") != freeze:
         return False
     workflow = data.get("workflow", {})
@@ -229,24 +239,22 @@ def _evidence_is_valid(path: Path, freeze: str) -> bool:
     return True
 
 
-def validate(root: Path, freeze: str) -> Optional[Attestation]:
-    """Return the valid owner attestation for ``freeze`` or ``None``."""
-    if not HEX40.fullmatch(freeze):
-        return None
-    signoff, evidence = paths_for(root, freeze)
-    if not signoff.exists() or not evidence.exists() or not _evidence_is_valid(evidence, freeze):
-        return None
-
-    text = signoff.read_text(encoding="utf-8")
+def _signoff_is_valid(
+    text: str,
+    evidence_bytes: bytes,
+    evidence_data: dict,
+    risk_config_text: str,
+    freeze: str,
+) -> bool:
     if _table_value(text, "`commit_sha`") != freeze:
-        return None
+        return False
 
     owner = _table_value(text, "Owner")
     accepted_at = _table_value(text, "Accepted at (UTC)")
     if not owner or owner in {"—", "TBD"}:
-        return None
+        return False
     if not accepted_at or accepted_at in {"—", "TBD"}:
-        return None
+        return False
 
     required_owner_decisions = {
         "B1 scope acceptance": "ACCEPT",
@@ -258,32 +266,55 @@ def validate(root: Path, freeze: str) -> Optional[Attestation]:
     }
     for field, expected in required_owner_decisions.items():
         if _table_value(text, field).strip("`") != expected:
-            return None
+            return False
 
-    # The owner explicitly accepted the current five-share SPY maximum. The
-    # 15% stress and $500 budget are recorded frozen mechanism parameters, not
-    # overclaimed as separately derived human judgements. All three still bind
-    # the sign-off to the exact risk configuration and force re-review on change.
     frozen_risk = {
-        "Accepted max_position_shares": _config_scalar(root, "max_position_shares"),
-        "Recorded overnight_gap_stress_pct": _config_scalar(root, "overnight_gap_stress_pct"),
-        "Recorded max_overnight_loss": _config_scalar(root, "max_overnight_loss"),
+        "Accepted max_position_shares": _config_scalar_text(
+            risk_config_text, "max_position_shares"
+        ),
+        "Recorded overnight_gap_stress_pct": _config_scalar_text(
+            risk_config_text, "overnight_gap_stress_pct"
+        ),
+        "Recorded max_overnight_loss": _config_scalar_text(
+            risk_config_text, "max_overnight_loss"
+        ),
     }
     if not all(frozen_risk.values()):
-        return None
+        return False
     for field, expected in frozen_risk.items():
         if _table_value(text, field).strip("`") != expected:
-            return None
+            return False
 
-    evidence_hash = sha256_file(evidence)
+    evidence_hash = hashlib.sha256(evidence_bytes).hexdigest()
     if _table_value(text, "Evidence snapshot sha256") != evidence_hash:
-        return None
-    data = json.loads(evidence.read_text(encoding="utf-8"))
-    workflow = data["workflow"]
+        return False
+    workflow = evidence_data["workflow"]
     if _table_value(text, "Freeze campaign run") != str(workflow["run_id"]):
-        return None
+        return False
     if _table_value(text, "Freeze artifact digest") != workflow["artifact_digest"]:
+        return False
+    return True
+
+
+def validate(root: Path, freeze: str) -> Optional[Attestation]:
+    """Return the valid owner attestation for ``freeze`` or ``None``."""
+    if not HEX40.fullmatch(freeze):
         return None
+    signoff, evidence = paths_for(root, freeze)
+    if not signoff.exists() or not evidence.exists():
+        return None
+    try:
+        text = signoff.read_text(encoding="utf-8")
+        evidence_bytes = evidence.read_bytes()
+        data = json.loads(evidence_bytes.decode("utf-8"))
+        risk_text = (root / "config" / "risk.example.yml").read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not _evidence_data_is_valid(data, freeze):
+        return None
+    if not _signoff_is_valid(text, evidence_bytes, data, risk_text, freeze):
+        return None
+    evidence_hash = hashlib.sha256(evidence_bytes).hexdigest()
 
     head = _git(root, "rev-parse", "HEAD")
     if head.returncode != 0:
@@ -334,3 +365,125 @@ def derive_signed_off_commit(root: Path) -> Optional[str]:
     if len(unique) > 1:
         raise RuntimeError(f"multiple valid Gate B1 attestations: {unique}")
     return unique[0] if unique else None
+
+
+def validate_historical(root: Path, freeze: str) -> Optional[HistoricalAttestation]:
+    """Validate a B1 attestation at the metadata-only commit that recorded it.
+
+    Unlike :func:`validate`, this intentionally permits later behavior commits.
+    It reads the sign-off, evidence and risk configuration from Git objects at
+    their historical refs, so a later checkout cannot rewrite the historical
+    fact and Windows line-ending conversion cannot change the evidence hash.
+    The current worktree-coverage question remains exclusively owned by
+    :func:`validate`.
+    """
+    if not HEX40.fullmatch(freeze):
+        return None
+    signoff, evidence = paths_for(root, freeze)
+    signoff_rel = signoff.relative_to(root).as_posix()
+    evidence_rel = evidence.relative_to(root).as_posix()
+
+    candidates = _git(
+        root,
+        "log",
+        "--format=%H",
+        "--diff-filter=A",
+        "--",
+        signoff_rel,
+    )
+    if candidates.returncode != 0:
+        return None
+
+    for attestation_commit in candidates.stdout.splitlines():
+        if not HEX40.fullmatch(attestation_commit):
+            continue
+        if _git(root, "merge-base", "--is-ancestor", freeze, attestation_commit).returncode:
+            continue
+        if _git(root, "merge-base", "--is-ancestor", attestation_commit, "HEAD").returncode:
+            continue
+        diff = _git(root, "diff", "--name-only", f"{freeze}..{attestation_commit}")
+        if diff.returncode != 0:
+            continue
+        committed = {line for line in diff.stdout.splitlines() if line}
+        if not {signoff_rel, evidence_rel} <= committed:
+            continue
+        if not committed <= allowed_attestation_paths(root, freeze):
+            continue
+
+        signoff_bytes = _git_blob(root, attestation_commit, signoff_rel)
+        evidence_bytes = _git_blob(root, attestation_commit, evidence_rel)
+        risk_bytes = _git_blob(root, freeze, "config/risk.example.yml")
+        if signoff_bytes is None or evidence_bytes is None or risk_bytes is None:
+            continue
+        try:
+            text = signoff_bytes.decode("utf-8")
+            data = json.loads(evidence_bytes.decode("utf-8"))
+            risk_text = risk_bytes.decode("utf-8")
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not _evidence_data_is_valid(data, freeze):
+            continue
+        if not _signoff_is_valid(text, evidence_bytes, data, risk_text, freeze):
+            continue
+        return HistoricalAttestation(
+            freeze_commit=freeze,
+            attestation_commit=attestation_commit,
+            signoff_path=signoff_rel,
+            evidence_path=evidence_rel,
+            evidence_sha256=hashlib.sha256(evidence_bytes).hexdigest(),
+        )
+    return None
+
+
+def derive_historical_attested_freeze(root: Path) -> Optional[HistoricalAttestation]:
+    """Return the latest ancestor B1 freeze that was validly attested."""
+    tree = _git(root, "ls-tree", "-r", "--name-only", "HEAD", "docs")
+    if tree.returncode != 0:
+        return None
+    records: list[HistoricalAttestation] = []
+    for name in tree.stdout.splitlines():
+        match = re.fullmatch(rf"docs/{SIGNOFF_PREFIX}([0-9a-f]{{12}})\.md", name)
+        if match is None:
+            continue
+        blob = _git_blob(root, "HEAD", name)
+        if blob is None:
+            continue
+        try:
+            freeze = _table_value(blob.decode("utf-8"), "`commit_sha`")
+        except UnicodeDecodeError:
+            continue
+        if not freeze.startswith(match.group(1)):
+            continue
+        record = validate_historical(root, freeze)
+        if record is not None:
+            records.append(record)
+    unique = {record.freeze_commit: record for record in records}
+    if not unique:
+        return None
+    if len(unique) == 1:
+        return next(iter(unique.values()))
+
+    # Multiple accepted freezes are allowed over the life of the repository,
+    # but HEAD must induce one unambiguous latest attestation.
+    latest = [
+        candidate
+        for candidate in unique.values()
+        if all(
+            other.attestation_commit == candidate.attestation_commit
+            or _git(
+                root,
+                "merge-base",
+                "--is-ancestor",
+                other.attestation_commit,
+                candidate.attestation_commit,
+            ).returncode
+            == 0
+            for other in unique.values()
+        )
+    ]
+    if len(latest) != 1:
+        raise RuntimeError(
+            "multiple incomparable historical Gate B1 attestations: "
+            f"{sorted(unique)}"
+        )
+    return latest[0]

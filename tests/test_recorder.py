@@ -22,6 +22,7 @@ from ib_execution.quote_recorder import (
     QuoteRecorder,
     RawEventLog,
     RawTick,
+    RecorderPrerequisiteError,
     ReconnectBudget,
     ReconnectBudgetExhausted,
     SubscriptionLimiter,
@@ -678,6 +679,8 @@ def test_a_swallowed_callback_exception_cannot_pass_as_a_complete_log(tmp_path):
 
     assert rec._fatal_prerequisite_error is not None
     assert "tick-by-tick" in rec._fatal_prerequisite_error
+    with pytest.raises(RecorderPrerequisiteError, match="tick-by-tick callback raised"):
+        rec._raise_if_fatal_error()
     rec.log.close()
 
 
@@ -771,6 +774,27 @@ def test_the_recorder_itself_binds_the_request_deadline():
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
     }
     assert "enforce_request_deadline" in called
+
+
+def test_the_production_loop_polls_callback_failures():
+    """Storing an eventkit-swallowed error is insufficient without this poll."""
+    import ast
+    import inspect
+    import textwrap
+
+    from ib_execution import quote_recorder
+
+    source = textwrap.dedent(inspect.getsource(quote_recorder.QuoteRecorder.run))
+    tree = ast.parse(source)
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_raise_if_fatal_error"
+    ]
+    # One poll protects the pre-session wait and one protects active capture.
+    assert len(calls) >= 2
 
 
 def test_stream_health_replace_keeps_dataclass_contract(tmp_path):

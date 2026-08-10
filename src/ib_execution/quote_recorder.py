@@ -986,6 +986,19 @@ class QuoteRecorder:
                 f"{stream} callback raised {type(exc).__name__}: {exc}"
             )
 
+    def _raise_if_fatal_error(self) -> None:
+        """Turn callback state into control flow on the recorder loop.
+
+        Event handlers cannot safely raise through eventkit because its
+        dispatcher catches handler exceptions.  Merely storing the failure is
+        not fail-closed either: the production loop must observe the stored
+        state and stop the run.  Keeping this check in one method makes that
+        contract testable and keeps entitlement and data-integrity failures on
+        the same non-retryable path.
+        """
+        if self._fatal_prerequisite_error is not None:
+            raise RecorderPrerequisiteError(self._fatal_prerequisite_error)
+
     @staticmethod
     def _is_fatal_market_data_error(code: int, message: str) -> bool:
         """Recognize entitlement failures across IB's localized messages."""
@@ -1100,11 +1113,9 @@ class QuoteRecorder:
         probe.marketDataType = 0  # distinguish an actual callback from ib_async's default
         deadline = time.monotonic() + 10.0
         while int(probe.marketDataType) == 0 and time.monotonic() < deadline:
-            if self._fatal_prerequisite_error:
-                raise RecorderPrerequisiteError(self._fatal_prerequisite_error)
+            self._raise_if_fatal_error()
             ib.sleep(0.10)
-        if self._fatal_prerequisite_error:
-            raise RecorderPrerequisiteError(self._fatal_prerequisite_error)
+        self._raise_if_fatal_error()
         observed = int(probe.marketDataType)
         self._market_data_type = self.DATA_TYPE.get(observed, f"UNKNOWN:{observed}")
         self._append(
@@ -1214,6 +1225,7 @@ class QuoteRecorder:
                     if not cfg.wait_for_rth:
                         raise RuntimeError("RTH has not started and wait_for_rth is false")
                     ib.sleep(min(1.0, (session.start - datetime.now(session.start.tzinfo)).total_seconds()))
+                    self._raise_if_fatal_error()
 
                 probe, _tickers, bars = self._subscribe(ib, contract)
                 last_mdt = None
@@ -1222,6 +1234,10 @@ class QuoteRecorder:
                     if not ib.isConnected():
                         raise ConnectionError("IB disconnected during RTH")
                     ib.sleep(0.25)
+                    # eventkit catches callback exceptions.  The callback
+                    # records them; this loop must turn that state into the
+                    # non-retryable/finalized failure path.
+                    self._raise_if_fatal_error()
                     mdt = int(probe.marketDataType)
                     if mdt != last_mdt:
                         self._market_data_type = self.DATA_TYPE.get(mdt, f"UNKNOWN:{mdt}")

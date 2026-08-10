@@ -1,9 +1,9 @@
-"""Bounded, broker-write-free OVERNIGHT probe through the real Recorder path.
+"""Bounded, broker-write-free session probe through the real Recorder path.
 
 This is deliberately not a Full-RTH health run.  It reuses QuoteRecorder's
 three subscriptions, event handlers and RawEventLog, but records for a bounded
-window on IB's explicit OVERNIGHT destination.  The report must never be used
-as evidence of RTH coverage.
+window on an explicit, mechanically validated RTH/SMART or
+OVERNIGHT/OVERNIGHT route. It is never a Full-RTH health report.
 """
 
 from __future__ import annotations
@@ -262,17 +262,28 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Bounded read-only OVERNIGHT trial through QuoteRecorder"
+        description="Bounded read-only session trial through QuoteRecorder"
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=4002)
     parser.add_argument("--client-id", type=int, default=945)
     parser.add_argument("--symbol", default="SPY")
+    parser.add_argument("--session-label", choices=("RTH", "OVERNIGHT"), default="OVERNIGHT")
+    parser.add_argument("--market-data-exchange", default=None)
     parser.add_argument("--sample-seconds", type=float, default=120.0)
     parser.add_argument("--request-timeout", type=float, default=10.0)
     parser.add_argument("--raw-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    expected_exchange = "SMART" if args.session_label == "RTH" else "OVERNIGHT"
+    if args.market_data_exchange is None:
+        args.market_data_exchange = expected_exchange
+    elif args.market_data_exchange.upper() != expected_exchange:
+        parser.error(
+            f"{args.session_label} requires --market-data-exchange {expected_exchange}"
+        )
+    else:
+        args.market_data_exchange = args.market_data_exchange.upper()
     if args.sample_seconds <= 0:
         parser.error("--sample-seconds must be greater than zero")
     if args.request_timeout <= 0:

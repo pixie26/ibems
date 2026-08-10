@@ -25,6 +25,9 @@ def _init_repo(root: Path) -> str:
     _git(root, "init")
     _git(root, "config", "user.email", "gate-test@example.invalid")
     _git(root, "config", "user.name", "Gate Test")
+    # Exact-freeze evidence hashes committed bytes.  Do not let a developer's
+    # global Windows autocrlf setting silently rewrite the fixture on add.
+    _git(root, "config", "core.autocrlf", "false")
     (root / "README.md").write_text("freeze\n", encoding="utf-8")
     config = root / "config" / "risk.example.yml"
     config.parent.mkdir(parents=True)
@@ -186,8 +189,8 @@ def test_pass_is_derived_and_survives_state_regeneration(tmp_path: Path):
     provenance.write_state(tmp_path)
     first = provenance.load_state(tmp_path)
     assert first is not None
-    assert first["gate_status"]["gate_b1"] == "PASS"
-    assert first["gate_status"]["signed_off_commit"] == freeze
+    assert first["gate_status"]["gate_b1_covers_worktree"] is True
+    assert first["gate_status"]["gate_b1_attested_freeze"] is None
 
     _git(
         tmp_path,
@@ -201,8 +204,11 @@ def test_pass_is_derived_and_survives_state_regeneration(tmp_path: Path):
     provenance.write_state(tmp_path)
     second = provenance.load_state(tmp_path)
     assert second is not None
-    assert second["gate_status"]["gate_b1"] == "PASS"
-    assert second["gate_status"]["signed_off_commit"] == freeze
+    assert second["gate_status"]["gate_b1_covers_worktree"] is True
+    assert second["gate_status"]["gate_b1_attested_freeze"] == freeze
+    historical = attestation.derive_historical_attested_freeze(tmp_path)
+    assert historical is not None
+    assert historical.freeze_commit == freeze
     assert provenance.stale_fields(tmp_path) == {}
 
 
@@ -226,14 +232,14 @@ def test_any_behavior_commit_after_attestation_invalidates_old_pass(tmp_path: Pa
     _git(tmp_path, "commit", "-m", "change behavior")
 
     stale = provenance.stale_fields(tmp_path)
-    assert stale["gate_status.gate_b1"] == ("PASS", "NOT_PASSED")
-    assert stale["gate_status.signed_off_commit"] == (freeze, None)
+    assert stale["gate_status.gate_b1_covers_worktree"] == (True, False)
+    assert stale["gate_status.gate_b1_attested_freeze"] == (None, freeze)
 
     provenance.write_state(tmp_path)
     state = provenance.load_state(tmp_path)
     assert state is not None
-    assert state["gate_status"]["gate_b1"] == "NOT_PASSED"
-    assert state["gate_status"]["signed_off_commit"] is None
+    assert state["gate_status"]["gate_b1_covers_worktree"] is False
+    assert state["gate_status"]["gate_b1_attested_freeze"] == freeze
 
 
 def test_bad_evidence_hash_cannot_derive_pass(tmp_path: Path):

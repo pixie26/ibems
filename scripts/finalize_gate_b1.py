@@ -85,14 +85,14 @@ def main(argv: list[str] | None = None) -> int:
 
     provenance.write_state(ROOT)
     state = provenance.load_state(ROOT)
-    if state is None or state["gate_status"].get("gate_b1") != "PASS":
-        raise SystemExit("derived provenance did not produce Gate B1 PASS")
-    if state["gate_status"].get("signed_off_commit") != freeze:
-        raise SystemExit("derived provenance signed_off_commit does not match freeze")
+    if state is None or state["gate_status"].get("gate_b1_covers_worktree") is not True:
+        raise SystemExit("derived provenance does not cover the attestation worktree")
+    if attestation.derive_signed_off_commit(ROOT) != freeze:
+        raise SystemExit("derived worktree attestation does not match freeze")
 
     print(f"validated owner acceptance: {signoff.relative_to(ROOT)}")
     print(f"validated durable evidence: {evidence.relative_to(ROOT)}")
-    print("regenerated STATE.json with derived Gate B1 PASS")
+    print("regenerated STATE.json with Gate B1 current-worktree coverage")
     print("commit ONLY STATE.json + sign-off + evidence snapshot as the attestation commit")
     return 0
 

@@ -14,15 +14,16 @@ DO NOT CONNECT THE TRADING ADAPTER TO IB PAPER OR LIVE
 上面的代码块是该工程记录创建时的历史标签，不是当前 Gate 判定。当前标签为：
 
 ```text
-Gate B1 owner acceptance recorded at exact-freeze commit 117188cea539...
-That attestation covers 117188cea539 only; the current worktree has B2
-changes after it, so STATE.json derives gate_b1 = NOT_PASSED for HEAD
+Gate B1 PASS recorded for exact-freeze commit 117188cea539...
+STATE.json: gate_b1_attested_freeze = 117188cea539...
+STATE.json: gate_b1_covers_worktree = false for current B2 HEAD
 Gate B2 READ-ONLY IN PROGRESS; NOT PASS
 NO PAPER-ORDER OR LIVE-ORDER AUTHORIZATION
 ```
 
-`gate_b1` 的两个不同问题（「在某个 freeze 上通过过吗」与「当前树被覆盖吗」）目前挤在
-同一个字段里；建议的字段拆分见 [`GATE_B2_REVIEW_20260810.md`](GATE_B2_REVIEW_20260810.md) §4。
+两项分别从历史 Git attestation blob 与当前 `attestation.validate` 派生；当前树不被 B1
+attestation 覆盖不会抹掉历史 exact-freeze PASS，也不会放宽当前树覆盖规则。实现与边界见
+[`GATE_B2_REVIEW_20260810.md`](GATE_B2_REVIEW_20260810.md) §4。
 
 ## 已实现并在 Python 3.12.13 验证
 

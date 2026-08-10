@@ -144,17 +144,16 @@ def test_ready_for_freeze_requires_every_requirement_complete():
 
 def test_gate_state_requires_a_derived_signed_commit_for_pass():
     unsigned = gate.as_state()
-    assert unsigned["gate_b1"] == "NOT_PASSED"
-    assert unsigned["signed_off_commit"] is None
+    assert unsigned["gate_b1_attested_freeze"] is None
+    assert unsigned["gate_b1_covers_worktree"] is False
 
     freeze = "a" * 40
-    signed = gate.as_state(freeze)
+    signed = gate.as_state(freeze, freeze)
+    assert signed["gate_b1_attested_freeze"] == freeze
     if gate.ready_for_freeze():
-        assert signed["gate_b1"] == "PASS"
-        assert signed["signed_off_commit"] == freeze
+        assert signed["gate_b1_covers_worktree"] is True
     else:
-        assert signed["gate_b1"] == "NOT_PASSED"
-        assert signed["signed_off_commit"] is None
+        assert signed["gate_b1_covers_worktree"] is False
 
 
 BLOCKER_COUNT = re.compile(r"(?<![B\w.])(\d+)\s*(?:项\s*)?blockers?\b")
@@ -170,60 +169,21 @@ def test_docs_agree_with_the_registry_on_how_many_blockers_there_are():
         )
 
 
-def _signoff_table_value(text: str, field: str) -> str:
-    match = re.search(
-        rf"^\|\s*{re.escape(field)}\s*\|\s*(.*?)\s*\|\s*$",
-        text,
-        re.MULTILINE,
-    )
-    return match.group(1).strip() if match else ""
-
-
-def test_gate_b1_is_not_claimed_passed_without_a_valid_freeze_attestation():
-    """PASS must be exactly the attestation that provenance can re-derive."""
+def test_gate_b1_history_and_worktree_coverage_are_independently_derived():
     state = provenance.load_state(ROOT)
     assert state is not None
     status = state["gate_status"]
-    if status["gate_b1"] != "PASS":
-        assert status.get("signed_off_commit") is None
-        return
-
-    freeze = status.get("signed_off_commit")
-    assert freeze, "Gate B1 PASS requires an exact frozen signed_off_commit"
-    assert all(r.status == gate.READY_FOR_FREEZE for r in gate.requirements())
-    validated = attestation.validate(ROOT, freeze)
-    assert validated is not None, "STATE claims PASS but exact-freeze attestation is invalid"
     assert provenance.derived_gate_status(ROOT) == status
+    freeze = status.get("gate_b1_attested_freeze")
+    if freeze is not None:
+        historical = attestation.validate_historical(ROOT, freeze)
+        assert historical is not None
+        assert historical.freeze_commit == freeze
 
-    ancestor = subprocess.run(
-        ["git", "-C", str(ROOT), "merge-base", "--is-ancestor", freeze, "HEAD"],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert ancestor.returncode == 0, f"signed_off_commit {freeze} is not an ancestor of HEAD"
-
-    allowed = attestation.allowed_attestation_paths(ROOT, freeze)
-    diff = subprocess.run(
-        ["git", "-C", str(ROOT), "diff", "--name-only", f"{freeze}..HEAD"],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=True,
-    )
-    changed = {line for line in diff.stdout.splitlines() if line}
-    assert changed <= allowed, (
-        "Gate B1 attestation changed files outside the allowed metadata-only set: "
-        f"{sorted(changed - allowed)}"
-    )
-    signoff, evidence = attestation.paths_for(ROOT, freeze)
-    assert signoff.relative_to(ROOT).as_posix() in changed
-    assert evidence.relative_to(ROOT).as_posix() in changed
-
-    text = signoff.read_text(encoding="utf-8")
-    assert _signoff_table_value(text, "`commit_sha`") == freeze
-    assert _signoff_table_value(text, "Evidence snapshot sha256") == attestation.sha256_file(evidence)
-    assert _signoff_table_value(text, "Decision").strip("`") == "PASS"
+    if status["gate_b1_covers_worktree"]:
+        assert freeze is not None
+        assert all(r.status == gate.READY_FOR_FREEZE for r in gate.requirements())
+        assert attestation.validate(ROOT, freeze) is not None
 
 
 GATE_PASS_CLAIMS = re.compile(
@@ -237,7 +197,7 @@ GATE_PASS_CLAIMS = re.compile(
 def test_docs_do_not_restate_gate_status_by_hand():
     state = provenance.load_state(ROOT)
     assert state is not None
-    if state["gate_status"]["gate_b1"] == "PASS":
+    if state["gate_status"]["gate_b1_attested_freeze"] is not None:
         return
     offenders = []
     for path in tracked_files():
@@ -248,7 +208,7 @@ def test_docs_do_not_restate_gate_status_by_hand():
                 offenders.append(f"{path.relative_to(ROOT).as_posix()}:{lineno}")
     assert not offenders, (
         f"docs claim Gate B1 passed while STATE.json records "
-        f"{state['gate_status']['gate_b1']}: {offenders}"
+        f"no historical attested freeze: {offenders}"
     )
 
 
