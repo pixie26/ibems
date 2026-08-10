@@ -225,6 +225,27 @@ def _fatal_entitlement_error(error: dict[str, Any]) -> bool:
     return error["code"] == 420 and "market data permissions" in error["message"].casefold()
 
 
+def _market_checks(
+    *,
+    stable_snapshot: bool,
+    market_type: int,
+    sample_counts: dict[str, int],
+    clock_ok: bool,
+    entitlement_blocked: bool,
+    sample_window: float,
+    required_sample_seconds: float,
+) -> dict[str, bool]:
+    """Build fail-closed market checks from independently recorded facts."""
+    return {
+        "stable_snapshot": stable_snapshot,
+        "live_market_data": market_type == 1,
+        "all_streams_nonzero": all(sample_counts.values()),
+        "clock_skew_within_threshold": clock_ok,
+        "no_fatal_entitlement_error": not entitlement_blocked,
+        "sample_window_complete": sample_window >= required_sample_seconds,
+    }
+
+
 def _bounded_read(name: str, request) -> tuple[list[Any] | None, dict[str, Any]]:
     """Turn an absent IB completion callback into explicit UNKNOWN evidence."""
     started = time.monotonic()
@@ -246,6 +267,15 @@ def _bounded_read(name: str, request) -> tuple[list[Any] | None, dict[str, Any]]
     }
 
 
+def _validate_session_exchange(session_label: str, exchange: str) -> None:
+    """Prevent an evidence label from being paired with the wrong data route."""
+    expected = {"OVERNIGHT": "OVERNIGHT", "RTH": "SMART"}.get(session_label)
+    if expected is not None and exchange != expected:
+        raise ValueError(
+            f"session label {session_label} requires --market-data-exchange {expected}"
+        )
+
+
 def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     ib = IB()
     # Bound every synchronous IB request.  readonly=True prevents broker
@@ -256,6 +286,7 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     report: dict[str, Any] = {
         "schema_version": 3,
         "started_utc": datetime.now(timezone.utc).isoformat(),
+        "session_label": args.session_label,
         "host": args.host,
         "port": args.port,
         "client_id": args.client_id,
@@ -305,7 +336,12 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             "account_count": len(ib.managedAccounts()),
         }
 
-        contract = Stock(args.symbol, "SMART", "USD", primaryExchange="ARCA")
+        contract = Stock(
+            args.symbol,
+            args.market_data_exchange,
+            "USD",
+            primaryExchange="ARCA",
+        )
         qualified = ib.qualifyContracts(contract)
         if len(qualified) != 1:
             raise RuntimeError(f"could not uniquely qualify {args.symbol}: {qualified}")
@@ -317,6 +353,7 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             "exchange": contract.exchange,
             "primary_exchange": contract.primaryExchange,
             "currency": contract.currency,
+            "requested_market_data_exchange": args.market_data_exchange,
             "details_count": len(details),
         }
 
@@ -422,6 +459,7 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
 
         samples = {name: counter.report(window) for name, counter in counters.items()}
         sample_counts = {name: counter.count for name, counter in counters.items()}
+        entitlement_blocked = any(_fatal_entitlement_error(error) for error in errors)
         report["market_data"] = {
             "market_data_type": market_type,
             "live": market_type == 1,
@@ -432,16 +470,19 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 "counted in updateEvent handlers as ticks arrive; Ticker.tickByTicks "
                 "is a per-update buffer and is never polled"
             ),
-            "entitlement_blocked": any(_fatal_entitlement_error(error) for error in errors),
+            "entitlement_blocked": entitlement_blocked,
         }
         report["errors"] = errors
         clock_ok = bool(skew_samples) and abs(skew_median) <= MAX_MEDIAN_CLOCK_SKEW_SECONDS
-        report["checks"] = {
-            "stable_snapshot": stable,
-            "live_market_data": market_type == 1,
-            "all_streams_nonzero": all(sample_counts.values()),
-            "clock_skew_within_threshold": clock_ok,
-        }
+        report["checks"] = _market_checks(
+            stable_snapshot=stable,
+            market_type=market_type,
+            sample_counts=sample_counts,
+            clock_ok=clock_ok,
+            entitlement_blocked=entitlement_blocked,
+            sample_window=window,
+            required_sample_seconds=args.sample_seconds,
+        )
         report["passed"] = all(report["checks"].values())
         return report, 0 if report["passed"] else 2
     finally:
@@ -464,6 +505,18 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=4002)
     parser.add_argument("--client-id", type=int, default=933)
     parser.add_argument("--symbol", default="SPY")
+    parser.add_argument(
+        "--session-label",
+        choices=("UNSPECIFIED", "OVERNIGHT", "RTH"),
+        default="UNSPECIFIED",
+        help="Evidence label; routing must be selected explicitly and match the label",
+    )
+    parser.add_argument(
+        "--market-data-exchange",
+        choices=("SMART", "OVERNIGHT"),
+        default="SMART",
+        help="Explicit market-data route; OVERNIGHT is distinct from SMART",
+    )
     parser.add_argument("--snapshot-rounds", type=int, default=3)
     parser.add_argument("--snapshot-interval", type=float, default=1.0)
     parser.add_argument("--market-data-timeout", type=float, default=10.0)
@@ -475,6 +528,10 @@ def main() -> int:
         parser.error("--snapshot-rounds must be at least 2")
     if args.request_timeout <= 0:
         parser.error("--request-timeout must be greater than zero")
+    try:
+        _validate_session_exchange(args.session_label, args.market_data_exchange)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     report, exit_code = run(args)
     report["finished_utc"] = datetime.now(timezone.utc).isoformat()

@@ -185,9 +185,29 @@ asyncio.windows_events._poll
 - operator console transcript 明确标注为用户提供内容的逐字转录，不冒充 probe 自动输出。
 - `SHA256SUMS` 同时固定 report、截图、转录以及本轮实际执行的 Python / PowerShell 脚本副本。
 
+### 5.5 SPY OVERNIGHT 行情与 bounded Recorder
+
+2026-08-10 香港时间约 08:48–08:59，使用 IBKR API 明确要求的 `exchange=OVERNIGHT` 完成两轮 120 秒只读测试：
+
+- event-driven preflight：BidAsk / AllLast / 5s bars 为 `1620 / 13 / 25`，`marketDataType=1`，`passed=true`；
+- 实际 Recorder subscription/event-handler/`RawEventLog` 写盘：`923 / 16 / 25`，raw event 合计 969，`passed=true`。
+
+第一轮错误使用 SMART route 时三路为零；IBKR 官方 API 文档确认 overnight data 与普通 SMART routed data 不重合。preflight 已加固为 `OVERNIGHT` label 必须显式配 `OVERNIGHT` exchange。Recorder v1 还直接暴露了 0.2 秒 clock pacing 的 callback timeout，随后与 preflight 统一为每次请求前 1.1 秒并成功重跑。
+
+详细证据、失败轮次和全部 digest 见 [`GATE_B2_OVERNIGHT_20260810.md`](GATE_B2_OVERNIGHT_20260810.md)。此项判定为 **OVERNIGHT PASS**，但不证明 RTH 或 Full-RTH health。
+
+### 5.6 SPY RTH 行情与 bounded Recorder
+
+2026-08-10 香港时间约 23:01–23:07，正式 `RTH+SMART` preflight 与真实 Recorder bounded 写盘均运行超过 120 秒：
+
+- preflight v2：BidAsk / AllLast / 5s bars 为 `25665 / 3168 / 25`；
+- Recorder：关闭 gzip 后独立重读为 `15590 / 2843 / 25`，所有市场数据行均为 LIVE。
+
+首轮在约 68 秒出现真实 `10197` competing-session error，并暴露 `entitlement_blocked=true` 仍可能错误汇总为 PASS 的工具缺口。现已增加 fatal entitlement 与完整 sample-window 两个否决检查；失败 v1 保留，设置调整后的独立 v2 才作为 RTH PASS 证据。详细结果和 digest 见 [`GATE_B2_RTH_20260810.md`](GATE_B2_RTH_20260810.md)。这仍不是 Full-RTH 全日 health。
+
 ## 6. 没有被本轮证明的事项
 
-- 休市零 tick 不证明 RTH stream 正常或异常；必须在 RTH 重跑 90 秒或更长采样。
+- RTH bounded 三路行情已经证明；两分钟样本仍不证明完整交易日 coverage 或整日 gap thresholds。
 - 零持仓、零挂单、零成交时的 hash 稳定，不证明动态 broker snapshot 是原子的，也不证明双快照屏障足以恢复 `SYNCED`。
 - Gateway 正常退出、Task Manager End task、`TerminateProcess` 及 Gateway 保持运行时的外网断线已经验证；外网断线轮直接观察到 1100 → 1102，但尚未观察到 1101，也未验证 late/duplicate/out-of-order order callback。
 - 没有验证 `orderId / permId / clientId / orderRef`。
@@ -199,7 +219,7 @@ asyncio.windows_events._poll
 
 Windows 上还观察到一个独立的 provenance 表示问题：`uv.lock` Git 内容未变，但 checkout 的 CRLF 原始字节 SHA-256 为 `4050...`；LF 归一化后为 STATE 记录的 `615629...`。当前 provenance 对 worktree 原始字节取 hash，因此 Linux 生成的 STATE 在 Windows clean checkout 也会显示 stale。这个问题不改变本轮 Gateway 观测，但必须在下一次正式 freeze 前修复，不能通过手改 STATE 掩盖。
 
-2026-08-10 在当前 Windows checkout 启动完整 `pytest -q`；外层 120 秒限时前已经出现失败。随后以 `pytest -x -vv` 定位第一个失败：`tests/test_fatal_fence.py::test_a_fence_is_durable_and_readable` 在 64 passed、1 skipped 后，因 Windows 对目录执行 `os.open(path, O_RDONLY)` 返回 `PermissionError` 而失败。该结果与已接受但尚未完成真实故障验证的 Windows gap 一致；本轮不能宣称完整回归通过。B2 preflight 专项测试为 12 passed，三个新增 B2 脚本均通过 Python compile 检查和 broker-write-path 静态搜索。
+2026-08-10 在当前 Windows checkout 启动完整 `pytest -q`；外层 120 秒限时前已经出现失败。随后以 `pytest -x -vv` 定位第一个失败：`tests/test_fatal_fence.py::test_a_fence_is_durable_and_readable` 在 64 passed、1 skipped 后，因 Windows 对目录执行 `os.open(path, O_RDONLY)` 返回 `PermissionError` 而失败。该结果与已接受但尚未完成真实故障验证的 Windows gap 一致；本轮不能宣称完整回归通过。加入 overnight routing 约束后 B2 preflight 专项测试为 18 passed；Recorder clock 相关测试为 3 passed；overnight probe 与相关脚本均通过 Python compile 和 broker-write-path 静态搜索。全量 `tests/test_recorder.py` 曾启动但长时间未完成后受控终止，不能宣称该文件全量 PASS。
 
 ## 8. 结论与下一步
 
@@ -208,8 +228,8 @@ Windows 上还观察到一个独立的 provenance 表示问题：`uv.lock` Git �
 下一步按顺序执行：
 
 1. 周末、零订单、Read-Only 边界下有明显安全价值的主要 Gateway 实测已经完成；completed-orders 保持 `BLOCKED_BY_GATEWAY_READ_ONLY_POLICY`，不得为补测而关闭 Read-Only；
-2. 香港时间约 08:00 后运行一次明确标注为 `OVERNIGHT` 的 SPY 行情/Recorder 试验；overnight 结果不能替代 RTH；
-3. 香港时间约 21:30 后在 SPY RTH 使用 event-driven 计数重跑至少 90 秒，要求 LIVE 且 BidAsk / AllLast / 5s bars 均非零；
+2. 明确 `OVERNIGHT` destination 的 SPY 行情与 bounded Recorder 已完成并 PASS；该结果不能替代 RTH；
+3. SPY RTH event-driven preflight 与 bounded Recorder 已完成；仍不得把两分钟样本称为 Full-RTH 全日 health；
 4. 保留 1101 为尚未观察到的分支；不得由已观察到的 1102 推断 1101；
 5. 完成官方文档逐项复核，并把 B2 source、tests、docs 和 evidence 纳入新的可复查 freeze；
 6. 只读证据封存后，再由 owner 单独决定是否授权 1 股 SPY paper-order protocol；非空 dynamic snapshot、订单身份和订单 callback 均留在该子阶段。

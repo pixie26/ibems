@@ -318,6 +318,7 @@ class _FakeIB:
         self.true_skew = true_skew
         self.rtt = rtt
         self.quantize = quantize
+        self.sleeps = []
 
     def reqCurrentTime(self):
         time.sleep(self.rtt / 2)                 # request leg
@@ -329,6 +330,7 @@ class _FakeIB:
         return reply
 
     def sleep(self, seconds):
+        self.sleeps.append(seconds)
         time.sleep(min(seconds, 0.01))
 
 
@@ -358,6 +360,12 @@ def test_a_quantized_server_clock_does_not_look_like_drift():
     skew = ClockSkew.from_samples(measure_clock_skew(ib, samples=15, pause=0.0))
     assert skew.samples == 15
     assert abs(skew.median_seconds) < 2.0
+
+
+def test_clock_requests_are_paced_before_every_real_request():
+    ib = _FakeIB(rtt=0.0)
+    measure_clock_skew(ib, samples=3)
+    assert ib.sleeps == [1.1, 1.1, 1.1]
 
 
 def test_one_unlucky_sample_cannot_decide_the_day(tmp_path):

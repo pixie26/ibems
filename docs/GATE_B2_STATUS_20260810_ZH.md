@@ -1,6 +1,6 @@
 # Gate B2 当前状态摘要（2026-08-10）
 
-截止时间：`2026-08-10 01:09 HKT`（`2026-08-09 17:09 UTC`）。
+截止时间：`2026-08-10 23:08 HKT`（`2026-08-10 15:08 UTC`）。
 
 ## 1. 当前正式结论
 
@@ -8,8 +8,8 @@
 - **Gate B2：READ-ONLY IN PROGRESS，尚未 PASS。**
 - 当前只允许 IB Gateway paper account 的只读协议验证；没有发送订单，也没有获得 paper-order 或 live-order 授权。
 - Gateway 的 Read-Only API 保护保持开启。不能为了补齐 `completed orders` 而关闭该保护。
-- 在“周末、零订单、Gateway Read-Only”边界内，当前有明显 B2 安全价值且可以安全执行的主要 Gateway 实测已经完成。
-- 下一项实际测试是香港时间约 `08:00` 后的 SPY overnight 行情/Recorder；正式 RTH 三路行情在约 `21:30` 后测试。
+- 在零订单、Gateway Read-Only 边界内，当前有明显 B2 安全价值且不需要额外故障授权的主要 Gateway 实测已经完成。
+- SPY overnight 与正式 `RTH+SMART` 行情及 bounded Recorder 均已完成并 PASS。RTH 首轮还直接暴露了 competing-session `10197` 和报告判定缺口；修正后独立 v2 才作为通过证据。
 
 `STATE.json` 是 Gate B1 的机器可读权威状态；其中 `gate_b2=NOT_STARTED` 尚未纳入本轮人工执行的真实 Gateway 证据，且该文件标明为生成文件，因此不得手工修改。本摘要和 [`GATE_B2_READONLY_20260809.md`](GATE_B2_READONLY_20260809.md) 记录当前 B2 实验状态；最终 B2 freeze 时需要统一机器状态、源码、文档和证据。
 
@@ -19,8 +19,8 @@
 |---|---|---|---|
 | API connectivity / preflight | 已完成 | paper port 4002、`readonly=True` 连接成功；server version 178 | 不授权订单 |
 | Managed account / account summary | 已完成 | 1 个 managed account；`reqAccountSummary` 完成并返回 71 项 | 报告只保存 count/hash；未保存账户名或余额明细 |
-| SPY qualification | 已完成 | `SMART / ARCA / USD` 唯一解析，`conId=756733` | 不等于行情流已经通过 |
-| LIVE entitlement | 已完成 | `marketDataType=1`，未出现 entitlement-blocking error | 休市观测不能证明三路 stream |
+| SPY qualification | 已完成 | `SMART / ARCA / USD` 与 `OVERNIGHT / ARCA / USD` 均唯一解析，`conId=756733` | route 必须与 session label 明确匹配 |
+| LIVE entitlement | 已完成 | OVERNIGHT 与正式 `RTH+SMART` 均观察到 `marketDataType=1` | entitlement 仍可能受 competing session 影响，10197 必须 fail-closed |
 | Positions / all-open-orders / executions | 已完成，空状态限定 | 多轮均为 `0 / 0 / 0`，相邻 snapshot hash 一致 | 只证明空状态读取 completion，不证明动态原子性 |
 | Completed orders | 被安全策略阻断 | 10 秒内无 completion，记为 `UNKNOWN`；最小复现触发 Gateway Read-Only 提示 | 不能解释成零条；不得关闭 Read-Only 追测 |
 | 多只读 client 空状态可见性 | 已完成 | client 934/935 同时连接并读取相同 `0 / 0 / 0` snapshot | 不证明有订单时的 cross-client visibility |
@@ -31,8 +31,8 @@
 | Task Manager End task | 已完成，空状态限定 | 重启后完整 snapshot 成功 | Gateway 表现出保存/退出过程，不声称为 hard kill |
 | Windows `TerminateProcess` | 已完成，空状态限定 | 强制终止后重启；第三次恢复尝试完成连接和 snapshot | 不证明非空 reconciliation |
 | Gateway 存活时受控外网中断 | 已完成，空状态限定 | 观察到真实 `1100 -> 1102`；恢复后 server time 与 snapshot 完成 | 没有观察到 1101；不证明动态订单 callback |
-| SPY overnight 三路行情 / Recorder | 未完成 | 尚未形成 overnight 证据 | 等香港时间约 08:00 后；必须明确标注 `OVERNIGHT` |
-| SPY RTH BidAsk / AllLast / 5s bars | 未完成 | 周日采样为零，不作成功或失败推断 | 等香港时间约 21:30 后，至少采样 90 秒 |
+| SPY overnight 三路行情 / Recorder | 已完成 | 正确 `OVERNIGHT` route：preflight `1620/13/25`；落盘 Recorder `923/16/25`，两轮均 PASS | 只证明 overnight；不是 RTH 或 Full-RTH health report |
+| SPY RTH BidAsk / AllLast / 5s bars / Recorder | 已完成 | preflight 120.109 秒 `25665/3168/25`；Recorder 120.360 秒落盘 `15590/2843/25`，均为 LIVE | bounded 两分钟证据；不是 Full-RTH 全日 health |
 | 非空动态 reconciliation | 未完成 | 当前没有仓位、挂单或成交事实 | 需要另行授权 paper-order 子阶段 |
 | `orderId / permId / clientId / orderRef` | 未完成 | 尚未产生真实订单身份事实 | 需要另行授权 paper-order 子阶段 |
 | submit / ack / modify / cancel / fill / commission / late callback | 未完成 | 订单路径没有运行 | 不属于当前只读轮次 |
@@ -42,7 +42,7 @@
 在当前安全边界下，**没有发现一个明显的、现在即可安全实测但被遗漏的关键周末 Gateway 场景**。当前不能继续完成的项目均有明确原因：
 
 1. `completed orders` 被 Gateway Read-Only policy 阻断；继续需要降低保护，不接受。
-2. overnight 和 RTH 行情分别需要对应的市场时段。
+2. overnight 与 RTH bounded 行情均已完成；仍未运行 Full-RTH 全日 health。
 3. 1101 不应通过反复断网碰运气；后续可在活跃行情订阅期间观察，但不得从已观察的 1102 推断 1101。
 4. 非空 broker facts、订单身份、cross-client order visibility 和订单 callback 必须先获得 paper-order 独立授权。
 
@@ -61,13 +61,18 @@
 | Task Manager End task | `artifacts/ib_preflight/20260810_b2_gateway_hard_kill_v2/report.json` | `b954367be4f976acf3ffca02eb7e4e71bb82eac1dadb609b5a64128ea5b4c441` |
 | Windows `TerminateProcess` | `artifacts/ib_preflight/20260810_b2_gateway_terminateprocess/report.json` | `2097c4fb5461b15a523879ee4cc7b7765e204db4d38d921a9a8b0e4c457a52d8` |
 | Gateway 存活时外网中断 | `artifacts/ib_preflight/20260810_b2_gateway_network_fault_v2/report.json` | `f8c88498a74402d59a49f80a0cdf9b61903a8d361b80b7045457f467f30c8bc2` |
+| SPY OVERNIGHT 三路 preflight | `artifacts/ib_preflight/20260810_b2_overnight_market_v2/report.json` | `cda99091b758cbd8fbe442d27bc5132199d6530ac118c94f74be25c8fb202fd7` |
+| SPY OVERNIGHT bounded Recorder | `artifacts/ib_preflight/20260810_b2_overnight_recorder_v2/report.json` | `7c97d75c9da2ac6372f241f721a6038ff4dea326acab869fc3268948869b2e35` |
+| SPY RTH v1（10197，失败证据） | `artifacts/ib_preflight/20260810_b2_rth_market_v1/report.json` | `db640ef3fec57adadac81426b314afcc0cc28ef31cb70f9243ab9d3989d34143` |
+| SPY RTH preflight v2 | `artifacts/ib_preflight/20260810_b2_rth_market_v2/report.json` | `204c979b8c29670a33dfdba111e704f51d6971dddc6989b4214ac0e8ad914c1b` |
+| SPY RTH bounded Recorder | `artifacts/ib_preflight/20260810_b2_rth_recorder_v1/report.json` | `86de43714c1d9fa1f515d01ddc126589b11e1634ff23f1ef57ca439cfa9a543d` |
 
 上述是本地 evidence bundle；网络中断目录的 `SHA256SUMS` 已复核。当前工作树仍有未提交的 B2 脚本和文档修改，因此这里的“封存”表示证据文件及其 digest 已保存，**不表示 B2 已形成最终 Git exact-freeze**。
 
 ## 5. 后续计划与进入下一阶段的条件
 
-1. 香港时间约 `08:00` 后运行一次 SPY overnight 行情/Recorder，明确标注 `OVERNIGHT`；记录 BidAsk、AllLast、5s bars、market-data type、错误码、时间范围和证据 digest。
-2. 香港时间约 `21:30` 后运行正式 RTH 三路行情验证，至少 90 秒，要求三路事件计数均非零；overnight 结果不能替代 RTH。
+1. SPY overnight 行情/Recorder 已完成；详细过程见 [`GATE_B2_OVERNIGHT_20260810.md`](GATE_B2_OVERNIGHT_20260810.md)。
+2. 正式 RTH 三路行情与 bounded Recorder 已完成；详细过程见 [`GATE_B2_RTH_20260810.md`](GATE_B2_RTH_20260810.md)。
 3. 逐项完成官方 IB 文档复核，并更新 [`DOCUMENTED_VS_OBSERVED.md`](DOCUMENTED_VS_OBSERVED.md)。
 4. 修复或明确 Windows full-suite/provenance gap，整理 B2 source、tests、docs 和 evidence，形成新的可复查 freeze；不得借用 B1 exact-freeze 为新代码背书。
 5. 只读证据完成并封存后，由 owner **单独决定**是否授权“paper account、1 股 SPY、机械订单生命周期”的 paper-order protocol。
@@ -76,7 +81,8 @@
 ## 6. 文档导航
 
 - 本文：当前状态、边界、证据索引和下一步。
+- [`GATE_B2_OVERNIGHT_20260810.md`](GATE_B2_OVERNIGHT_20260810.md)：正确 overnight routing、三路行情及 bounded Recorder 写盘证据。
+- [`GATE_B2_RTH_20260810.md`](GATE_B2_RTH_20260810.md)：RTH competing-session 失败、判定加固、正式三路行情及 bounded Recorder 写盘证据。
 - [`GATE_B2_READONLY_20260809.md`](GATE_B2_READONLY_20260809.md)：每一轮真实 Gateway 测试的详细过程与观测。
 - [`DOCUMENTED_VS_OBSERVED.md`](DOCUMENTED_VS_OBSERVED.md)：官方文档语义与真实 Gateway 直接观测的逐项矩阵。
 - [`GATE_B1_SIGNOFF_117188cea539.md`](GATE_B1_SIGNOFF_117188cea539.md)：Gate B1 exact-freeze owner acceptance；其范围不包含真实 IB 行为。
-

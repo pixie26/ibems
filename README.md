@@ -19,7 +19,7 @@
 | 无 IB 依赖的执行核心 | Gate B1 已在 exact-freeze commit `117188cea539...` 完成正式 campaign、真实存储故障证据和 owner acceptance，结论为 PASS。当前 B2 工作树已有 freeze 后改动，必须单独验证，不能沿用 B1 attestation。 |
 | Hypothesis Gate campaign | B1 exact-freeze campaign 已通过；详细计数与 artifact digest 见 `docs/GATE_B1_SIGNOFF_117188cea539.md`。任何 B2 行为代码改动都需要绑定新的 tree 重新验证。 |
 | 不变量 0 + 22 条安全不变量 | B1 exact-freeze 的 Property / Runtime / Auditor 与 B1.6 journal witness 已闭环。真实 IB reconciliation、unknown broker facts 和 callback 行为明确留给 B2，不属于 B1 PASS 的证明范围。 |
-| 只读 SPY Recorder / B2 preflight | Gateway 4002、server time、SPY `conId=756733`、account summary、空状态 broker snapshot、多 client、Gateway restart / `TerminateProcess` 与 `1100 -> 1102` 已有直接观测。尚无 overnight 或合格 RTH 三路行情证据；详见 B2 当前状态摘要。 |
+| 只读 SPY Recorder / B2 preflight | Gateway 4002、server time、SPY `conId=756733`、account summary、空状态 broker snapshot、多 client、Gateway restart / `TerminateProcess` 与 `1100 -> 1102` 已有直接观测。明确 `OVERNIGHT` 和正式 `RTH+SMART` 的三路行情及 bounded Recorder 写盘均已 PASS；仍不是 Full-RTH 全日 health。 |
 | 交易型 IB Adapter | 未授权连接下单路径。`placeOrder`、`cancelOrder`、订单身份、完整 callback/error mapping 和非空动态 reconciliation 尚未在真实 Gateway 验证。 |
 | Emergency flatten broker path | 未实现。现有代码只覆盖计划生成与人工确认边界。 |
 
@@ -28,6 +28,8 @@
 - **[`STATE.json`](STATE.json) —— 唯一权威的机器可读状态**（gate 状态、source/config/lock 三个树 hash）
 - [Gate B2 当前状态摘要](docs/GATE_B2_STATUS_20260810_ZH.md)（当前真实 Gateway 只读测试状态、证据索引和下一步）
 - [Gate B2 只读详细证据](docs/GATE_B2_READONLY_20260809.md)
+- [Gate B2 SPY OVERNIGHT 行情与 Recorder 证据](docs/GATE_B2_OVERNIGHT_20260810.md)
+- [Gate B2 SPY RTH 行情与 Recorder 证据](docs/GATE_B2_RTH_20260810.md)
 - [IB documented-vs-observed 矩阵](docs/DOCUMENTED_VS_OBSERVED.md)
 - [实施状态](docs/IMPLEMENTATION_STATUS.md)
 - [22 条不变量覆盖矩阵](docs/INVARIANT_COVERAGE.md)
@@ -207,7 +209,7 @@ python -m ib_execution.execution_host --journal D:\ibems-data\journal.db \
 ## 下一步
 
 1. **策略 Gate A 独立推进。** 在策略仓库完成真实成本、数据质量和统计不确定性判断；若结论为 `NO_GO` 或 `INSUFFICIENT_EVIDENCE`，且没有独立第二消费者，就停止投资交易型 IB Adapter。
-2. **完成 Gate B2 只读行情证据。** 香港时间约 08:00 后做一次明确标注为 overnight 的 SPY 行情/Recorder；约 21:30 后做至少 90 秒的正式 RTH BidAsk / AllLast / 5s bars 验证。overnight 不能替代 RTH。
+2. **Gate B2 RTH 行情证据已完成。** 正式 `RTH+SMART` preflight 与 bounded Recorder 均运行超过 120 秒，LIVE BidAsk / AllLast / 5s bars 全部非零；该结果仍不等于 Full-RTH 全日 coverage。
 3. **完成 documented-vs-observed 复核与 B2 freeze。** 周末空状态、client/Gateway 故障和 `1100 -> 1102` 已有直接观测；仍需官方文档逐项复核、Windows/provenance gap 处置，并把 B2 source、tests、docs 和 evidence 绑定到新的可复查 tree。
 4. **只读阶段不下单。** `completed orders` 被 Gateway Read-Only policy 阻断；不关闭保护追测。非空 reconciliation、订单身份和 callback 保留到另行授权的 paper-order 子阶段。
 5. **paper order 必须重新授权。** 只读证据封存后，owner 才单独决定是否运行 1 股 SPY paper-order protocol；B1 PASS 或 B2 只读结果都不自动构成该授权。MOC、多策略、live capital 和自动 watchdog takeover 继续推迟。

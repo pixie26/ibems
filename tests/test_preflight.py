@@ -78,6 +78,34 @@ def test_pacing_errors_are_not_treated_as_entitlement_failures():
     )
 
 
+def test_market_checks_fail_closed_after_fatal_error_even_with_live_ticks():
+    checks = preflight._market_checks(
+        stable_snapshot=True,
+        market_type=1,
+        sample_counts={"bid_ask": 19885, "all_last": 1509, "bars_5s": 13},
+        clock_ok=True,
+        entitlement_blocked=True,
+        sample_window=68.078,
+        required_sample_seconds=120.0,
+    )
+    assert checks["no_fatal_entitlement_error"] is False
+    assert checks["sample_window_complete"] is False
+    assert all(checks.values()) is False
+
+
+def test_market_checks_accept_complete_unblocked_window():
+    checks = preflight._market_checks(
+        stable_snapshot=True,
+        market_type=1,
+        sample_counts={"bid_ask": 1, "all_last": 1, "bars_5s": 1},
+        clock_ok=True,
+        entitlement_blocked=False,
+        sample_window=120.001,
+        required_sample_seconds=120.0,
+    )
+    assert all(checks.values()) is True
+
+
 def test_clock_skew_is_round_trip_compensated():
     """Same correction as the recorder: the midpoint removes the round trip."""
     import time
@@ -132,3 +160,27 @@ def test_bounded_read_marks_missing_completion_unknown():
     assert rows is None
     assert status["completed"] is False
     assert status["exception_type"] == "TimeoutError"
+
+
+def test_session_label_is_evidence_only():
+    """The label is recorded and routing remains an explicit argument."""
+    parser_source = Path(preflight.__file__).read_text(encoding="utf-8")
+    assert 'choices=("UNSPECIFIED", "OVERNIGHT", "RTH")' in parser_source
+    assert '"session_label": args.session_label' in parser_source
+
+
+@pytest.mark.parametrize(
+    ("label", "exchange"),
+    [("OVERNIGHT", "OVERNIGHT"), ("RTH", "SMART"), ("UNSPECIFIED", "SMART")],
+)
+def test_session_label_accepts_only_matching_explicit_route(label, exchange):
+    preflight._validate_session_exchange(label, exchange)
+
+
+@pytest.mark.parametrize(
+    ("label", "exchange"),
+    [("OVERNIGHT", "SMART"), ("RTH", "OVERNIGHT")],
+)
+def test_session_label_rejects_wrong_route(label, exchange):
+    with pytest.raises(ValueError):
+        preflight._validate_session_exchange(label, exchange)

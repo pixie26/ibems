@@ -12,11 +12,12 @@
 | API TCP handshake | `PENDING DOC REVIEW` | Windows、paper port 4002、`readonly=True` 成功连接；server version 178 | `OBSERVED` | 2026-08-09 round 1 |
 | Managed accounts | `PENDING DOC REVIEW` | 返回 1 个 managed account；报告只保存数量，不保存 account id | `OBSERVED` | 脱敏报告 `connection.account_count=1` |
 | SPY contract qualification | `PENDING DOC REVIEW` | `SMART / ARCA / USD` 唯一解析，`conId=756733`，contract details 1 条 | `OBSERVED` | 2026-08-09 round 1 |
-| Market-data entitlement | `PENDING DOC REVIEW` | `marketDataType=1`，无 entitlement-blocking error | `OBSERVED` | 休市观测，不代表流覆盖通过 |
-| Overnight BidAsk / AllLast / 5s bars | `PENDING DOC REVIEW` | 周日休市采样均为 0；尚未在 overnight 窗口重跑 | `NOT TESTED IN OVERNIGHT` | 香港时间约 08:00 后明确标注 `OVERNIGHT` 重跑；不能替代 RTH |
-| RTH BidAsk / AllLast / 5s bars | `PENDING DOC REVIEW` | 周日 15.234 秒采样均为 0 | `NOT TESTED IN RTH` | 香港时间约 21:30 后至少重跑 90 秒；休市 0 不作失败或成功推断 |
+| Market-data entitlement | `PENDING DOC REVIEW` | OVERNIGHT 与正式 `RTH+SMART` 均观察到 `marketDataType=1`；RTH v1 还观察到 competing-session 10197 | `OBSERVED` | 10197 后即使已有 ticks 也必须 fail-closed；stream coverage 分 session 判定 |
+| Overnight routing | IBKR API 要求 overnight 市场数据使用 `exchange=OVERNIGHT`；它不与普通 SMART routed data 重合 | `OVERNIGHT+SMART` 120.219 秒为 `0/0/0`；改为明确 `OVERNIGHT+OVERNIGHT` 后立即获得三路数据 | `DOCUMENTED AND OBSERVED` | 错误 label/route 组合现已在连接前机械拒绝 |
+| Overnight BidAsk / AllLast / 5s bars | overnight US stock/ETF session 从 Sunday 20:00 ET 开始；market data route 为 `OVERNIGHT` | 正确 route preflight 120.047 秒：`1620/13/25`；bounded Recorder 120.078 秒落盘：`923/16/25` | `OBSERVED - OVERNIGHT PASS` | report SHA `cda99091...fd7` / `7c97d75c...2e35`；不能替代 RTH |
+| RTH BidAsk / AllLast / 5s bars | `PENDING DOC REVIEW` | 正式 preflight 120.109 秒：`25665/3168/25`；bounded Recorder 120.360 秒落盘：`15590/2843/25`，市场数据行均为 LIVE | `OBSERVED - RTH BOUNDED PASS` | report SHA `204c979b...14c1b` / `86de4371...43d`；不是 Full-RTH 全日 health |
 | Broker clock | `PENDING DOC REVIEW` | 7 个 RTT midpoint 样本，中位偏差 `+0.517s`，最大绝对值 `0.837s` | `OBSERVED` | 低于当前 2 秒阈值 |
-| Repeated `reqCurrentTime` | `PENDING DOC REVIEW` | 0.2 秒间隔时至少一次 callback 未返回；`ib_async` 默认 `RequestTimeout=0` 导致同步调用无限等待。1.1 秒间隔下连续 7 次返回 | `OBSERVED - CLIENT HARDENED` | preflight 增加 1.1 秒间隔和 10 秒同步请求硬超时；12 tests PASS |
+| Repeated `reqCurrentTime` | `PENDING DOC REVIEW` | 0.2 秒间隔时至少一次 callback 未返回；bounded Recorder v1 也在 10 秒 hard deadline 触发 `TimeoutError`。1.1 秒 request-before pacing 后 preflight 与 Recorder 均完成 | `OBSERVED - CLIENT HARDENED` | preflight 与 Recorder 统一 pacing；preflight 18 tests、clock 相关 3 tests PASS |
 | Account summary | `PENDING DOC REVIEW` | `reqAccountSummary` 在 0.141 秒内完成，返回 71 项；报告只保存 count/hash | `OBSERVED` | 2026-08-10 safety-check report |
 | Positions snapshot | `PENDING DOC REVIEW` | 三轮计数 `0 / 0 / 0`，canonical hash 相同 | `STATIC CANDIDATE ONLY` | 未覆盖持仓变化并发 |
 | All-open-orders snapshot | `PENDING DOC REVIEW` | 三轮计数 `0 / 0 / 0`，canonical hash 相同 | `STATIC CANDIDATE ONLY` | 未覆盖订单 callback 并发或其他 client 的订单 |
@@ -38,8 +39,8 @@
 
 ## 当前判定
 
-Gate B2 已开始，但 **没有 PASS**。截至 2026-08-10，已经直接观察基础连接、静态零事实快照、SPY 合约、LIVE entitlement、broker clock、client death / ID collision、Gateway restart / `TerminateProcess`，以及 Gateway 存活时的 1100 → 1102 与恢复后空状态 reconciliation completion。仍未证明 RTH stream、非空动态 snapshot barrier、1101、订单身份或任何订单生命周期。
+Gate B2 已开始，但 **没有 PASS**。截至 2026-08-10，已经直接观察基础连接、静态零事实快照、SPY 合约、LIVE entitlement、明确 OVERNIGHT destination 与正式 `RTH+SMART` 的三路行情及 Recorder raw-log 写盘、broker clock、client death / ID collision、Gateway restart / `TerminateProcess`，以及 Gateway 存活时的 1100 → 1102 与恢复后空状态 reconciliation completion。仍未证明 Full-RTH 全日 Recorder health、非空动态 snapshot barrier、1101、订单身份或任何订单生命周期。
 
-周末、零订单、Read-Only 边界下有明显 B2 安全价值的主要 Gateway 实测已经完成。剩余实测依赖 overnight/RTH 市场时段，或者需要另行授权 paper-order 子阶段；`completed orders` 则保持被 Read-Only policy 阻断。当前证据已保存 digest，但工作树尚未形成最终 B2 Git exact-freeze。
+零订单、Read-Only 边界下明显具有 B2 安全价值且无需额外故障授权的主要 Gateway 实测已经完成，包括 bounded OVERNIGHT 与 RTH。其他动态项目需要另行授权 paper-order 子阶段，`completed orders` 则保持被 Read-Only policy 阻断。当前证据已保存 digest，但工作树尚未形成最终 B2 Git exact-freeze。
 
 详细轮次证据见 [`GATE_B2_READONLY_20260809.md`](GATE_B2_READONLY_20260809.md)。

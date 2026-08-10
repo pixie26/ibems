@@ -847,7 +847,14 @@ class SessionRolloverError(RuntimeError):
     """The exchange session changed underneath a running recorder."""
 
 
-def measure_clock_skew(ib, samples: int = 5, pause: float = 0.2) -> list[float]:
+CLOCK_REQUEST_MIN_INTERVAL_SECONDS = 1.1
+
+
+def measure_clock_skew(
+    ib,
+    samples: int = 5,
+    pause: float = CLOCK_REQUEST_MIN_INTERVAL_SECONDS,
+) -> list[float]:
     """Round-trip-compensated skew samples.
 
     ``local_midpoint - server_time``, where the midpoint of the local clock
@@ -857,7 +864,11 @@ def measure_clock_skew(ib, samples: int = 5, pause: float = 0.2) -> list[float]:
     and reports a median instead of trusting any one of them.
     """
     out: list[float] = []
-    for index in range(samples):
+    for _ in range(samples):
+        # Real Gateway requests made in rapid succession can omit a completion
+        # callback. Pace the first request too because callers commonly make a
+        # separate reqCurrentTime immediately before this measurement.
+        ib.sleep(pause)
         t0 = time.time()
         server = ib.reqCurrentTime()
         t1 = time.time()
@@ -866,8 +877,6 @@ def measure_clock_skew(ib, samples: int = 5, pause: float = 0.2) -> list[float]:
         if server.tzinfo is None:
             server = server.replace(tzinfo=timezone.utc)
         out.append(((t0 + t1) / 2.0) - server.timestamp())
-        if index + 1 < samples:
-            ib.sleep(pause)
     return out
 
 
