@@ -159,17 +159,19 @@ Windows 换行改写历史事实；后者仍由现有 `attestation.validate` 派
 恢复后的首条到达与是否需要 resubscribe；受控解除 outbound block。它仍在只读边界内，
 但结果应写成“观察到 1101/1102 中哪一个以及 stream 如何恢复”，不能预注册为必取 1101。
 `run_ib_readonly_network_fault_probe.py` 已改为持有三路订阅并记录 recovery 后逐流增量；
-`QuoteRecorder.run()` 也已接入 bar heartbeat、1101 重订/1102 不重订、`GAP_SUSPECTED`、
-generic tick 49 与 transport timeout re-arm。尚未执行新的防火墙故障轮次。下一轮应把“持订阅
-断网”和 production `run()` 的真实 fault 验证合并为同一次 operator-controlled interruption；
-单独跑测量 harness 不能关闭 production 路径。
+`QuoteRecorder.run()` 也已接入 bar heartbeat、1101 重订/1102 不重订、incident 标记与 transport
+timeout re-arm。2026-08-12 已把“持订阅断网”和 production `run()` 合并为一次经授权的 45 秒
+operator-controlled interruption：实际得到 1100→1102、无重订，三路在 1102 后恢复；没有得到 1101。
+STK generic tick 49 被 Gateway 以 error 321 拒绝，重试通过配置覆盖为空继续。详细边界见
+[`GATE_B2_CONTROLLED_DISCONNECT_20260812_ZH.md`](GATE_B2_CONTROLLED_DISCONNECT_20260812_ZH.md)。
 
 而 1101 本身不是重点。**重点是它之后的状态**：订阅可能已死，socket 仍活着，
 `isConnected()` 为 True，没有异常，行情却不再恢复。当前实现用预期每 5 秒到达的 bar 作为
 可判定 heartbeat；BidAsk / AllLast 是事件驱动流，其 staleness 只记录、不驱动恢复。这套
-production liveness 逻辑仍**从未对着真实 Gateway 故障跑过**。
-第 1、2 条说明这个静默失败家族在这个代码库里已经出现过两次；这是同一家族里
-还没被实测的第三个成员，也是我认为当前剩余的只读测试里价值最高的一个。
+production liveness 的 1100/1102 路径已对着真实 Gateway 故障运行；1101→重订分支仍未直接观察。
+该真实轮还暴露 poll 频率泄漏：一个 outage 被写成 380 条 `GAP_SUSPECTED`。后续代码改为
+`FEED_OUTAGE / EXPECTED_SILENCE / GAP_SUSPECTED` 生命周期，但运行中进程加载的是旧代码，所以新语义
+仍只有单元/回归证据，不能倒推为真实 Gateway PASS。
 
 ## 下一步建议顺序
 
@@ -177,9 +179,10 @@ production liveness 逻辑仍**从未对着真实 Gateway 故障跑过**。
    在 Windows 工作树通过。**（`980f655` + `85f4084` 后已完成）**
 2. 旧窗口约 40% 差异按“不是有效测量”关闭，不再安排同步 A/B；handler 对账与 million-event
    soak 已直接证明 Recorder 写路径在各自覆盖窗口内无损。
-3. 最高优先级：用真实 `QuoteRecorder.run()` 持三路订阅做一次受控断网，观察实际 recovery
-   code、1101 重订/1102 不重订、`GAP_SUSPECTED`、bar heartbeat 与恢复后逐流增量。
-4. 运行一次 Full-RTH 全日 health，同时覆盖 `finalize_day`、开/午/收盘 bar cadence、长期内存、
+3. 持三路订阅的 production 受控断网已部分完成：观察 1100→1102、不重订和逐流恢复；1101 未观察。
+   新 incident 生命周期需在下一次加载新代码的真实运行中验证，但不得为取 1101 反复断网。
+4. 当前约 13:00 ET 起跑的部分日运行自然结束后先封存 accounting/health/manifest；另一天从开盘前
+   运行一次 Full-RTH 全日 health，同时覆盖 `finalize_day`、开/午/收盘 bar cadence、长期内存、
    磁盘和队列水位，并解释 OVERNIGHT route 下 `useRTH=True` 仍有 bar 的直接行为。
 5. 完成 Recorder 强杀后 gzip 段级完整性/尾段处置，以及 attestation 统一读取 Git 对象。
 6. 完成 `PENDING DOC REVIEW` 并形成 B2 自己的 exact-freeze——不借 B1 attestation 背书。

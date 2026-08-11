@@ -17,6 +17,8 @@ from ib_execution.market_liveness import (
     DEFAULT_BAR_TIMEOUT_SECONDS,
     MIN_BAR_TIMEOUT_SECONDS,
     LivenessAction,
+    LivenessIncidentKind,
+    LivenessIncidentTracker,
     MarketLiveness,
 )
 
@@ -258,6 +260,7 @@ def test_the_manifest_records_what_was_suppressed_and_what_was_lost():
     assert manifest["heartbeat_stream"] == "BAR_5S"
     assert manifest["advisory_streams_never_stop_the_run"] is True
     assert manifest["suppressed_assessments"] == 1
+    assert manifest["suppressed_assessments_are_poll_count"] is True
     assert manifest["heartbeat_losses"] == 1
 
 
@@ -278,6 +281,152 @@ def test_ages_never_go_negative_on_a_clock_that_appears_to_move_backwards():
 
     assert liveness.heartbeat_age(99.0) == 0.0
     assert not math.isnan(liveness.heartbeat_age(99.0))
+
+
+# -- incident lifecycle, not poll-count logging -----------------------
+
+
+def test_a_hundred_second_feed_outage_emits_three_rows_not_four_hundred():
+    liveness = _live()
+    incidents = LivenessIncidentTracker(checkpoint_seconds=60.0)
+    liveness.note_status(1100, "Connectivity between IB and TWS has been lost")
+
+    markers = []
+    for quarter_second in range(1, 401):
+        now = quarter_second / 4.0
+        markers.extend(incidents.observe(liveness.assess(now), now))
+
+    liveness.note_status(1102, "Connectivity restored - data maintained")
+    # 1102 says the subscription was maintained; the first returned bar is
+    # still the positive observation that closes the coverage incident.
+    liveness.note_event("BAR_5S", 100.25)
+    markers.extend(incidents.observe(liveness.assess(100.25), 100.25))
+
+    assert len(markers) == 3
+    assert markers[0].startswith("FEED_OUTAGE_START:")
+    assert markers[1].startswith("FEED_OUTAGE_CHECKPOINT:")
+    assert markers[2].startswith("FEED_OUTAGE_END:")
+    assert all("GAP_SUSPECTED" not in marker for marker in markers)
+    assert "duration=100.0s" in markers[2]
+
+    manifest = incidents.manifest(100.25)
+    assert manifest["incident_count"] == 1
+    assert manifest["completed_incident_count"] == 1
+    assert manifest["open_incident_count"] == 0
+    assert manifest["incident_by_kind"] == {"FEED_OUTAGE": 1}
+    assert manifest["total_seconds_by_kind"]["FEED_OUTAGE"] == pytest.approx(100.0)
+
+
+def test_a_material_feed_outage_change_emits_one_update():
+    liveness = _live()
+    incidents = LivenessIncidentTracker()
+    liveness.note_status(1100, "Connectivity lost")
+    start = incidents.observe(liveness.assess(1.0), 1.0)
+
+    liveness.note_status(1101, "Connectivity restored - data lost")
+    update = incidents.observe(liveness.assess(2.0), 2.0)
+
+    assert len(start) == 1
+    assert len(update) == 1
+    assert update[0].startswith("FEED_OUTAGE_UPDATE:")
+    assert "action=recover_subscription" in update[0]
+    assert "market data lost (1101)" in update[0]
+
+
+def test_unexplained_bar_loss_is_one_gap_incident_until_recovery():
+    liveness = _live()
+    incidents = LivenessIncidentTracker(checkpoint_seconds=60.0)
+
+    start = incidents.observe(liveness.assess(12.1), 12.1)
+    duplicate = incidents.observe(liveness.assess(12.35), 12.35)
+    liveness.note_event("BAR_5S", 12.5)
+    end = incidents.observe(liveness.assess(12.5), 12.5)
+
+    assert len(start) == 1
+    assert start[0].startswith("GAP_SUSPECTED_START:")
+    assert duplicate == []
+    assert len(end) == 1
+    assert end[0].startswith("GAP_SUSPECTED_END:")
+    assert "max_bar_age=12.3s" in end[0]
+
+
+def test_reconnect_grace_period_does_not_claim_recovery_before_a_bar():
+    liveness = _live()
+    incidents = LivenessIncidentTracker()
+    incidents.observe(liveness.assess(12.1), 12.1)
+
+    liveness.subscription_started(20.0)
+    no_bar_yet = incidents.observe(liveness.assess(20.1), 20.1)
+    liveness.note_event("BAR_5S", 20.2)
+    first_bar = incidents.observe(liveness.assess(20.2), 20.2)
+
+    assert no_bar_yet == []
+    assert len(first_bar) == 1
+    assert first_bar[0].startswith("GAP_SUSPECTED_END:")
+    assert "recovery_reason=bar cadence intact" in first_bar[0]
+
+
+@pytest.mark.parametrize(
+    ("silence", "configure"),
+    [
+        ("halt", lambda live: live.note_halted(1)),
+        ("calendar", lambda live: live.enter_calendar_silence("closing auction")),
+    ],
+)
+def test_legitimate_silence_is_not_labelled_as_a_data_gap(silence, configure):
+    liveness = _live()
+    incidents = LivenessIncidentTracker()
+    configure(liveness)
+
+    state = liveness.assess(30.0)
+    markers = incidents.observe(state, 30.0)
+
+    assert silence in {"halt", "calendar"}
+    assert state.incident_kind is LivenessIncidentKind.EXPECTED_SILENCE
+    assert markers[0].startswith("EXPECTED_SILENCE_START:")
+    assert "GAP_SUSPECTED" not in markers[0]
+
+
+def test_incident_kind_transition_closes_old_before_starting_new():
+    liveness = _live()
+    incidents = LivenessIncidentTracker()
+    liveness.note_halted(1)
+    incidents.observe(liveness.assess(20.0), 20.0)
+
+    liveness.note_halted(0)
+    markers = incidents.observe(liveness.assess(21.0), 21.0)
+
+    assert len(markers) == 2
+    assert markers[0].startswith("EXPECTED_SILENCE_END:")
+    assert markers[1].startswith("GAP_SUSPECTED_START:")
+
+
+def test_unclosed_incident_is_explicit_in_the_manifest():
+    liveness = _live()
+    incidents = LivenessIncidentTracker()
+    liveness.note_status(1100, "Connectivity lost")
+    incidents.observe(liveness.assess(1.0), 1.0)
+
+    manifest = incidents.manifest(11.0)
+
+    assert manifest["open_incident_count"] == 1
+    assert manifest["completed_incident_count"] == 0
+    assert manifest["open_incident"]["kind"] == "FEED_OUTAGE"
+    assert manifest["open_incident"]["duration_seconds"] == pytest.approx(10.0)
+
+
+def test_clean_boundary_closes_an_open_incident():
+    liveness = _live()
+    incidents = LivenessIncidentTracker()
+    liveness.enter_calendar_silence("closing auction")
+    incidents.observe(liveness.assess(1.0), 1.0)
+
+    markers = incidents.close("session ended", 5.0)
+
+    assert len(markers) == 1
+    assert markers[0].startswith("EXPECTED_SILENCE_END:")
+    assert "recovery_reason=session ended" in markers[0]
+    assert incidents.manifest(5.0)["open_incident_count"] == 0
 
 
 # -- the production loop must actually use all of this ----------------
@@ -322,12 +471,13 @@ def test_the_production_loop_marks_the_data_before_it_reacts():
     """A gap the log does not admit to is the failure this layer prevents.
 
     An unlabelled gap silently claims continuity, and a backtest cannot tell
-    it from a quiet market. The marker must therefore be written for every
-    non-CONTINUE verdict, not only the ones that end the session.
+    it from a quiet market. The incident edge must therefore be written before
+    an actionable verdict ends the connection.
     """
     source = _loop_source()
-    assert "GAP_SUSPECTED" in source
-    marker_at = source.index("GAP_SUSPECTED")
+    assert "_liveness_incidents.observe" in source
+    assert "special_conditions=marker" in source
+    marker_at = source.index("_liveness_incidents.observe")
     raise_at = source.index("market data not live")
     assert marker_at < raise_at, "the raw log must be marked before the run reacts"
 

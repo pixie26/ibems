@@ -217,7 +217,10 @@ def write_state(root: Path) -> Path:
     }
     path = root / STATE_FILENAME
     tmp = root / f".{STATE_FILENAME}.tmp"
-    tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    # Write bytes so Windows cannot translate LF to CRLF. `.gitattributes`
+    # deliberately disables Git EOL conversion; generated provenance must
+    # therefore be platform-independent before Git sees it.
+    tmp.write_bytes((json.dumps(state, indent=2, sort_keys=True) + "\n").encode("utf-8"))
     tmp.replace(path)
     return path
 

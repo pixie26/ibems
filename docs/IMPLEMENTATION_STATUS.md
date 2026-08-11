@@ -33,25 +33,27 @@ attestation 覆盖不会抹掉历史 exact-freeze PASS，也不会放宽当前�
 - durable HALT + exact-cause CAS acknowledgement；connect/reconcile 前强制 journal restore；
 - async single-writer bridge、Windows/POSIX watchdog PID identity 与 fencing；
 - 22 条 invariant 的 P/R/A auditor 入口，包括 per-intent overnight stress 重算；
-- 144 个 non-property tests：PASS；
-- 5 个 property tests：默认 100-example profile PASS；
-- 当前完整工作树合计 149 tests：PASS；
+- historical B1 freeze 的 144 个 non-property tests 与 5 个 property tests：PASS；
+- 2026-08-12 当前 B2 工作树收集 386 tests：381 PASS、5 个环境相关 SKIP；这不把新工作树倒灌为 B1 exact-freeze；
 - 正式 Gate profile：两个生成测试各 1,500 examples PASS，seed `2026080601`，source-tree hash 与 manifest 复算一致；
 - 7 个 subprocess force-kill crash windows：PASS；
 - SQLite locked、disk full、malformed WAL、fsync timeout、writer death、bridge death：fail-closed tests PASS；
-- read-only Full-RTH Recorder：订阅/存储/Parquet/health/hash 代码与本地测试 PASS；
+- read-only、具备 Full-RTH 边界处理能力的 Recorder：订阅/存储/Parquet/health/hash 代码与本地测试 PASS；尚无完整 Full-RTH 实测 PASS；
 - 4002 Read-Only Gateway 握手：PASS；server time、SPY `conId=756733` 与合约详情读取 PASS；
+- 持三路订阅的真实 production fault：观察 1100→1102、不重订和三路恢复；1101 未观察，当前部分日运行不是 Full-RTH；
+- Windows Gateway 分层检测：在真实 CIM Access Denied 下仍由 PID、4002 listener 与只读 API server version 178 判定 `RUNNING_API_VERIFIED`；
 - positions → all-open-orders → executions 三轮读取连续两对 canonical hash 相等（22/3/0）；这是静态时段的候选屏障证据，不是 Gate B2 通过；
 - **2026-08-07 复测**（paper 账户已 redact，0 持仓 / 0 挂单）：IB `10089` entitlement 阻塞已解除，`marketDataType=1`（Live），`entitlement_blocked=false`，报告的时钟偏差约 +1.4s；20 秒采样收到 BidAsk tick 与 4 条 5 秒 realtime bars，`AllLast` 报 0 tick，`passed=false`（证据 `artifacts/ib_preflight/20260807T151722Z/report.json`）。
   - **该次预检的 tick 计数口径已被判定无效**，`AllLast=0` 不构成证据：脚本读的是 `Ticker.tickByTicks` 的残余缓冲，而 `ib_async` 在网络更新之间清空它；`bars_5s` 之所以正确是因为它读的是会累积的 `RealTimeBarList`。
   - **该次预检的时钟偏差同样不可用**：`datetime.now() - reqCurrentTime()` 未做 RTT 补偿，而 IB server time 只有秒级粒度，所以 +1.4s 里有多少是真实偏差无法区分。健康阈值是 2s，按当时口径会因量化噪声误判整天数据。
 
-## Recorder 行情状态（2026-08-07 更新）
+## Recorder 行情状态（2026-08-12 更新）
 
 - 历史阻塞 `10089`（缺 `SPY ARCA/TOP/ALL` API LIVE entitlement）**已解除**：`marketDataType=1`，`entitlement_blocked=false`。
-- `AllLast` 是否正常**目前无证据，不是「有 0 tick 这个证据」**。2026-08-07 的计数口径已被判定无效（见上），因此该次预检对 `AllLast` 既不支持也不否定任何结论。改成 event-driven 累积计数后重测，才第一次会产生关于 `AllLast` 的有效观测。
+- `AllLast` 已在 OVERNIGHT、正式 RTH bounded run 和 2026-08-12 持订阅断网恢复后直接观察为非零；2026-08-07 的旧 `AllLast=0` 仍是无效计数口径，不得复活为反证。
 - 明确不成立的推理：「5s TRADES bar 正常 ⇒ tick-by-tick AllLast 正常」。`reqRealTimeBars` 与 `reqTickByTickData` 是不同的订阅路径，前者健康不构成后者健康的证据。
-- 在三路 sample 全部稳定非零、且至少有一个完整 Full-RTH health report 之前，Recorder 仍按 fail-closed 退出码 2 处理。
+- 三路 sample 与 bounded write/readback 已通过，但仍没有一个完整 Full-RTH health report。当前约 13:00 ET 起跑的长跑只能作为部分日资源/恢复证据，不能补齐全日覆盖。
+- 旧 production fault 为一个 outage 写了 380 条 poll-level marker；新 incident 生命周期已通过测试，但尚未由下一次真实 Gateway fault 直接验证。
 
 ## Gate B1 blockers（8 项，机器可读状态见 `STATE.json`）
 
@@ -127,7 +129,6 @@ HALT 被 witness 钉在 seq 2309（OPERATING_MODE_CHANGED）
 
 - 未发现 `config/paper.yml`；
 - ~~`SPY ARCA/TOP/ALL` API LIVE entitlement 缺失（IB `10089`）~~ —— **2026-08-07 已解除**，`marketDataType=1`、`entitlement_blocked=false`；
-- `AllLast` 订阅路径尚无有效观测（2026-08-07 的计数口径无效），改成 event-driven 累积计数后才能重测；
 - 独立 recorder username/Gateway 与首个 Full-RTH health report 尚未验证。
 
 Recorder 可以在 Gate A/B1 之外独立上线，但只能保持 Read-Only API；它的通过不推导 trading adapter 可连接。
@@ -135,7 +136,7 @@ Recorder 可以在 Gate A/B1 之外独立上线，但只能保持 Read-Only API�
 ## Gate B2 blockers
 
 - `IbAdapter.place_order/cancel_order` 和完整 callback/error mapping；
-- 空状态 stable-snapshot、Gateway 正常 restart、Task Manager End task、Windows `TerminateProcess`、API client 异常死亡及 Gateway 存活时的 `1100 -> 1102` 已直接观察；仍缺 1101、非空动态 broker facts、成交/回调并发和 late callback 下的 barrier 实测；
-- SPY overnight 和正式 RTH 三路行情尚未完成；休市零 tick 不形成结论；
+- 空状态 stable-snapshot、Gateway 正常 restart、Task Manager End task、Windows `TerminateProcess`、API client 异常死亡，以及空状态与持三路订阅 production run 的 `1100 -> 1102` 已直接观察；仍缺 1101、非空动态 broker facts、成交/回调并发和 late callback 下的 barrier 实测；
+- SPY overnight 和正式 RTH bounded 三路行情已完成；仍缺 Full-RTH 全日 health，新 incident 生命周期尚未真实 fault 复测；
 - orderRef/permId/clientId、fee delay/correction/cancel race 仍未产生真实订单证据；
 - 只读证据封存后，才由 owner 单独决定是否授权 1 股 SPY paper-order protocol；当前没有该授权。

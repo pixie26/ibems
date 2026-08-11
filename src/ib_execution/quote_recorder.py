@@ -70,15 +70,19 @@ import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import asdict, dataclass, field, fields
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Optional
 from uuid import uuid4
 
+from . import market_liveness
 from .durable_io import durable_atomic_write, durable_replace
 from .event_loop_heartbeat import EventLoopHeartbeat
-from . import market_liveness
-from .market_liveness import LivenessAction, MarketLiveness
+from .market_liveness import (
+    LivenessAction,
+    LivenessIncidentTracker,
+    MarketLiveness,
+)
 from .processlock import ProcessLock, ProcessLockUnavailable
 from .recorder_modes import CapturePolicy, DataMode
 
@@ -1381,6 +1385,7 @@ class QuoteRecorder:
         self.liveness = MarketLiveness(
             bar_timeout_seconds=self.config.bar_heartbeat_timeout_seconds,
         )
+        self._liveness_incidents = LivenessIncidentTracker()
         self._sample_lock = threading.Lock()
         self._bidask_prebuffer: deque[tuple[float, RawTick]] = deque()
 
@@ -1654,6 +1659,8 @@ class QuoteRecorder:
 
     def _finalize(self, session) -> dict[str, Any]:
         assert self.log is not None
+        liveness_manifest = self.liveness.manifest()
+        liveness_manifest["incidents"] = self._liveness_incidents.manifest()
         return finalize_day(
             self.log,
             session_open=session.start,
@@ -1663,7 +1670,7 @@ class QuoteRecorder:
             selected_counts=self.selected_events,
             filtered_counts=self.filtered_events,
             capture_policy=self.capture_policy.manifest(),
-            liveness=self.liveness.manifest(),
+            liveness=liveness_manifest,
         )
 
     def run(self) -> dict[str, Any]:  # pragma: no cover - requires a real Gateway/session
@@ -1831,17 +1838,15 @@ class QuoteRecorder:
                     # records them; this loop must turn that state into the
                     # non-retryable/finalized failure path.
                     self._raise_if_fatal_error()
-                    if state.action is not LivenessAction.CONTINUE:
-                        # Mark the data before doing anything about it. A
-                        # labelled gap is usable in a backtest; an unlabelled
-                        # one silently claims continuity it does not have,
-                        # and that is the failure this whole layer exists to
-                        # prevent.
+                    # Assess four times per second, but record sustained states
+                    # as incidents rather than turning the poll cadence into
+                    # hundreds of duplicate audit rows.
+                    for marker in self._liveness_incidents.observe(state):
                         self._append(
                             "SYSTEM",
                             datetime.now(timezone.utc),
                             contract_id=contract.conId,
-                            special_conditions=f"GAP_SUSPECTED:{state.as_marker()}",
+                            special_conditions=marker,
                         )
                     if state.action is LivenessAction.RECOVER_SUBSCRIPTION:
                         # Recovery is a reconnect, which the reconnect budget
@@ -1873,6 +1878,13 @@ class QuoteRecorder:
                         )
                         last_server_probe = time.monotonic()
 
+                for marker in self._liveness_incidents.close("session ended"):
+                    self._append(
+                        "SYSTEM",
+                        datetime.now(timezone.utc),
+                        contract_id=contract.conId,
+                        special_conditions=marker,
+                    )
                 ib.cancelTickByTickData(contract, "BidAsk")
                 ib.cancelTickByTickData(contract, "AllLast")
                 ib.cancelRealTimeBars(bars)

@@ -41,6 +41,16 @@ def test_state_json_matches_worktree():
     )
 
 
+def test_state_writer_uses_platform_independent_lf(tmp_path, monkeypatch):
+    monkeypatch.setattr(provenance, "tree_state", lambda root: {"root": str(root)})
+    monkeypatch.setattr(provenance, "derived_gate_status", lambda root: {"gate": str(root)})
+
+    data = provenance.write_state(tmp_path).read_bytes()
+
+    assert data.endswith(b"\n")
+    assert b"\r" not in data
+
+
 def test_no_hand_maintained_checksum_file():
     """SHA256SUMS was deleted on purpose. Reintroducing it reintroduces drift."""
     assert not (ROOT / "SHA256SUMS").exists(), (

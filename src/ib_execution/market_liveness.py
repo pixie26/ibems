@@ -117,6 +117,14 @@ class LivenessAction(Enum):
     RECOVER_SUBSCRIPTION = "recover_subscription"
 
 
+class LivenessIncidentKind(Enum):
+    """Audit classification for a sustained non-normal liveness state."""
+
+    FEED_OUTAGE = "FEED_OUTAGE"
+    EXPECTED_SILENCE = "EXPECTED_SILENCE"
+    GAP_SUSPECTED = "GAP_SUSPECTED"
+
+
 @dataclass(frozen=True)
 class LivenessState:
     """One assessment. Everything a SYSTEM marker or report needs."""
@@ -127,10 +135,14 @@ class LivenessState:
     heartbeat_lost: bool = False
     expected_silence: Optional[str] = None
     advisory_ages: dict[str, float] = field(default_factory=dict)
+    incident_kind: LivenessIncidentKind | None = None
+    heartbeat_last_mono: float | None = None
 
     def as_marker(self) -> str:
         """Compact, greppable form for the raw log."""
         parts = [f"action={self.action.value}", f"reason={self.reason}"]
+        if self.incident_kind is not None:
+            parts.append(f"incident_kind={self.incident_kind.value}")
         if self.heartbeat_age is not None:
             parts.append(f"bar_age={self.heartbeat_age:.1f}s")
         if self.expected_silence:
@@ -138,6 +150,195 @@ class LivenessState:
         for stream, age in sorted(self.advisory_ages.items()):
             parts.append(f"{stream}_age={age:.1f}s")
         return ";".join(parts)
+
+
+@dataclass
+class _OpenIncident:
+    incident_id: str
+    kind: LivenessIncidentKind
+    started_mono: float
+    last_emitted_mono: float
+    signature: tuple[str, str | None]
+    max_heartbeat_age: float | None
+
+
+class LivenessIncidentTracker:
+    """Turn poll-level assessments into bounded incident lifecycle records.
+
+    The recorder assesses liveness four times per second. That cadence is an
+    implementation detail, not an incident count. This tracker emits on state
+    edges, material state changes, an optional durable checkpoint, and
+    recovery. A crash leaves a START without an END, which is intentionally an
+    unambiguous open incident rather than a fabricated recovery.
+    """
+
+    def __init__(
+        self,
+        *,
+        checkpoint_seconds: float = 60.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if checkpoint_seconds <= 0:
+            raise ValueError("checkpoint_seconds must be positive")
+        self.checkpoint_seconds = float(checkpoint_seconds)
+        self._clock = clock
+        self._open: _OpenIncident | None = None
+        self._next_id = 0
+        self._incident_by_kind: dict[str, int] = {}
+        self._completed_by_kind: dict[str, int] = {}
+        self._total_seconds_by_kind: dict[str, float] = {}
+        self._max_seconds_by_kind: dict[str, float] = {}
+
+    @staticmethod
+    def _signature(state: LivenessState) -> tuple[str, str | None]:
+        # Ages move on every poll and are deliberately excluded. Only a
+        # semantic action or explicit-silence change merits an UPDATE row.
+        # Unexplained heartbeat reasons also embed the current age, so reason
+        # text itself cannot be part of the stable identity.
+        return (state.action.value, state.expected_silence)
+
+    @staticmethod
+    def _max_age(current: float | None, candidate: float | None) -> float | None:
+        if candidate is None:
+            return current
+        return candidate if current is None else max(current, candidate)
+
+    @staticmethod
+    def _marker(
+        phase: str,
+        incident: _OpenIncident,
+        state: LivenessState,
+        now: float,
+        *,
+        recovery_reason: str | None = None,
+    ) -> str:
+        parts = [
+            f"{incident.kind.value}_{phase}",
+            f"incident_id={incident.incident_id}",
+            f"duration={max(0.0, now - incident.started_mono):.1f}s",
+        ]
+        if incident.max_heartbeat_age is not None:
+            parts.append(f"max_bar_age={incident.max_heartbeat_age:.1f}s")
+        if recovery_reason is not None:
+            parts.append(f"recovery_reason={recovery_reason}")
+        parts.append(state.as_marker())
+        return ":".join((parts[0], ";".join(parts[1:])))
+
+    def observe(
+        self,
+        state: LivenessState,
+        now_mono: float | None = None,
+    ) -> list[str]:
+        """Return zero or more lifecycle markers for one assessment."""
+
+        now = self._clock() if now_mono is None else float(now_mono)
+        markers: list[str] = []
+        kind = state.incident_kind
+
+        if (
+            self._open is not None
+            and kind is None
+            and (
+                state.heartbeat_last_mono is None
+                or state.heartbeat_last_mono < self._open.started_mono
+            )
+        ):
+            # A reconnect resets the grace-period clock. It is not positive
+            # evidence that the subscription is producing data again. Keep
+            # the incident open until a post-incident BAR_5S arrives.
+            self._open.max_heartbeat_age = self._max_age(
+                self._open.max_heartbeat_age, state.heartbeat_age
+            )
+            return markers
+
+        if self._open is not None and self._open.kind is not kind:
+            markers.append(self._end(state, now, recovery_reason=state.reason))
+
+        if kind is None:
+            return markers
+
+        signature = self._signature(state)
+        if self._open is None:
+            self._next_id += 1
+            incident_id = f"{kind.value.lower()}-{self._next_id:04d}"
+            self._open = _OpenIncident(
+                incident_id=incident_id,
+                kind=kind,
+                started_mono=now,
+                last_emitted_mono=now,
+                signature=signature,
+                max_heartbeat_age=state.heartbeat_age,
+            )
+            self._incident_by_kind[kind.value] = self._incident_by_kind.get(kind.value, 0) + 1
+            markers.append(self._marker("START", self._open, state, now))
+            return markers
+
+        incident = self._open
+        incident.max_heartbeat_age = self._max_age(
+            incident.max_heartbeat_age, state.heartbeat_age
+        )
+        if signature != incident.signature:
+            incident.signature = signature
+            incident.last_emitted_mono = now
+            markers.append(self._marker("UPDATE", incident, state, now))
+        elif now - incident.last_emitted_mono >= self.checkpoint_seconds:
+            incident.last_emitted_mono = now
+            markers.append(self._marker("CHECKPOINT", incident, state, now))
+        return markers
+
+    def close(
+        self,
+        reason: str,
+        now_mono: float | None = None,
+    ) -> list[str]:
+        """Close an incident at a clean boundary such as normal session end."""
+
+        if self._open is None:
+            return []
+        now = self._clock() if now_mono is None else float(now_mono)
+        state = LivenessState(action=LivenessAction.CONTINUE, reason=reason)
+        return [self._end(state, now, recovery_reason=reason)]
+
+    def _end(self, state: LivenessState, now: float, *, recovery_reason: str) -> str:
+        assert self._open is not None
+        incident = self._open
+        incident.max_heartbeat_age = self._max_age(
+            incident.max_heartbeat_age, state.heartbeat_age
+        )
+        duration = max(0.0, now - incident.started_mono)
+        kind = incident.kind.value
+        self._completed_by_kind[kind] = self._completed_by_kind.get(kind, 0) + 1
+        self._total_seconds_by_kind[kind] = self._total_seconds_by_kind.get(kind, 0.0) + duration
+        self._max_seconds_by_kind[kind] = max(
+            self._max_seconds_by_kind.get(kind, 0.0), duration
+        )
+        marker = self._marker(
+            "END", incident, state, now, recovery_reason=recovery_reason
+        )
+        self._open = None
+        return marker
+
+    def manifest(self, now_mono: float | None = None) -> dict[str, object]:
+        now = self._clock() if now_mono is None else float(now_mono)
+        open_incident = None
+        if self._open is not None:
+            open_incident = {
+                "incident_id": self._open.incident_id,
+                "kind": self._open.kind.value,
+                "duration_seconds": max(0.0, now - self._open.started_mono),
+                "max_heartbeat_age_seconds": self._open.max_heartbeat_age,
+            }
+        return {
+            "checkpoint_seconds": self.checkpoint_seconds,
+            "incident_count": sum(self._incident_by_kind.values()),
+            "incident_by_kind": dict(sorted(self._incident_by_kind.items())),
+            "completed_incident_count": sum(self._completed_by_kind.values()),
+            "completed_by_kind": dict(sorted(self._completed_by_kind.items())),
+            "total_seconds_by_kind": dict(sorted(self._total_seconds_by_kind.items())),
+            "max_seconds_by_kind": dict(sorted(self._max_seconds_by_kind.items())),
+            "open_incident_count": int(self._open is not None),
+            "open_incident": open_incident,
+        }
 
 
 class MarketLiveness:
@@ -169,7 +370,7 @@ class MarketLiveness:
         self._halted: Optional[int] = None
         self._outages: dict[int, str] = {}
         self._calendar_silence: Optional[str] = None
-        self._pending_recover: Optional[str] = None
+        self._pending_recover: tuple[LivenessIncidentKind, str] | None = None
         #: Counted for the report: how often silence was explained rather
         #: than alarmed. A detector that never suppresses is not measuring.
         self.suppressed_assessments = 0
@@ -205,7 +406,10 @@ class MarketLiveness:
             self._outages[code] = f"connectivity lost ({code})"
         elif code == CONNECTIVITY_RESTORED_DATA_LOST:
             self._outages.pop(CONNECTIVITY_LOST, None)
-            self._pending_recover = f"connectivity restored, market data lost ({code})"
+            self._pending_recover = (
+                LivenessIncidentKind.FEED_OUTAGE,
+                f"connectivity restored, market data lost ({code})",
+            )
         elif code == CONNECTIVITY_RESTORED_DATA_KEPT:
             self._outages.pop(CONNECTIVITY_LOST, None)
         elif code in FARM_BROKEN_CODES:
@@ -223,7 +427,10 @@ class MarketLiveness:
         Stronger than any per-stream gap, because it does not depend on
         market activity -- TWS keeps talking even when the tape does not.
         """
-        self._pending_recover = f"no data of any kind from TWS for {idle_seconds:.1f}s"
+        self._pending_recover = (
+            LivenessIncidentKind.GAP_SUSPECTED,
+            f"no data of any kind from TWS for {idle_seconds:.1f}s",
+        )
 
     def enter_calendar_silence(self, reason: str) -> None:
         """A known auction/session boundary. Silence here is scheduled."""
@@ -236,13 +443,25 @@ class MarketLiveness:
 
     def expected_silence(self) -> Optional[str]:
         """Why silence is legitimate right now, or None."""
+        details = self._expected_silence_details()
+        return None if details is None else details[1]
+
+    def _expected_silence_details(
+        self,
+    ) -> Optional[tuple[LivenessIncidentKind, str]]:
         if self._halted in (1, 2):
             kind = "volatility pause" if self._halted == 2 else "halted"
-            return f"instrument {kind} (tick 49 = {self._halted})"
+            return (
+                LivenessIncidentKind.EXPECTED_SILENCE,
+                f"instrument {kind} (tick 49 = {self._halted})",
+            )
         if self._outages:
-            return "; ".join(self._outages[code] for code in sorted(self._outages))
+            return (
+                LivenessIncidentKind.FEED_OUTAGE,
+                "; ".join(self._outages[code] for code in sorted(self._outages)),
+            )
         if self._calendar_silence:
-            return self._calendar_silence
+            return (LivenessIncidentKind.EXPECTED_SILENCE, self._calendar_silence)
         return None
 
     def heartbeat_age(self, now_mono: Optional[float] = None) -> Optional[float]:
@@ -269,7 +488,9 @@ class MarketLiveness:
         now = self._now(now_mono)
         advisory = self.advisory_ages(now)
         age = self.heartbeat_age(now)
-        silence = self.expected_silence()
+        heartbeat_last_mono = self._last_event_mono.get(HEARTBEAT_STREAM)
+        silence_details = self._expected_silence_details()
+        silence = None if silence_details is None else silence_details[1]
 
         if self._started_mono is None:
             return LivenessState(
@@ -291,18 +512,22 @@ class MarketLiveness:
                 heartbeat_lost=age is not None and age > self.bar_timeout_seconds,
                 expected_silence=silence,
                 advisory_ages=advisory,
+                incident_kind=silence_details[0],
+                heartbeat_last_mono=heartbeat_last_mono,
             )
 
         # Explicit "your subscription is gone" beats waiting for the bar
         # timeout to notice the same thing several seconds later.
         if self._pending_recover is not None:
-            reason = self._pending_recover
+            incident_kind, reason = self._pending_recover
             self._pending_recover = None
             return LivenessState(
                 action=LivenessAction.RECOVER_SUBSCRIPTION,
                 reason=reason,
                 heartbeat_age=age,
                 advisory_ages=advisory,
+                incident_kind=incident_kind,
+                heartbeat_last_mono=heartbeat_last_mono,
             )
 
         if age is not None and age > self.bar_timeout_seconds:
@@ -316,6 +541,8 @@ class MarketLiveness:
                 heartbeat_age=age,
                 heartbeat_lost=True,
                 advisory_ages=advisory,
+                incident_kind=LivenessIncidentKind.GAP_SUSPECTED,
+                heartbeat_last_mono=heartbeat_last_mono,
             )
 
         return LivenessState(
@@ -323,6 +550,7 @@ class MarketLiveness:
             reason="bar cadence intact",
             heartbeat_age=age,
             advisory_ages=advisory,
+            heartbeat_last_mono=heartbeat_last_mono,
         )
 
     def manifest(self) -> dict[str, object]:
@@ -336,6 +564,7 @@ class MarketLiveness:
             "halt_state": self._halted,
             "open_outages": [self._outages[code] for code in sorted(self._outages)],
             "suppressed_assessments": self.suppressed_assessments,
+            "suppressed_assessments_are_poll_count": True,
             "heartbeat_losses": self.heartbeat_losses,
         }
 

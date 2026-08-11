@@ -19,7 +19,7 @@
 | 无 IB 依赖的执行核心 | Gate B1 已在 exact-freeze commit `117188cea539...` 完成正式 campaign、真实存储故障证据和 owner acceptance，结论为 PASS。当前 B2 工作树已有 freeze 后改动，必须单独验证，不能沿用 B1 attestation。 |
 | Hypothesis Gate campaign | B1 exact-freeze campaign 已通过；详细计数与 artifact digest 见 `docs/GATE_B1_SIGNOFF_117188cea539.md`。任何 B2 行为代码改动都需要绑定新的 tree 重新验证。 |
 | 不变量 0 + 22 条安全不变量 | B1 exact-freeze 的 Property / Runtime / Auditor 与 B1.6 journal witness 已闭环。真实 IB reconciliation、unknown broker facts 和 callback 行为明确留给 B2，不属于 B1 PASS 的证明范围。 |
-| 只读 SPY Recorder / B2 preflight | Gateway 4002、server time、SPY `conId=756733`、account summary、空状态 broker snapshot、多 client、Gateway restart / `TerminateProcess` 与 `1100 -> 1102` 已有直接观测。明确 `OVERNIGHT` 和正式 `RTH+SMART` 的三路行情及 bounded Recorder 写盘均已 PASS；仍不是 Full-RTH 全日 health。 |
+| 只读 SPY Recorder / B2 preflight | Gateway 4002、server time、SPY `conId=756733`、account summary、空状态 broker snapshot、多 client、Gateway restart / `TerminateProcess` 已有直接观测。明确 `OVERNIGHT` 和正式 `RTH+SMART` 的三路行情及 bounded Recorder 写盘均已 PASS；持三路订阅的 production 断网已观察 1100→1102、不重订与三路恢复。当前 13:00 ET 起跑的长跑仍是部分日，不是 Full-RTH 全日 health；1101 未观察。 |
 | 交易型 IB Adapter | 未授权连接下单路径。`placeOrder`、`cancelOrder`、订单身份、完整 callback/error mapping 和非空动态 reconciliation 尚未在真实 Gateway 验证。 |
 | Emergency flatten broker path | 未实现。现有代码只覆盖计划生成与人工确认边界。 |
 
@@ -132,12 +132,14 @@ Recorder 与交易路径隔离开发，只采集：
 
 当前实测已在 SPY OVERNIGHT 与正式 `RTH+SMART` bounded run 中直接观察到 LIVE BidAsk、AllLast 和 5 秒 bars 三路非零。早期 sleep 后读取 `Ticker.tickByTicks` 残余缓冲得到的 `AllLast=0` 已被判定为无效测量；现有 preflight 与 Recorder 都在 callback 中累计。2026-08-11 的 RTH handler-count run 中，handler 与 raw readback 均为 `8972/1707/25`，直接证明该窗口 callback→gzip→readback 无丢失。旧 preflight 与 Recorder 位于不重叠窗口，约 40% 的 BidAsk 计数差异从来不是有效的丢包测量，现已关闭且不再安排同步 A/B；这仍不等于 IB 上游无损或 Full-RTH 全日 health。
 
+2026-08-12 又用真实 `QuoteRecorder.run()` 持有三路订阅执行一次经授权的 45 秒 outbound block：直接观察 1100→1102、connection epoch 不变、没有重订，三路均在 1102 后恢复。本轮没有 1101。旧进程还暴露一个审计问题：一个持续 outage 按 0.25 秒 poll 写了 380 条 `GAP_SUSPECTED`；新代码已改为 `FEED_OUTAGE / EXPECTED_SILENCE / GAP_SUSPECTED` 的 START/UPDATE/CHECKPOINT/END 生命周期，并要求 incident 后真实 BAR_5S 才能闭合，但该新逻辑尚未在真实 fault 上复测。详细边界见 [`docs/GATE_B2_CONTROLLED_DISCONNECT_20260812_ZH.md`](docs/GATE_B2_CONTROLLED_DISCONNECT_20260812_ZH.md)。
+
 ```powershell
 # Broker-write-free Gateway 与稳定快照预检
-.\.venv312\Scripts\python.exe scripts\run_ib_readonly_preflight.py --port 4002
+.\.venv312\python.exe scripts\run_ib_readonly_preflight.py --port 4002
 
 # 只有预检得到 market_data_type=1 且三路 sample 均非零后才运行
-.\.venv312\Scripts\python.exe -m ib_execution.quote_recorder `
+.\.venv312\python.exe -m ib_execution.quote_recorder `
   --root data\recordings --port 4002
 ```
 
@@ -204,8 +206,8 @@ python -m ib_execution.execution_host --journal D:\ibems-data\journal.db \
 ## 下一步
 
 1. **策略 Gate A 独立推进。** 在策略仓库完成真实成本、数据质量和统计不确定性判断；若结论为 `NO_GO` 或 `INSUFFICIENT_EVIDENCE`，且没有独立第二消费者，就停止投资交易型 IB Adapter。
-2. **最高优先级是持三路订阅的受控断网。** 在一次 operator 明确确认的窗口中，用真实 `QuoteRecorder.run()` 同时验证实际 1101/1102、1101 重订/1102 不重订、`GAP_SUSPECTED`、bar heartbeat 与恢复后逐流增量；不预设必须得到 1101。
-3. **随后运行一次 Full-RTH 全日 health。** 同时验证 `finalize_day` 全日 coverage、开盘/午盘/收盘的 5 秒 bar 节奏，以及长时间内存、磁盘和队列水位；在直接观测前，bar heartbeat 仍不能被宣称为全时段有效承重结构。
+2. **持三路订阅的受控断网已部分闭环。** production `run()` 已直接观察 1100→1102、不重订和恢复后逐流增量；1101 仍未观察，新 incident 生命周期尚未真实 fault 复测。不得为碰取 1101 重复断网。
+3. **先封存当前部分日，再运行一次真正 Full-RTH。** 当前约 13:00 ET 起跑的运行即使到收盘也不是 Full-RTH；自然结束后先核对 writer accounting、health、manifest 和 digest。另一天从开盘前启动，验证 `finalize_day` 全日 coverage、开盘/午盘/收盘 bar 节奏，以及长期内存、磁盘和队列水位。
 4. **完成本地剩余小项与 B2 freeze。** 为强杀后的 gzip 段增加明确的段级完整性判定和不完整尾段处置；统一 attestation 从 Git 对象读取历史冻结事实；完成官方文档复核，并把 B2 source、tests、docs 和 evidence 绑定到新的可复查 tree。
 5. **只读阶段不下单。** `completed orders` 被 Gateway Read-Only policy 阻断；不关闭保护追测。非空 reconciliation、订单身份和 callback 保留到另行授权的 paper-order 子阶段。
 6. **paper order 必须重新授权。** 只读证据封存后，owner 才单独决定是否运行 1 股 SPY paper-order protocol；B1 PASS 或 B2 只读结果都不自动构成该授权。MOC、多策略、live capital 和自动 watchdog takeover 继续推迟；live order 继续禁止。

@@ -205,11 +205,24 @@ asyncio.windows_events._poll
 
 首轮在约 68 秒出现真实 `10197` competing-session error，并暴露 `entitlement_blocked=true` 仍可能错误汇总为 PASS 的工具缺口。现已增加 fatal entitlement 与完整 sample-window 两个否决检查；失败 v1 保留，设置调整后的独立 v2 才作为 RTH PASS 证据。详细结果和 digest 见 [`GATE_B2_RTH_20260810.md`](GATE_B2_RTH_20260810.md)。这仍不是 Full-RTH 全日 health。
 
+### 5.7 持三路订阅的 production 受控断网（2026-08-12）
+
+真实 `QuoteRecorder.run()` 在持有 BidAsk、AllLast、BAR_5S 时执行一次经 owner 明确授权的 45 秒
+`ibgateway.exe` outbound block。直接观察 1100→1102、connection epoch 保持 1、没有
+`RESUBSCRIBE_REQUIRED`；1102 后三路本地接收分别约 +0.264/+0.267/+0.896 秒。没有观察到 1101，
+因此 1101→重订阅仍未验证。
+
+首次启动因 STK generic tick 49 被 Gateway error 321 拒绝而 fail closed；失败 artifact 保留。重试使用
+`market_data_generic_ticks=""`，约 13:00 ET 才开始，所以是部分日长跑，不是 Full-RTH。旧进程为同一
+outage 每 0.25 秒写 marker，共 380 条；新 incident 生命周期随后在源码中修正并通过测试，但当前真实
+进程加载旧代码，不能把修正倒推为真实 Gateway PASS。完整记录见
+[`GATE_B2_CONTROLLED_DISCONNECT_20260812_ZH.md`](GATE_B2_CONTROLLED_DISCONNECT_20260812_ZH.md)。
+
 ## 6. 没有被本轮证明的事项
 
 - RTH bounded 三路行情已经证明；两分钟样本仍不证明完整交易日 coverage 或整日 gap thresholds。
 - 零持仓、零挂单、零成交时的 hash 稳定，不证明动态 broker snapshot 是原子的，也不证明双快照屏障足以恢复 `SYNCED`。
-- Gateway 正常退出、Task Manager End task、`TerminateProcess` 及 Gateway 保持运行时的外网断线已经验证；外网断线轮直接观察到 1100 → 1102，但尚未观察到 1101，也未验证 late/duplicate/out-of-order order callback。
+- Gateway 正常退出、Task Manager End task、`TerminateProcess`，以及空状态和持三路订阅 production run 的外网断线已经验证；两类外网断线均直接观察到 1100→1102，但尚未观察到 1101，也未验证 late/duplicate/out-of-order order callback。
 - 没有验证 `orderId / permId / clientId / orderRef`。
 - 没有发 paper order；Read-Only 权限提示也不构成订单尝试或订单授权；B1 PASS 仍不构成订单授权。
 
@@ -217,9 +230,15 @@ asyncio.windows_events._poll
 
 本轮修改了 B2 preflight 行为与其测试，因此当前工作树不再等同于 B1 exact-freeze source tree。`docs/GATE_B1_SIGNOFF_117188cea539.md` 仍是历史冻结证据，但不能自动证明这些新改动。进入任何 paper-order 测试前，必须把 B2 变更纳入新的可复查 tree 并重新满足相应的回归 / attestation 要求。
 
-Windows 上还观察到一个独立的 provenance 表示问题：`uv.lock` Git 内容未变，但 checkout 的 CRLF 原始字节 SHA-256 为 `4050...`；LF 归一化后为 STATE 记录的 `615629...`。当前 provenance 对 worktree 原始字节取 hash，因此 Linux 生成的 STATE 在 Windows clean checkout 也会显示 stale。这个问题不改变本轮 Gateway 观测，但必须在下一次正式 freeze 前修复，不能通过手改 STATE 掩盖。
+Windows provenance 的 checkout 行尾问题已由 `.gitattributes` 的 `* -text` 修复；随后又发现生成器本身
+用 `Path.write_text()` 在 Windows 重新产生 CRLF。生成器现改为显式 UTF-8 bytes + LF，并有回归测试；
+当前 `STATE.json` 实测 `CR=0` 且 `python -m ib_execution.provenance --check` 通过。该修复只保证表示一致，
+不把新的 B2 worktree 纳入历史 B1 attestation。
 
-2026-08-10 在当前 Windows checkout 启动完整 `pytest -q`；外层 120 秒限时前已经出现失败。随后以 `pytest -x -vv` 定位第一个失败：`tests/test_fatal_fence.py::test_a_fence_is_durable_and_readable` 在 64 passed、1 skipped 后，因 Windows 对目录执行 `os.open(path, O_RDONLY)` 返回 `PermissionError` 而失败。该结果与已接受但尚未完成真实故障验证的 Windows gap 一致；本轮不能宣称完整回归通过。加入 overnight routing 约束后 B2 preflight 专项测试为 18 passed；Recorder clock 相关测试为 3 passed；overnight probe 与相关脚本均通过 Python compile 和 broker-write-path 静态搜索。全量 `tests/test_recorder.py` 曾启动但长时间未完成后受控终止，不能宣称该文件全量 PASS。
+历史 2026-08-10 Windows 全套失败证据仍保留，不能改写。但相关 Windows 目录 fsync、Recorder 和
+provenance 问题后续已修正；2026-08-12 当前 B2 工作树收集 386 tests，完整运行 381 PASS、5 个环境相关
+SKIP，并通过核心 Ruff、PowerShell parse、`git diff --check` 和 provenance `--check`。这是当前工作树的
+回归证据，不是新的 B1 exact-freeze 签字。
 
 ## 8. 结论与下一步
 
@@ -230,6 +249,7 @@ Windows 上还观察到一个独立的 provenance 表示问题：`uv.lock` Git �
 1. 周末、零订单、Read-Only 边界下有明显安全价值的主要 Gateway 实测已经完成；completed-orders 保持 `BLOCKED_BY_GATEWAY_READ_ONLY_POLICY`，不得为补测而关闭 Read-Only；
 2. 明确 `OVERNIGHT` destination 的 SPY 行情与 bounded Recorder 已完成并 PASS；该结果不能替代 RTH；
 3. SPY RTH event-driven preflight 与 bounded Recorder 已完成；仍不得把两分钟样本称为 Full-RTH 全日 health；
-4. 保留 1101 为尚未观察到的分支；不得由已观察到的 1102 推断 1101；
-5. 完成官方文档逐项复核，并把 B2 source、tests、docs 和 evidence 纳入新的可复查 freeze；
-6. 只读证据封存后，再由 owner 单独决定是否授权 1 股 SPY paper-order protocol；非空 dynamic snapshot、订单身份和订单 callback 均留在该子阶段。
+4. 持三路订阅 production 1100→1102 已观察；保留 1101 为尚未观察到的分支，不得由 1102 推断，也不得为取码反复断网；
+5. 当前部分日自然结束后封存 accounting/health/manifest；另一天从开盘前运行真正 Full-RTH；
+6. 完成官方文档逐项复核，并把 B2 source、tests、docs 和 evidence 纳入新的可复查 freeze；
+7. 只读证据封存后，再由 owner 单独决定是否授权 1 股 SPY paper-order protocol；非空 dynamic snapshot、订单身份和订单 callback 均留在该子阶段。

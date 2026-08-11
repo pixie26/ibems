@@ -67,9 +67,21 @@ Recorder 现在有独立 heartbeat publisher 线程，但该线程不会自行�
 
 "这段静默要不要报警"由 IB 的显式信号回答，不由时长推断：generic tick 49（0=正常，1=停牌，2=波动性熔断）、market data farm 状态码 2103/2105 与 2104/2106、以及 1100/1101/1102 连接三元组。1101 表示订阅已丢必须重订，1102 表示订阅保留、重订反而会自己制造一段缺口。2108 是 IB 明说的"非错误"，不当作故障 —— 把它当故障是让 operator 学会无视告警的最快方式。另外 `ib.setTimeout()` / `timeoutEvent` 监听"完全没有任何数据从 TWS 过来"，它跑在 event loop 上，只能发现对端沉默；本地 loop 卡死由独立线程的 `EventLoopHeartbeat` 负责，两个失败域两个探测器。
 
-任何非 CONTINUE 判定都**先**往 raw log 写 `GAP_SUSPECTED` 再决定动作。被标注的缺口回测可用，未标注的缺口会默默宣称自己是连续的 —— 后者才是这一层真正要防的事故。恢复动作就是重连，由既有 `ReconnectBudget` 负责限次和升级，不另设第二套升级策略。
+任何非 CONTINUE 判定都必须**先**留下 raw-log 证据再决定动作，但不能把 0.25 秒 polling cadence
+伪装成 incident count。2026-08-12 的真实断网旧进程为一个持续 outage 写了 380 条
+`GAP_SUSPECTED`；新实现改为事件生命周期：IB 明示 1100/farm-down 使用
+`FEED_OUTAGE_START/UPDATE/CHECKPOINT/END`，halt/calendar 使用 `EXPECTED_SILENCE_*`，没有解释的 bar
+丢失才使用 `GAP_SUSPECTED_*`。相同状态不重复，默认每 60 秒最多一个 checkpoint；reconnect、1102 或
+重发订阅本身不能闭合 coverage incident，只有 incident 开始后的首个真实 BAR_5S 才能写 END。进程在
+恢复前崩溃会留下 START 无 END，manifest 明示 open incident，而不是制造恢复。恢复动作仍由既有
+`ReconnectBudget` 负责限次和升级，不另设第二套策略。
 
-仍需真实 Gateway 实测才能把 bar heartbeat 提升为 probe 的 pass/fail 条件（当前只记录、不判定）：停牌期间 bar 是否继续、tick 49 是否必须显式在 `genericTickList` 中请求、5 秒节奏能否覆盖开盘/午盘/收盘的长窗口、以及 `useRTH=True` 在 OVERNIGHT 路由下的真实语义。**未测就当作 pass 条件，等于重犯它所替换的错误。**
+持三路订阅的真实 production fault 已观察 1100→1102、不重订和三路恢复，证明 bar heartbeat 路径确实
+进入真实 `run()`；但未观察 1101，新 incident 生命周期又是在该运行启动后加入，不能倒推为真实 PASS。
+Gateway 还直接拒绝 STK generic tick 49（error 321），当前实测运行通过
+`market_data_generic_ticks=""` 覆盖继续；因此停牌态仍未有直接观测。仍需 Full-RTH 覆盖开盘/午盘/收盘
+5 秒节奏，并解释 `useRTH=True` 在 OVERNIGHT route 下的行为。**未测就当作 pass 条件，等于重犯它所
+替换的错误。**
 
 ## 测试策略
 

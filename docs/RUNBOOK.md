@@ -53,9 +53,11 @@ that is the cost model's availability term.
 
 ## 2. Daily — recorder
 
-**Current status: storage/health logic only; IB subscriptions are not yet
-implemented. Do not assume data collection has started.** Once Gate R1 ships,
-an automated report is pushed daily. Check:
+**Current status: all three IB market-data subscriptions and bounded Recorder
+runs have been observed, and a partial-day production run is in progress. No
+Full-RTH health report has passed.** Do not infer daily coverage from a live PID
+or a growing raw directory. Once Gate R1 ships, an automated report is pushed
+daily. Check only a finalized manifest:
 
 | Field | Threshold |
 |---|---|
@@ -64,11 +66,32 @@ an automated report is pushed daily. Check:
 | `max_gap_seconds` | ≤ 30 |
 | `clock_skew_seconds` | ≤ 2 |
 | `disconnects` | reviewed, not just counted |
+| `liveness.incidents` | no unexplained open incident; counts are lifecycle incidents, not poll rows |
 
 **Do not skip this because the recorder "just works".** The classic failure is
 discovering three months later that the feed silently switched to delayed data —
 and that every L2/L3 conclusion built on it is void. A daily check converts that
 into a one-day loss.
+
+### 2.1 Windows Gateway detection
+
+Use the layered detector; do not infer "Gateway is not running" from a failed
+`Get-CimInstance Win32_Process` call:
+
+```powershell
+.\.venv312\python.exe scripts\detect_ib_gateway.py `
+  --expected-path D:\tws\ibgateway\ibgateway.exe `
+  --host 127.0.0.1 --port 4002 --api-client-id 962
+```
+
+`RUNNING_API_VERIFIED`, `RUNNING_LISTENER_VERIFIED`, and
+`RUNNING_PROCESS_DETECTED` are positive running states. `INDETERMINATE` means
+inspection was incomplete and must never be reported as `NOT_RUNNING`.
+`NOT_RUNNING` is allowed only after successful process and listener queries
+both return empty and the API probe does not succeed. A dangerous action scoped
+to one executable, such as the controlled firewall drill, additionally requires
+`path_status=MATCH`; a running Gateway with an unreadable path must fail closed
+as `RUNNING_* + UNKNOWN_ACCESS_DENIED`, not as absent.
 
 ---
 
