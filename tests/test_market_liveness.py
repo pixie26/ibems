@@ -474,12 +474,25 @@ def test_the_production_loop_marks_the_data_before_it_reacts():
     it from a quiet market. The incident edge must therefore be written before
     an actionable verdict ends the connection.
     """
+    import inspect
+    import textwrap
+
+    from ib_execution import quote_recorder
+
     source = _loop_source()
     assert "_liveness_incidents.observe" in source
     assert "special_conditions=marker" in source
     marker_at = source.index("_liveness_incidents.observe")
-    raise_at = source.index("market data not live")
-    assert marker_at < raise_at, "the raw log must be marked before the run reacts"
+    react_at = source.index("_recover_market_data")
+    assert marker_at < react_at, "the raw log must be marked before the run reacts"
+
+    # The repair itself is also on the record, including which repair was
+    # chosen and the evidence it was chosen on, before it is carried out.
+    repair = textwrap.dedent(
+        inspect.getsource(quote_recorder.QuoteRecorder._recover_market_data)
+    )
+    assert repair.index("RECOVERY_ATTEMPT") < repair.index("SlowRecoveryReconnect(")
+    assert repair.index("RECOVERY_ATTEMPT") < repair.index("cancelRealTimeBars")
 
 
 def test_the_production_loop_no_longer_stops_on_event_driven_gaps():
@@ -535,3 +548,157 @@ def test_an_arriving_halt_value_proves_the_suppressor_is_connected():
     liveness.note_halted(0.0)
 
     assert liveness.manifest()["halt_state_available"] is True
+
+
+# -- recovery policy: repair the smallest broken thing ----------------
+
+
+def _scheduler(**kwargs):
+    from ib_execution.quote_recorder import RecoveryScheduler
+
+    defaults = dict(
+        fast_attempts=2, bars_only_seconds=120.0,
+        slow_base_seconds=300.0, slow_max_seconds=1800.0,
+    )
+    return RecoveryScheduler(**{**defaults, **kwargs})
+
+
+def _plan_names(scheduler, *, evidence_of_life, times):
+    return [
+        scheduler.plan(evidence_of_life=evidence_of_life, now_mono=t).value for t in times
+    ]
+
+
+def test_live_quotes_veto_a_reconnect_and_get_a_targeted_bar_repair():
+    """Tearing down a working socket to fix one stream is the wrong repair.
+
+    At the RTH rate observed on 2026-08-10 (25,665 BidAsk in 120.1s, ~214/s)
+    a full reconnect costs thousands of quotes. Re-requesting only the bar
+    stream costs none, which is what makes a short retry interval defensible.
+    """
+    from ib_execution.quote_recorder import RecoveryPlan
+
+    scheduler = _scheduler(fast_attempts=0)
+
+    first = scheduler.plan(evidence_of_life=True, now_mono=0.0)
+    immediately_after = scheduler.plan(evidence_of_life=True, now_mono=1.0)
+    after_the_interval = scheduler.plan(evidence_of_life=True, now_mono=121.0)
+
+    assert first is RecoveryPlan.BARS_ONLY
+    assert immediately_after is RecoveryPlan.NONE  # paced, not every poll
+    assert after_the_interval is RecoveryPlan.BARS_ONLY
+    assert scheduler.bars_only_attempts == 2
+    assert scheduler.slow_full_attempts == 0
+
+
+def test_total_silence_earns_a_full_reconnect_that_backs_off():
+    """Nothing is arriving, so a reconnect destroys nothing and may fix it.
+
+    Rate follows the cost of retrying, not the severity: free here, so start
+    short, then stretch out because the hundredth identical failure is
+    neither more likely to work nor worth another audit row.
+    """
+    from ib_execution.quote_recorder import RecoveryPlan
+
+    scheduler = _scheduler(fast_attempts=0, slow_base_seconds=300.0, slow_max_seconds=1200.0)
+    fired = []
+    now = 0.0
+    for _ in range(6):
+        for _ in range(20_000):  # four hours of 0.25s polls, compressed
+            if scheduler.plan(evidence_of_life=False, now_mono=now) is (
+                RecoveryPlan.FULL_RECONNECT
+            ):
+                fired.append(now)
+                break
+            now += 0.25
+        now += 0.25
+
+    gaps = [round(b - a) for a, b in zip(fired, fired[1:])]
+    assert gaps == [300, 600, 1200, 1200, 1200], gaps
+    assert scheduler.bars_only_attempts == 0
+
+
+def test_the_first_attempts_are_immediate():
+    """A genuinely dead subscription should not wait five minutes."""
+    from ib_execution.quote_recorder import RecoveryPlan
+
+    scheduler = _scheduler(fast_attempts=2)
+
+    assert scheduler.plan(evidence_of_life=False, now_mono=0.0) is RecoveryPlan.FULL_RECONNECT
+    assert scheduler.plan(evidence_of_life=False, now_mono=0.25) is RecoveryPlan.FULL_RECONNECT
+    assert scheduler.plan(evidence_of_life=False, now_mono=0.5) is RecoveryPlan.NONE
+
+
+def test_any_inbound_message_resets_the_backoff():
+    """A farm coming back at 14:00 must not wait out a 30-minute timer."""
+    from ib_execution.quote_recorder import RecoveryPlan
+
+    scheduler = _scheduler(fast_attempts=0, slow_base_seconds=300.0, slow_max_seconds=1800.0)
+    scheduler.plan(evidence_of_life=False, now_mono=0.0)
+    scheduler.plan(evidence_of_life=False, now_mono=300.0)
+    scheduler.plan(evidence_of_life=False, now_mono=900.0)  # delay now 1200s
+
+    # Without this the next attempt would not be due until t=2100.
+    scheduler.note_activity(now_mono=900.0)
+
+    assert scheduler.plan(evidence_of_life=False, now_mono=1199.0) is RecoveryPlan.NONE
+    assert scheduler.plan(evidence_of_life=False, now_mono=1200.1) is (
+        RecoveryPlan.FULL_RECONNECT
+    )
+
+
+def test_a_chatty_peer_cannot_turn_the_backoff_into_a_hammer():
+    """IB emits several messages around an outage; each one must not re-arm."""
+    from ib_execution.quote_recorder import RecoveryPlan
+
+    scheduler = _scheduler(fast_attempts=0, slow_base_seconds=300.0)
+    assert scheduler.plan(evidence_of_life=False, now_mono=0.0) is RecoveryPlan.FULL_RECONNECT
+
+    fired = 0
+    for tick in range(1, 1200):  # 300s of 0.25s polls, a message on every one
+        now = tick * 0.25
+        scheduler.note_activity(now_mono=now)
+        if scheduler.plan(evidence_of_life=False, now_mono=now) is RecoveryPlan.FULL_RECONNECT:
+            fired += 1
+
+    assert fired == 0, "no second attempt may land inside one base interval"
+
+
+def test_a_real_bar_puts_everything_back_to_square_one():
+    from ib_execution.quote_recorder import RecoveryPlan
+
+    scheduler = _scheduler(fast_attempts=1)
+    scheduler.plan(evidence_of_life=False, now_mono=0.0)
+    assert scheduler.plan(evidence_of_life=False, now_mono=1.0) is RecoveryPlan.NONE
+
+    scheduler.note_recovered()
+
+    assert scheduler.plan(evidence_of_life=False, now_mono=2.0) is RecoveryPlan.FULL_RECONNECT
+
+
+def test_the_scheduler_never_returns_an_exit():
+    """The owner's decision, made structural: unexplained silence never quits.
+
+    A recorder's only product is data, so ending the session turns a
+    labelled gap into no data for the rest of the day. The retry loop is
+    bounded in rate and in cost, and its stop condition is the session
+    close -- not a counter that can fire at 11:00.
+    """
+    from ib_execution.quote_recorder import RecoveryPlan
+
+    scheduler = _scheduler()
+    seen = set()
+    now = 0.0
+    for _ in range(200_000):  # well past a full trading day of polls
+        seen.add(scheduler.plan(evidence_of_life=now % 2 < 1, now_mono=now))
+        now += 0.25
+
+    assert seen <= set(RecoveryPlan)
+    assert scheduler.manifest()["exits_on_unexplained_silence"] is False
+
+
+def test_recovery_intervals_are_validated():
+    with pytest.raises(ValueError, match="must not be below"):
+        _scheduler(slow_base_seconds=600.0, slow_max_seconds=300.0)
+    with pytest.raises(ValueError, match="must be positive"):
+        _scheduler(bars_only_seconds=0.0)

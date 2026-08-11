@@ -222,3 +222,81 @@ def test_a_clean_session_reports_no_salvage(tmp_path):
 
     assert health.salvaged_segments == []
     assert not any("capture truncated" in problem for problem in health.problems())
+
+
+def _health_with_incidents(incidents):
+    from ib_execution.quote_recorder import ClockSkew, DailyHealth
+
+    return DailyHealth(
+        session=SESSION.isoformat(),
+        events=10,
+        market_data_type="LIVE",
+        clock_skew=ClockSkew.from_samples([0.0]),
+        disconnects=0,
+        liveness_incidents=incidents,
+    )
+
+
+def test_a_day_that_lost_coverage_cannot_report_itself_as_clean():
+    """The counterweight to never exiting on unexplained silence.
+
+    Staying alive through a gap beats losing the rest of the day only while
+    the gap is impossible to overlook. So the incidents that mean lost
+    coverage fail the day here, rather than sitting in the manifest as an
+    advisory number a reader has to go looking for.
+    """
+    health = _health_with_incidents(
+        {
+            "incident_count": 2,
+            "incident_by_kind": {"FEED_OUTAGE": 1, "GAP_SUSPECTED": 1},
+            "total_seconds_by_kind": {"FEED_OUTAGE": 101.8, "GAP_SUSPECTED": 42.0},
+            "open_incident_count": 0,
+            "open_incident": None,
+        }
+    )
+
+    problems = health.problems()
+
+    assert health.ok() is False
+    assert any("FEED_OUTAGE" in p and "102s" in p for p in problems), problems
+    assert any("GAP_SUSPECTED" in p for p in problems)
+
+
+def test_market_data_that_never_came_back_is_named_as_such():
+    health = _health_with_incidents(
+        {
+            "incident_count": 1,
+            "incident_by_kind": {"GAP_SUSPECTED": 1},
+            "total_seconds_by_kind": {"GAP_SUSPECTED": 9000.0},
+            "open_incident_count": 1,
+            "open_incident": {
+                "incident_id": "gap_suspected-0001",
+                "kind": "GAP_SUSPECTED",
+                "duration_seconds": 9000.0,
+                "max_heartbeat_age_seconds": 9000.0,
+            },
+        }
+    )
+
+    assert health.ok() is False
+    assert any("never recovered before the session ended" in p for p in health.problems())
+
+
+def test_expected_silence_alone_does_not_fail_the_day():
+    """A halt or a scheduled auction is not lost coverage.
+
+    Failing on it would train the reader to ignore health_ok, taking the
+    real failures with it.
+    """
+    health = _health_with_incidents(
+        {
+            "incident_count": 1,
+            "incident_by_kind": {"EXPECTED_SILENCE": 1},
+            "total_seconds_by_kind": {"EXPECTED_SILENCE": 300.0},
+            "open_incident_count": 0,
+            "open_incident": None,
+        }
+    )
+
+    assert health.problems() == []
+    assert health.ok() is True

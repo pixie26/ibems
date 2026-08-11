@@ -500,6 +500,21 @@ class MarketLiveness:
         last = self._last_event_mono.get(HEARTBEAT_STREAM, self._started_mono)
         return max(0.0, self._now(now_mono) - last)
 
+    def last_market_event_age(self, now_mono: Optional[float] = None) -> Optional[float]:
+        """Seconds since *any* stream last delivered. None before subscribe.
+
+        Evidence that the pipe is carrying something, whatever the bar clock
+        says. Used only to veto a destructive repair, never to trigger one:
+        the asymmetry is what keeps the "event-driven streams decide nothing"
+        rule intact while still letting a live BidAsk save itself from being
+        cut off by a reconnect aimed at the bar stream.
+        """
+        if self._started_mono is None:
+            return None
+        now = self._now(now_mono)
+        last = max(self._last_event_mono.values(), default=self._started_mono)
+        return max(0.0, now - last)
+
     def advisory_ages(self, now_mono: Optional[float] = None) -> dict[str, float]:
         """Over-threshold ages of the event-driven streams. Report only."""
         if self._started_mono is None:
