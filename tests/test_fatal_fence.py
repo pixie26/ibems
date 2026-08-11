@@ -83,6 +83,27 @@ def _host(tmp_path, *, clock=None, calendar=None, allow_shared=True) -> Executio
     )
 
 
+def test_order_capable_broker_cannot_hide_under_simulation_capability(tmp_path):
+    clock = ManualClock(SESSION_START)
+    broker = FakeBroker(clock, Faults())
+    broker.order_capable = True
+    host = ExecutionHost(
+        HostConfig(
+            journal_path=tmp_path / "journal.db",
+            fence_path=tmp_path / "fatal-fence.json",
+            status_path=tmp_path / "status.json",
+            require_separate_fence_domain=False,
+        ),
+        broker_factory=lambda: broker,
+        risk=_risk(clock),
+        clock=clock,
+        alert=lambda *_: None,
+    )
+    with pytest.raises(HostStartupRefused, match="cannot run under simulation"):
+        host.start()
+    assert host.journal is None
+
+
 # --------------------------------------------------------------------------
 # the fence record itself
 # --------------------------------------------------------------------------

@@ -82,9 +82,9 @@ Exact-freeze sign-off 同时记录当前机制参数，以便以后追溯和重�
 
 ### Windows 范围限制——owner 接受为非 blocker
 
-当前 B1 的真实存储/故障证据全部来自 Linux。2026-08-11 已修复 Windows 的 durable-file publication 调用形状和 lock diagnostics：fence/witness 不再尝试 POSIX directory `os.open`，Windows 使用 write-through replace；`msvcrt.locking` 的控制文件与可读 owner diagnostics 已分离，Windows 完整测试套件已运行到 100% 并返回 0。但卷序列号 failure-domain 检查、NTFS ENOSPC/stall/中途强杀语义，以及 `deploy/ibems-execution-service.ps1` 仍未经过生产等价真实故障演练。
+当前 B1 的完整真实存储/故障 campaign 仍来自 Linux。2026-08-11 已修复 Windows 的 durable-file publication 调用形状和 lock diagnostics：fence/witness 不再尝试 POSIX directory `os.open`，Windows 使用 write-through replace；`msvcrt.locking` 的控制文件与可读 owner diagnostics 已分离。Windows 完整测试套件现在是 PR/main CI 必跑项；本机真实 NTFS safe drill 也已覆盖两进程互斥、holder 强杀后的接管、连续 durable replace 和 publication 中途强杀后只能读到完整 generation。隔离 VHD ENOSPC runner 已实现，但本机会话没有磁盘管理提权，尚未产生该项证据；kernel-level flush stall、WAL/witness crossing 和 `deploy/ibems-execution-service.ps1` 仍需生产等价真实故障演练。
 
-**Owner decision：记录该缺口，但不把它设为进入 B2 read-only / paper progression 的 blocker。** 这不等于允许在 Windows 上发单；在任何 order-capable Windows deployment 之前，必须补生产 OS 的真实验证。
+**Owner decision：记录该缺口，但不把它设为进入 B2 read-only progression 的 blocker。** 这不等于允许在 Windows 上发单。运行时现在也会在 broker 构造前要求平台匹配的 exact-freeze capability evidence；当前没有通过文件，`order_authorization=NONE`，因此 Windows paper/live 均不能解锁。
 
 另外，GitHub-hosted 的 fsync drill 使用真实 block-layer `dm-delay`，但 constrained filesystem 由 tmpfs 支撑；B1 仍使用 FakeBroker，不变量 10/14/18 的真实 IB 部分属于 B2；Recorder 也不在 B1 中声称已有完整 Full-RTH session。
 

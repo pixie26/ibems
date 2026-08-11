@@ -284,12 +284,26 @@ class Controller:
 
         Idempotency is enforced by a database PRIMARY KEY, not by this method.
         """
+        quote = self.quotes.get(target.symbol)
+        quote_snapshot = None
+        if quote is not None:
+            quote_snapshot = {
+                "bid": str(quote.bid),
+                "ask": str(quote.ask),
+                "bid_size": quote.bid_size,
+                "ask_size": quote.ask_size,
+                "last": str(quote.last) if quote.last is not None else None,
+                "last_size": quote.last_size,
+                "quote_ts": quote.ts.isoformat(),
+                "captured_at": self.clock.now().isoformat(),
+            }
         accepted = self.journal.accept_decision(
             target.decision_id,
             {
                 "target_quantity": target.target_quantity,
                 "valid_until": target.valid_until.isoformat(),
                 "metadata": target.metadata,
+                "quote_snapshot": quote_snapshot,
             },
             strategy_id=target.strategy_id,
             symbol=target.symbol,

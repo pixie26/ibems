@@ -68,14 +68,17 @@ import queue
 import statistics
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import asdict, dataclass, field, fields
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Optional
 from uuid import uuid4
 
+from .durable_io import durable_atomic_write, durable_replace
+from .event_loop_heartbeat import EventLoopHeartbeat
 from .processlock import ProcessLock, ProcessLockUnavailable
+from .recorder_modes import CapturePolicy, DataMode
 
 # Market-data failures that reconnecting cannot repair. 10197 belongs here and
 # was missing: "no market data during competing session" is what a live and a
@@ -267,8 +270,11 @@ class RawEventLog:
         self._dropped = 0
         self._queue_high_water = 0
         self._max_writer_lag_ms = 0.0
+        self._fsync_latencies_ms: list[float] = []
         self._accepted_by_stream: dict[str, int] = defaultdict(int)
         self._persisted_by_stream: dict[str, int] = defaultdict(int)
+        self._accepted_by_run_id: dict[str, int] = defaultdict(int)
+        self._persisted_by_run_id: dict[str, int] = defaultdict(int)
         # A same-day process restart must not overwrite earlier segments.
         self.run_id = run_id or uuid4().hex[:10]
         self._lock: Optional[ProcessLock] = None
@@ -313,11 +319,11 @@ class RawEventLog:
         sync_flags = os.O_RDWR if os.name == "nt" else os.O_RDONLY
         fd = os.open(self._current, sync_flags)
         try:
-            os.fsync(fd)
+            self._fsync_fd(fd)
         finally:
             os.close(fd)
         final = self._current.with_name(self._current.name.replace(".partial-", "segment-"))
-        os.replace(self._current, final)   # atomic
+        durable_replace(self._current, final, source_is_synced=True)
         self._fh = None
         self._current = None
 
@@ -332,6 +338,13 @@ class RawEventLog:
         if failure is not None:
             raise RecorderWriteFailed(f"raw event writer failed: {failure}") from failure
 
+    def _fsync_fd(self, fd: int) -> None:
+        started = time.monotonic()
+        os.fsync(fd)
+        elapsed_ms = (time.monotonic() - started) * 1000.0
+        with self._state_lock:
+            self._fsync_latencies_ms.append(elapsed_ms)
+
     def _flush_file(self, *, force_sync: bool = False) -> None:
         if self._fh is None:
             return
@@ -340,7 +353,7 @@ class RawEventLog:
         if force_sync or self._last_sync is None or now - self._last_sync >= self.sync_seconds:
             raw = getattr(getattr(self._fh, "buffer", None), "fileobj", None)
             if raw is not None:
-                os.fsync(raw.fileno())
+                self._fsync_fd(raw.fileno())
             self._last_sync = now
 
     def _write_batch(self, batch: list[_QueuedTick]) -> None:
@@ -358,6 +371,7 @@ class RawEventLog:
             for item in batch:
                 self._count += 1
                 self._persisted_by_stream[item.tick.event_type] += 1
+                self._persisted_by_run_id[item.tick.recorder_run_id] += 1
                 self._max_writer_lag_ms = max(
                     self._max_writer_lag_ms,
                     (written_at - item.enqueued_mono) * 1000.0,
@@ -448,6 +462,7 @@ class RawEventLog:
                 raise failure from exc
             self._accepted += 1
             self._accepted_by_stream[tick.event_type] += 1
+            self._accepted_by_run_id[tick.recorder_run_id] += 1
             self._queue_high_water = max(self._queue_high_water, self._queue.qsize())
 
     def flush(self, *, publish: bool = True, timeout: Optional[float] = None) -> None:
@@ -531,15 +546,28 @@ class RawEventLog:
     def write_stats(self) -> dict[str, Any]:
         with self._state_lock:
             failure = None if self._failure is None else repr(self._failure)
+            fsyncs = sorted(self._fsync_latencies_ms)
+            p95_index = max(0, math.ceil(len(fsyncs) * 0.95) - 1) if fsyncs else 0
             return {
                 "accepted": self._accepted,
                 "persisted": self._count,
                 "dropped": self._dropped,
+                "enqueued_count": self._accepted,
+                "persisted_count": self._count,
+                "dropped_count": self._dropped,
                 "queue_capacity": self.queue_capacity,
                 "queue_high_water": self._queue_high_water,
                 "max_writer_lag_ms": self._max_writer_lag_ms,
+                "fsync_count": len(fsyncs),
+                "fsync_latency_ms": {
+                    "max": max(fsyncs) if fsyncs else 0.0,
+                    "mean": statistics.fmean(fsyncs) if fsyncs else 0.0,
+                    "p95": fsyncs[p95_index] if fsyncs else 0.0,
+                },
                 "accepted_by_stream": dict(sorted(self._accepted_by_stream.items())),
                 "persisted_by_stream": dict(sorted(self._persisted_by_stream.items())),
+                "accepted_by_run_id": dict(sorted(self._accepted_by_run_id.items())),
+                "persisted_by_run_id": dict(sorted(self._persisted_by_run_id.items())),
                 "writer_error": failure,
             }
 
@@ -947,6 +975,10 @@ def finalize_day(
     session_open: datetime,
     session_close: datetime,
     clock_skew_samples: Iterable[float] = (),
+    handler_counts: Optional[dict[str, int]] = None,
+    selected_counts: Optional[dict[str, int]] = None,
+    filtered_counts: Optional[dict[str, int]] = None,
+    capture_policy: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Close raw capture, write atomic Parquet, health JSON and a hash manifest.
 
@@ -968,6 +1000,69 @@ def finalize_day(
             f"raw writer accounting mismatch: {write_accounting}"
         )
     rows = list(log.read_all())
+    current_run_ids = set(write_accounting["persisted_by_run_id"])
+    current_run_rows = [row for row in rows if row["recorder_run_id"] in current_run_ids]
+    readback_by_stream: dict[str, int] = defaultdict(int)
+    for row in current_run_rows:
+        readback_by_stream[row["event_type"]] += 1
+    readback_by_stream = dict(sorted(readback_by_stream.items()))
+    if write_accounting["persisted"] != len(current_run_rows):
+        raise RecorderWriteFailed(
+            "raw writer/readback count mismatch: "
+            f"persisted={write_accounting['persisted']} readback={len(current_run_rows)}"
+        )
+    if write_accounting["persisted_by_stream"] != readback_by_stream:
+        raise RecorderWriteFailed(
+            "raw writer/readback stream mismatch: "
+            f"persisted={write_accounting['persisted_by_stream']} "
+            f"readback={readback_by_stream}"
+        )
+    readback_by_run_id: dict[str, int] = defaultdict(int)
+    for row in current_run_rows:
+        readback_by_run_id[row["recorder_run_id"]] += 1
+    readback_by_run_id = dict(sorted(readback_by_run_id.items()))
+    if write_accounting["persisted_by_run_id"] != readback_by_run_id:
+        raise RecorderWriteFailed(
+            "raw writer/readback run mismatch: "
+            f"persisted={write_accounting['persisted_by_run_id']} "
+            f"readback={readback_by_run_id}"
+        )
+
+    handled = dict(sorted((handler_counts or {}).items()))
+    selected = dict(sorted((selected_counts or {}).items()))
+    filtered = dict(sorted((filtered_counts or {}).items()))
+    if handled or selected or filtered:
+        market_enqueued = {
+            stream: write_accounting["accepted_by_stream"].get(stream, 0)
+            for stream in MARKET_STREAMS
+            if write_accounting["accepted_by_stream"].get(stream, 0)
+        }
+        if selected != market_enqueued:
+            raise RecorderWriteFailed(
+                f"callback selection/enqueue mismatch: selected={selected} "
+                f"enqueued={market_enqueued}"
+            )
+        for stream in MARKET_STREAMS:
+            if handled.get(stream, 0) != selected.get(stream, 0) + filtered.get(stream, 0):
+                raise RecorderWriteFailed(
+                    f"callback accounting mismatch for {stream}: handled={handled.get(stream, 0)} "
+                    f"selected={selected.get(stream, 0)} filtered={filtered.get(stream, 0)}"
+                )
+
+    write_accounting.update(
+        {
+            "handled_count": sum(handled.values()),
+            "handled_by_stream": handled,
+            "selected_count": sum(selected.values()),
+            "selected_by_stream": selected,
+            "filtered_count": sum(filtered.values()),
+            "filtered_by_stream": filtered,
+            "readback_count": len(current_run_rows),
+            "readback_by_stream": readback_by_stream,
+            "readback_by_run_id": readback_by_run_id,
+            "session_readback_count": len(rows),
+        }
+    )
     parquet = log.dir / "events.parquet"
     parquet_tmp = log.dir / ".events.parquet.tmp"
     try:
@@ -979,7 +1074,7 @@ def finalize_day(
     schema = parquet_schema()
     table = pa.Table.from_pylist(rows, schema=schema)
     pq.write_table(table, parquet_tmp, compression="zstd")
-    os.replace(parquet_tmp, parquet)
+    durable_replace(parquet_tmp, parquet)
 
     # Verify what is on disk, not what we handed to the writer. The point of
     # this whole subsystem is a dataset someone will trust months from now.
@@ -1001,14 +1096,13 @@ def finalize_day(
     )
     health.file_hashes = hashes
     health_path = log.dir / "health.json"
-    health_tmp = log.dir / ".health.json.tmp"
-    health_tmp.write_text(
-        json.dumps(health.as_dict(), indent=2, sort_keys=True), encoding="utf-8"
+    durable_atomic_write(
+        health_path,
+        json.dumps(health.as_dict(), indent=2, sort_keys=True).encode("utf-8"),
     )
-    os.replace(health_tmp, health_path)
 
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "session": log.session.isoformat(),
         "rows": len(rows),
         "parquet_rows_verified": readback.num_rows,
@@ -1016,12 +1110,14 @@ def finalize_day(
         "health_ok": health.ok(),
         "problems": health.problems(),
         "write_accounting": write_accounting,
+        "capture_policy": capture_policy,
         "files": {**hashes, health_path.name: _sha256(health_path)},
     }
     manifest_path = log.dir / "manifest.json"
-    manifest_tmp = log.dir / ".manifest.json.tmp"
-    manifest_tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
-    os.replace(manifest_tmp, manifest_path)
+    durable_atomic_write(
+        manifest_path,
+        json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8"),
+    )
     return manifest
 
 
@@ -1138,6 +1234,7 @@ def measure_clock_skew(
     ib,
     samples: int = 5,
     pause: float = CLOCK_REQUEST_MIN_INTERVAL_SECONDS,
+    pulse: Optional[Callable[..., None]] = None,
 ) -> list[float]:
     """Round-trip-compensated skew samples.
 
@@ -1152,10 +1249,16 @@ def measure_clock_skew(
         # Real Gateway requests made in rapid succession can omit a completion
         # callback. Pace the first request too because callers commonly make a
         # separate reqCurrentTime immediately before this measurement.
+        if pulse is not None:
+            pulse(phase="CLOCK_PACING")
         ib.sleep(pause)
+        if pulse is not None:
+            pulse(phase="CLOCK_REQUEST")
         t0 = time.time()
         server = ib.reqCurrentTime()
         t1 = time.time()
+        if pulse is not None:
+            pulse(phase="CLOCK_RESPONSE")
         if server is None:
             continue
         if server.tzinfo is None:
@@ -1182,6 +1285,13 @@ class RecorderConfig:
     writer_batch_records: int = 512
     writer_batch_max_latency_seconds: float = 0.05
     writer_close_timeout_seconds: float = 30.0
+    mode: DataMode | str = DataMode.RESEARCH_FULL
+    bidask_sample_interval_seconds: float = 1.0
+    bidask_on_price_change: bool = True
+    decision_window_seconds: float = 30.0
+    decision_pre_window_seconds: float = 30.0
+    status_path: Optional[Path] = None
+    heartbeat_publish_seconds: float = 1.0
 
 
 class QuoteRecorder:
@@ -1207,6 +1317,10 @@ class QuoteRecorder:
 
     def __init__(self, root: str | Path, symbol: str = "SPY", **kwargs):
         self.config = RecorderConfig(root=Path(root), symbol=symbol, **kwargs)
+        if DataMode(self.config.mode) is DataMode.EXECUTION_MINIMAL:
+            raise ValueError(
+                "execution_minimal does not start RawEventLog; run the execution host instead"
+            )
         self.root = self.config.root
         self.symbol = self.config.symbol
         self.log: Optional[RawEventLog] = None
@@ -1230,9 +1344,69 @@ class QuoteRecorder:
         # Counted in the callback, before the write path. A readback that
         # disagrees with these locates the loss on one side of _append.
         self.handled_events: dict[str, int] = {}
+        self.selected_events: dict[str, int] = {}
+        self.filtered_events: dict[str, int] = {}
+        self.capture_policy = CapturePolicy(
+            mode=self.config.mode,
+            bidask_sample_interval_seconds=self.config.bidask_sample_interval_seconds,
+            bidask_on_price_change=self.config.bidask_on_price_change,
+            decision_pre_window_seconds=self.config.decision_pre_window_seconds,
+            decision_window_seconds=self.config.decision_window_seconds,
+        )
+        self._heartbeat: Optional[EventLoopHeartbeat] = None
+        self._subscription_started_mono: Optional[float] = None
+        self._last_handled_mono: dict[str, float] = {}
+        self._sample_lock = threading.Lock()
+        self._bidask_prebuffer: deque[tuple[float, RawTick]] = deque()
 
     def _note_handled(self, event_type: str) -> None:
         self.handled_events[event_type] = self.handled_events.get(event_type, 0) + 1
+        self._last_handled_mono[event_type] = time.monotonic()
+
+    def stream_staleness(self, now_mono: Optional[float] = None) -> dict[str, float]:
+        """Return over-threshold stream ages while the socket may still be alive."""
+
+        if self._subscription_started_mono is None:
+            return {}
+        now = time.monotonic() if now_mono is None else float(now_mono)
+        stale: dict[str, float] = {}
+        for stream in MARKET_STREAMS:
+            last = self._last_handled_mono.get(stream, self._subscription_started_mono)
+            age = max(0.0, now - last)
+            if age > DEFAULT_GAP_THRESHOLDS[stream]:
+                stale[stream] = age
+        return stale
+
+    def _note_selected(self, event_type: str) -> None:
+        self.selected_events[event_type] = self.selected_events.get(event_type, 0) + 1
+
+    def _note_filtered(self, event_type: str) -> None:
+        self.filtered_events[event_type] = self.filtered_events.get(event_type, 0) + 1
+
+    def mark_decision(self, *, now_mono: Optional[float] = None, seconds: float | None = None) -> None:
+        """Persist the pre-decision ring and open a full-fidelity post window."""
+
+        now = time.monotonic() if now_mono is None else float(now_mono)
+        with self._sample_lock:
+            self.capture_policy.open_decision_window(now, seconds)
+            cutoff = now - self.capture_policy.decision_pre_window_seconds
+            while self._bidask_prebuffer and self._bidask_prebuffer[0][0] < cutoff:
+                self._bidask_prebuffer.popleft()
+            if self.log is None:
+                return
+            while self._bidask_prebuffer:
+                enqueued_mono, tick = self._bidask_prebuffer.popleft()
+                remaining = self.filtered_events.get("BID_ASK", 0) - 1
+                if remaining > 0:
+                    self.filtered_events["BID_ASK"] = remaining
+                else:
+                    self.filtered_events.pop("BID_ASK", None)
+                self._note_selected("BID_ASK")
+                self.log.append(tick, now_mono=enqueued_mono)
+
+    def _pulse(self, **state: Any) -> None:
+        if self._heartbeat is not None:
+            self._heartbeat.pulse(**state)
 
     def _handler_failed(self, stream: str, exc: BaseException) -> None:
         """A market-data callback raised. That is fatal, not a log line.
@@ -1262,6 +1436,8 @@ class QuoteRecorder:
         """
         if self.log is not None:
             self.log.raise_if_failed()
+        if self._heartbeat is not None:
+            self._heartbeat.raise_if_failed()
         if self._fatal_prerequisite_error is not None:
             raise RecorderPrerequisiteError(self._fatal_prerequisite_error)
 
@@ -1273,9 +1449,9 @@ class QuoteRecorder:
         text = message.casefold()
         return code == 420 and "market data permissions" in text
 
-    def _append(self, event_type: str, broker_ts: datetime | str, **values: Any) -> None:
-        if self.log is None:
-            return
+    def _make_tick(
+        self, event_type: str, broker_ts: datetime | str, **values: Any
+    ) -> tuple[RawTick, float]:
         self._event_id += 1
         self._receive_sequence += 1
         now_wall = time.time_ns()
@@ -1297,7 +1473,37 @@ class QuoteRecorder:
             receive_sequence=self._receive_sequence,
             **values,
         )
-        self.log.append(tick, now_mono=now_mono / 1e9)
+        return tick, now_mono / 1e9
+
+    def _append(self, event_type: str, broker_ts: datetime | str, **values: Any) -> None:
+        if self.log is None:
+            return
+        tick, now_mono = self._make_tick(event_type, broker_ts, **values)
+        self.log.append(tick, now_mono=now_mono)
+
+    def _record_market_event(
+        self, event_type: str, broker_ts: datetime | str, **values: Any
+    ) -> None:
+        if self.log is None:
+            return
+        tick, now_mono = self._make_tick(event_type, broker_ts, **values)
+        with self._sample_lock:
+            selected = self.capture_policy.should_persist(
+                event_type,
+                now_mono=now_mono,
+                bid=values.get("bid"),
+                ask=values.get("ask"),
+            )
+            if selected:
+                self._note_selected(event_type)
+                self.log.append(tick, now_mono=now_mono)
+                return
+            self._note_filtered(event_type)
+            if event_type == "BID_ASK":
+                self._bidask_prebuffer.append((now_mono, tick))
+                cutoff = now_mono - self.capture_policy.decision_pre_window_seconds
+                while self._bidask_prebuffer and self._bidask_prebuffer[0][0] < cutoff:
+                    self._bidask_prebuffer.popleft()
 
     @staticmethod
     def _session(details, now: datetime):
@@ -1333,22 +1539,28 @@ class QuoteRecorder:
                 for tick in updated.tickByTicks:
                     if isinstance(tick, TickByTickBidAsk):
                         self._note_handled("BID_ASK")
-                        self._append(
-                            "BID_ASK", tick.time, contract_id=updated.contract.conId,
-                            bid=float(tick.bidPrice), ask=float(tick.askPrice),
-                            bid_size=float(tick.bidSize), ask_size=float(tick.askSize),
-                            special_conditions=(
+                        values = {
+                            "contract_id": updated.contract.conId,
+                            "bid": float(tick.bidPrice),
+                            "ask": float(tick.askPrice),
+                            "bid_size": float(tick.bidSize),
+                            "ask_size": float(tick.askSize),
+                            "special_conditions": (
                                 f"bidPastLow={tick.tickAttribBidAsk.bidPastLow};"
                                 f"askPastHigh={tick.tickAttribBidAsk.askPastHigh}"
                             ),
-                        )
+                        }
+                        self._record_market_event("BID_ASK", tick.time, **values)
                     elif isinstance(tick, TickByTickAllLast):
                         self._note_handled("ALL_LAST")
-                        self._append(
-                            "ALL_LAST", tick.time, contract_id=updated.contract.conId,
-                            last=float(tick.price), last_size=float(tick.size),
-                            exchange=tick.exchange, special_conditions=tick.specialConditions,
-                        )
+                        values = {
+                            "contract_id": updated.contract.conId,
+                            "last": float(tick.price),
+                            "last_size": float(tick.size),
+                            "exchange": tick.exchange,
+                            "special_conditions": tick.specialConditions,
+                        }
+                        self._record_market_event("ALL_LAST", tick.time, **values)
             except Exception as exc:  # eventkit would swallow this
                 self._handler_failed("tick-by-tick", exc)
 
@@ -1361,12 +1573,17 @@ class QuoteRecorder:
             try:
                 bar = updated[-1]
                 self._note_handled("BAR_5S")
-                self._append(
-                    "BAR_5S", bar.time, contract_id=updated.contract.conId,
-                    open=float(bar.open_), high=float(bar.high), low=float(bar.low),
-                    close=float(bar.close), volume=float(bar.volume), wap=float(bar.wap),
-                    trade_count=int(bar.count),
-                )
+                values = {
+                    "contract_id": updated.contract.conId,
+                    "open": float(bar.open_),
+                    "high": float(bar.high),
+                    "low": float(bar.low),
+                    "close": float(bar.close),
+                    "volume": float(bar.volume),
+                    "wap": float(bar.wap),
+                    "trade_count": int(bar.count),
+                }
+                self._record_market_event("BAR_5S", bar.time, **values)
             except Exception as exc:  # eventkit would swallow this
                 self._handler_failed("realtime-bar", exc)
 
@@ -1374,6 +1591,8 @@ class QuoteRecorder:
 
     def _subscribe(self, ib, contract):
         self._wired.clear()
+        self._last_handled_mono.clear()
+        self._subscription_started_mono = time.monotonic()
         self._limiter.wait(ib.sleep)
         probe = ib.reqMktData(contract, "", False, False)
         probe.marketDataType = 0  # distinguish an actual callback from ib_async's default
@@ -1411,14 +1630,55 @@ class QuoteRecorder:
             session_open=session.start,
             session_close=session.end,
             clock_skew_samples=self._clock_skew_samples,
+            handler_counts=self.handled_events,
+            selected_counts=self.selected_events,
+            filtered_counts=self.filtered_events,
+            capture_policy=self.capture_policy.manifest(),
         )
 
     def run(self) -> dict[str, Any]:  # pragma: no cover - requires a real Gateway/session
+        cfg = self.config
+        status_path = cfg.status_path or (
+            cfg.root / f".{cfg.symbol.lower()}-{cfg.client_id}-recorder-status.json"
+        )
+        heartbeat = EventLoopHeartbeat(
+            status_path,
+            component=f"quote-recorder-{cfg.symbol}-{cfg.client_id}",
+            publish_seconds=cfg.heartbeat_publish_seconds,
+        )
+        self._heartbeat = heartbeat
+        failed = False
+        heartbeat.start()
+        self._pulse(phase="STARTING", data_mode=self.capture_policy.mode.value)
+        try:
+            result = self._run_session_loop()
+            self._pulse(phase="FINALIZED", health_ok=result.get("health_ok"))
+            return result
+        except BaseException:
+            failed = True
+            try:
+                self._pulse(phase="FAILED")
+            except BaseException:
+                # Preserve the primary Recorder/Gateway failure. A heartbeat
+                # failure is already visible as a missing/stale status file.
+                pass
+            raise
+        finally:
+            try:
+                heartbeat.close(phase="FAILED" if failed else "STOPPED")
+            except BaseException:
+                if not failed:
+                    raise
+            finally:
+                self._heartbeat = None
+
+    def _run_session_loop(self) -> dict[str, Any]:
         from ib_async import IB, StartupFetchNONE, Stock
 
         cfg = self.config
         session = None
         while True:
+            self._pulse(phase="CONNECTING")
             ib = IB()
             enforce_request_deadline(ib, cfg.request_deadline_seconds)
             self._fatal_prerequisite_error = None
@@ -1428,6 +1688,7 @@ class QuoteRecorder:
                     cfg.host, cfg.port, clientId=cfg.client_id, timeout=10,
                     readonly=True, fetchFields=StartupFetchNONE,
                 )
+                self._pulse(phase="CONNECTED")
                 self._connection_epoch += 1
                 contract = Stock(cfg.symbol, "SMART", "USD", primaryExchange="ARCA")
                 qualified = ib.qualifyContracts(contract)
@@ -1437,7 +1698,9 @@ class QuoteRecorder:
                 details_list = ib.reqContractDetails(contract)
                 if not details_list:
                     raise RuntimeError("IB returned no contract details/liquid hours")
+                self._pulse(phase="SERVER_TIME_REQUEST")
                 server_now = ib.reqCurrentTime()
+                self._pulse(phase="SERVER_TIME_RESPONSE")
                 session = self._session(details_list[0], server_now)
                 session_key = self._session_id(session)
 
@@ -1460,7 +1723,7 @@ class QuoteRecorder:
                         batch_max_latency_seconds=cfg.writer_batch_max_latency_seconds,
                         close_timeout_seconds=cfg.writer_close_timeout_seconds,
                     )
-                self._clock_skew_samples.extend(measure_clock_skew(ib))
+                self._clock_skew_samples.extend(measure_clock_skew(ib, pulse=self._pulse))
                 self._append(
                     "SYSTEM", server_now, contract_id=contract.conId,
                     special_conditions="CONNECTED;READ_ONLY=true;SERVER_TIME",
@@ -1496,6 +1759,7 @@ class QuoteRecorder:
                     if not cfg.wait_for_rth:
                         raise RuntimeError("RTH has not started and wait_for_rth is false")
                     ib.sleep(min(1.0, (session.start - datetime.now(session.start.tzinfo)).total_seconds()))
+                    self._pulse(phase="WAITING_FOR_SESSION")
                     self._raise_if_fatal_error()
 
                 probe, _tickers, bars = self._subscribe(ib, contract)
@@ -1505,10 +1769,26 @@ class QuoteRecorder:
                     if not ib.isConnected():
                         raise ConnectionError("IB disconnected during RTH")
                     ib.sleep(0.25)
+                    stale_streams = self.stream_staleness()
+                    self._pulse(phase="CAPTURING", stale_streams=stale_streams)
                     # eventkit catches callback exceptions.  The callback
                     # records them; this loop must turn that state into the
                     # non-retryable/finalized failure path.
                     self._raise_if_fatal_error()
+                    if stale_streams:
+                        detail = ", ".join(
+                            f"{stream}={age:.1f}s"
+                            for stream, age in sorted(stale_streams.items())
+                        )
+                        self._append(
+                            "SYSTEM",
+                            datetime.now(timezone.utc),
+                            contract_id=contract.conId,
+                            special_conditions=f"STREAM_STALE:{detail}",
+                        )
+                        raise ConnectionError(
+                            f"market-data stream stale while socket is connected: {detail}"
+                        )
                     mdt = int(probe.marketDataType)
                     if mdt != last_mdt:
                         self._market_data_type = self.DATA_TYPE.get(mdt, f"UNKNOWN:{mdt}")
@@ -1524,7 +1804,9 @@ class QuoteRecorder:
                         )
                         raise ConnectionError("subscription reset required")
                     if time.monotonic() - last_server_probe >= 60:
-                        self._clock_skew_samples.extend(measure_clock_skew(ib, samples=3))
+                        self._clock_skew_samples.extend(
+                            measure_clock_skew(ib, samples=3, pulse=self._pulse)
+                        )
                         self._append(
                             "SYSTEM", datetime.now(timezone.utc), contract_id=contract.conId,
                             special_conditions="SERVER_TIME",
@@ -1583,7 +1865,10 @@ class QuoteRecorder:
                         return self._finalize(session)
                     raise fatal from exc
                 delay = min(cfg.max_backoff_seconds, 2 ** (self._budget.recent - 1))
-                time.sleep(delay)
+                deadline = time.monotonic() + delay
+                while time.monotonic() < deadline:
+                    self._pulse(phase="RECONNECT_BACKOFF")
+                    time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
                 self._resubscribe = False
 
 
@@ -1597,6 +1882,15 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - operato
     ap.add_argument("--session-reconnect-limit", type=int, default=20)
     ap.add_argument("--queue-capacity", type=int, default=100_000)
     ap.add_argument("--writer-batch-records", type=int, default=512)
+    ap.add_argument(
+        "--mode",
+        choices=[DataMode.EVIDENCE_SAMPLED.value, DataMode.RESEARCH_FULL.value],
+        default=DataMode.RESEARCH_FULL.value,
+    )
+    ap.add_argument("--bidask-sample-seconds", type=float, default=1.0)
+    ap.add_argument("--decision-window-seconds", type=float, default=30.0)
+    ap.add_argument("--decision-pre-window-seconds", type=float, default=30.0)
+    ap.add_argument("--status-path", default=None)
     ap.add_argument("--no-wait", action="store_true")
     args = ap.parse_args(argv)
     try:
@@ -1609,6 +1903,11 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - operato
             session_reconnect_limit=args.session_reconnect_limit,
             queue_capacity=args.queue_capacity,
             writer_batch_records=args.writer_batch_records,
+            mode=args.mode,
+            bidask_sample_interval_seconds=args.bidask_sample_seconds,
+            decision_window_seconds=args.decision_window_seconds,
+            decision_pre_window_seconds=args.decision_pre_window_seconds,
+            status_path=Path(args.status_path) if args.status_path else None,
             wait_for_rth=not args.no_wait,
         ).run()
     except ProcessLockUnavailable as exc:

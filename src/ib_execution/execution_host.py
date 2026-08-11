@@ -53,6 +53,12 @@ from .controller import Controller, ExecutionPolicy
 from .fatal_fence import FatalFence, FenceStillRaised
 from .journal import Journal, JournalOwnershipError
 from .journal_witness import JournalWitness, WitnessViolation
+from .platform_gate import (
+    BrokerCapability,
+    PlatformCapabilityRefused,
+    validate_broker_capability,
+)
+from .recorder_modes import DataMode
 from .risk import RiskEngine
 from .watchdog import write_status
 
@@ -85,6 +91,16 @@ class HostConfig:
     witness_path: Optional[Path] = None
     require_separate_fence_domain: bool = True
     heartbeat_seconds: float = 1.0
+    broker_capability: BrokerCapability | str = BrokerCapability.SIMULATION
+    capability_evidence_path: Optional[Path] = None
+    data_mode: DataMode | str = DataMode.EXECUTION_MINIMAL
+
+    def __post_init__(self) -> None:
+        if DataMode(self.data_mode) is not DataMode.EXECUTION_MINIMAL:
+            raise ValueError(
+                "execution_host requires data_mode=execution_minimal; "
+                "sampled/full Recorder must run in a separate process"
+            )
 
 
 class ExecutionHost:
@@ -133,6 +149,15 @@ class ExecutionHost:
         except CalendarCoverageError as exc:
             raise HostStartupRefused(EXIT_CALENDAR, str(exc)) from exc
 
+    def _gate_platform_capability(self) -> None:
+        try:
+            validate_broker_capability(
+                self.config.broker_capability,
+                self.config.capability_evidence_path,
+            )
+        except (PlatformCapabilityRefused, ValueError) as exc:
+            raise HostStartupRefused(EXIT_STARTUP, str(exc)) from exc
+
     def _gate_failure_domains(self) -> None:
         """Both out-of-band files must be able to outlive the journal's volume."""
         for check in (self.fence.verify_domain, self.witness.verify_domain):
@@ -169,6 +194,7 @@ class ExecutionHost:
 
     def start(self) -> Controller:
         """Run every gate, then build the controller. Broker untouched until the end."""
+        self._gate_platform_capability()
         calendar_state = self._gate_calendar()
         self._gate_failure_domains()
         # Fence before ownership: a fenced host should not even briefly hold
@@ -182,9 +208,27 @@ class ExecutionHost:
             self.journal = None
             raise
 
+        try:
+            broker = self.broker_factory()
+        except BaseException:
+            self.journal.close()
+            self.journal = None
+            raise
+        configured_capability = BrokerCapability(self.config.broker_capability)
+        if getattr(broker, "order_capable", False) and (
+            configured_capability is not BrokerCapability.ORDER_CAPABLE
+        ):
+            self.journal.close()
+            self.journal = None
+            raise HostStartupRefused(
+                EXIT_STARTUP,
+                "order-capable broker cannot run under simulation capability; "
+                "supply validated exact-freeze platform evidence",
+            )
+
         self.controller = Controller(
             journal=self.journal,
-            broker=self.broker_factory(),
+            broker=broker,
             risk=self.risk,
             clock=self.clock,
             calendar=self.calendar,

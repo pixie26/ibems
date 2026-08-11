@@ -272,6 +272,8 @@ class Quote:
     bid_size: int
     ask_size: int
     ts: datetime
+    last: Optional[Decimal] = None
+    last_size: Optional[int] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "ts", _utc(self.ts))
@@ -281,6 +283,10 @@ class Quote:
             raise ValueError("ask must be >= bid")
         if self.bid_size < 0 or self.ask_size < 0:
             raise ValueError("quote sizes must be non-negative")
+        if self.last is not None and self.last <= 0:
+            raise ValueError("last must be positive when supplied")
+        if self.last_size is not None and self.last_size < 0:
+            raise ValueError("last_size must be non-negative when supplied")
 
     @property
     def mid(self) -> Decimal:

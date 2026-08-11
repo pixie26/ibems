@@ -14,6 +14,14 @@
 
 因此，全行情写入不是 paper/live order 的前置条件，也不应与订单 Journal 共用进程、Gateway pacing budget 或故障域。
 
+代码现在显式定义三种模式，manifest 不再要求读者从文件名猜测数据是否完整：
+
+- `execution_minimal`：禁止启动 `RawEventLog`。执行主机只保存同步订单审计、TARGET 接收时的 bid/ask/last 快照、连接/行情状态、fence 和 witness。
+- `evidence_sampled`：完整保存 AllLast 和 5 秒 bar；BidAsk 在固定间隔、价格变化或 decision window 任一条件满足时保存。`mark_decision()` 会先提升内存 ring 中的完整 pre-decision BidAsk，再打开完整 post-decision window；前后窗口、采样间隔和价格变化规则全部写入 manifest。
+- `research_full`：三路行情全部保存，用于滑点、arrival spread 和数据源研究。
+
+`QuoteRecorder --mode` 只接受 `evidence_sampled` 或 `research_full`；选择 `execution_minimal` 会拒绝构造 Recorder，防止“最小执行模式”意外变成全行情落盘。
+
 ## Recorder 写入实现
 
 IB callback 不再执行 JSON 编码、gzip flush 或 `fsync`。`RawEventLog.append()` 只构造队列项并执行非阻塞 `put_nowait`；独立 writer 线程负责：
@@ -34,7 +42,13 @@ IB callback 不再执行 JSON 编码、gzip flush 或 `fsync`。`RawEventLog.app
 - accepted、persisted 或 per-stream 计数不一致；
 - callback handler 异常。
 
-manifest 保存 `write_accounting`：`accepted`、`persisted`、`dropped`、`queue_high_water`、`max_writer_lag_ms` 以及逐 stream 计数。bounded Gateway probe 另外比较 callback 侧 `handler_counts` 与磁盘 readback；任何不等都失败。
+manifest 保存完整链路：`handled → selected → enqueued → persisted → readback`、`filtered`、`dropped`、逐 stream/逐 run 计数、`queue_high_water`、`max_writer_lag_ms` 和 `fsync_latency_ms`。任何不等都失败。`research_full` 必须 `filtered=0`；`evidence_sampled` 必须满足 `handled=selected+filtered`，且 manifest 必须携带采样规则。
+
+## Event-loop watchdog
+
+Recorder 现在有独立 heartbeat publisher 线程，但该线程不会自行刷新 event-loop 时间。只有 IB event loop 调用 `pulse()` 才会推进 `heartbeat_mono`；因此 `reqCurrentTime` 或其他 IB 请求卡住时，publisher 虽仍能写状态文件，外部 watchdog 看到的 pulse 仍会持续变旧。
+
+生产/验证运行应把 `scripts/run_recorder_watchdog.py` 作为独立进程启动。默认建议 heartbeat timeout 15 秒、再等待 15 秒 grace；watchdog 只告警和终止 Recorder，不下单、不重启。每路行情也有独立运行时 staleness：socket 仍连接但 BidAsk、AllLast 或 BAR_5S 超过各自阈值时，Recorder 会记录 `STREAM_STALE` 并重建订阅，不能静默完成。
 
 ## 测试策略
 
@@ -49,7 +63,11 @@ manifest 保存 `write_accounting`：`accepted`、`persisted`、`dropped`、`que
 - gzip → Parquet → readback → schema/hash/manifest；
 - callback handler 与 persisted 计数。
 
-2026-08-11 当前 Windows 环境中，`tests/test_recorder.py` 为 51 项全过，约 13.5 秒。完整 `pytest -q` 在不 deselect、不隐藏 Windows 分支的情况下运行到 100% 并返回 0。完整套件仍包含故意等待 timeout、子进程强杀和真实持久化边界的慢测试，所以总耗时不能用 Recorder 单文件预算衡量。
+另外覆盖 60 秒虚拟 session 的开收盘/gap 边界、writer drain timeout 不释放仍在工作的 session lock、Recorder 进程强杀后的 gzip prefix 恢复，以及 event-loop pulse 停止时外部 watchdog 判定 stale。
+
+重型吞吐验证已移到 `.github/workflows/recorder-soak.yml`：Windows/Linux 每周或手动写入并 readback 一百万事件，输出吞吐、字节数、队列水位、writer lag、fsync latency 和零丢失对账。普通 PR CI 不重复写一整天数据。
+
+2026-08-11 本机 million-event soak 已在目标 10,000 events/s 下通过：1,000,000 accepted/persisted/readback、dropped=0，100 秒完成，gzip 共 7,190,604 bytes，queue high-water 2,329，max writer lag 234ms，98 次 fsync 的 p95/max 为 63/125ms。按“实测峰值 10,000 events/s × 可容忍磁盘停顿 10 秒”得到推荐 queue capacity 100,000，与默认值一致；未来峰值或停顿预算变化必须重跑校准。
 
 ## Windows durable publication
 
@@ -61,6 +79,10 @@ manifest 保存 `write_accounting`：`accepted`、`persisted`、`dropped`、`que
 Windows 不再调用 `os.open(directory, O_RDONLY)`，也不会在 replace 已完成后因为该 POSIX 假设而误报失败。
 
 `ProcessLock` 的控制与诊断也已分离：内核 byte-range lock 仍是唯一 ownership 控制；未加锁的 `.owner` sidecar 保存 PID、进程启动身份和说明，解决 Windows 上第二进程无法读取已锁文件的问题。PID/sidecar 从不代替内核锁，也不作为 stale-lock lease。
+
+本机真实 NTFS safe drill 已直接通过：两进程只能一个持锁、holder 强杀后 successor 可取得锁、连续 durable replace 可读、publication writer 中途强杀后目标仍是完整 JSON generation。证据由 `scripts/run_windows_ntfs_safe_drill.py` 生成。
+
+真实 disk-full 已提供隔离 VHD runner：`scripts/run_windows_ntfs_vhd_disk_full.ps1` 只在 `artifacts/` 新建 128–512MB VHD、格式化该临时盘、运行 execution-host ENOSPC drill，最后卸载删除；`.github/workflows/windows-ntfs-fault.yml` 可在独立 Windows runner 上封存结果。本机尝试因当前会话没有可用 Windows 磁盘管理提权而未创建 VHD，主工作盘没有被写满。
 
 ## 仍未解除的授权边界
 
@@ -76,3 +98,5 @@ Windows 单元、子进程和完整套件通过，只证明当前 API 调用形�
 - volume failure-domain 判定。
 
 在这些证据完成前，Windows 只授权 read-only Recorder/Gateway validation；`order_authorization` 仍为 `NONE`。若生产执行放在已有 Linux 故障证据覆盖的环境，Windows 可继续作为开发和只读观测机，但 Linux freeze 也不能自动为新的 B2 代码背书。
+
+该限制现在不仅是文档：`HostConfig.broker_capability=order_capable` 时，启动前必须提供平台匹配的 exact-freeze capability evidence，包含 owner `PAPER/LIVE` 授权、source tree hash、全部必需 fault drill PASS 和 artifact SHA-256；缺任一项都在 broker 构造前拒绝启动。默认 capability 是 `simulation`，当前没有任何通过文件，也不会因测试绿色自动产生授权。

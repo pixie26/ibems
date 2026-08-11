@@ -905,7 +905,9 @@ def test_the_recorder_itself_binds_the_request_deadline():
 
     from ib_execution import quote_recorder
 
-    source = textwrap.dedent(inspect.getsource(quote_recorder.QuoteRecorder.run))
+    source = textwrap.dedent(
+        inspect.getsource(quote_recorder.QuoteRecorder._run_session_loop)
+    )
     tree = ast.parse(source)
     called = {
         node.func.id
@@ -923,7 +925,9 @@ def test_the_production_loop_polls_callback_failures():
 
     from ib_execution import quote_recorder
 
-    source = textwrap.dedent(inspect.getsource(quote_recorder.QuoteRecorder.run))
+    source = textwrap.dedent(
+        inspect.getsource(quote_recorder.QuoteRecorder._run_session_loop)
+    )
     tree = ast.parse(source)
     calls = [
         node

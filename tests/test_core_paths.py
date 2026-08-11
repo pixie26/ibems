@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from ib_execution.models import EventType, OrderState, Side
+from decimal import Decimal
+
+from ib_execution.models import EventType, OrderState, Quote, Side
 from conftest import quote, target
 
 
@@ -12,6 +14,37 @@ def test_flat_to_long(ctl, broker, clock):
     assert broker.position("SPY") == 3
     assert ctl.leg("manual_test", "SPY").position == 3
     assert ctl.leg("manual_test", "SPY").order_state is OrderState.IDLE
+
+
+def test_target_journals_the_decision_time_quote_snapshot(ctl, clock):
+    ctl.on_quote(
+        Quote(
+            "SPY",
+            Decimal("600.10"),
+            Decimal("600.12"),
+            400,
+            500,
+            clock.now(),
+            last=Decimal("600.11"),
+            last_size=25,
+        )
+    )
+    ctl.submit_target(target(1, clock))
+    received = [
+        event for event in ctl.journal.replay()
+        if event.event_type is EventType.TARGET_RECEIVED
+    ][-1]
+    snapshot = received.payload["quote_snapshot"]
+    assert snapshot == {
+        "bid": "600.10",
+        "ask": "600.12",
+        "bid_size": 400,
+        "ask_size": 500,
+        "last": "600.11",
+        "last_size": 25,
+        "quote_ts": clock.now().isoformat(),
+        "captured_at": clock.now().isoformat(),
+    }
 
 
 def test_long_to_flat(ctl, broker, clock):

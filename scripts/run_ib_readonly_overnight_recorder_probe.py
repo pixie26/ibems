@@ -66,6 +66,7 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         args.raw_root,
         args.symbol,
         client_id=args.client_id,
+        mode="research_full",
         wait_for_rth=False,
         roll_seconds=max(30, int(args.sample_seconds)),
     )
@@ -142,6 +143,9 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                     f"IB disconnected during bounded {session_label} probe"
                 )
             ib.sleep(0.25)
+            stale_streams = recorder.stream_staleness()
+            if stale_streams:
+                raise RuntimeError(f"market-data streams became stale: {stale_streams}")
     except Exception as exc:  # report the failure as evidence, then exit fail-closed
         exception = exc
     finally:
@@ -202,6 +206,9 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             # arrived" -- two bounded runs recorded ~40% fewer BidAsk rows than
             # the paired preflight, and one number cannot tell those apart.
             "handler_counts": dict(sorted(recorder.handled_events.items())),
+            "selected_counts": dict(sorted(recorder.selected_events.items())),
+            "filtered_counts": dict(sorted(recorder.filtered_events.items())),
+            "capture_policy": recorder.capture_policy.manifest(),
             "writer_accounting": log.write_stats() if log is not None else None,
             "raw_event_count": len(rows),
             "stream_counts": {
@@ -258,11 +265,18 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         ),
         "writer_accounting_balanced": bool(
             writer_accounting
-            and writer_accounting.get("accepted") == writer_accounting.get("persisted")
-            and writer_accounting.get("dropped") == 0
+            and writer_accounting.get("enqueued_count")
+            == writer_accounting.get("persisted_count")
+            == len(rows)
+            and writer_accounting.get("dropped_count") == 0
             and writer_accounting.get("writer_error") is None
             and writer_accounting.get("accepted_by_stream")
             == writer_accounting.get("persisted_by_stream")
+        ),
+        "research_full_selected_every_handled_event": bool(
+            report["capture_policy"]["mode"] == "research_full"
+            and report["selected_counts"] == report["handler_counts"]
+            and not report["filtered_counts"]
         ),
         "no_exception": exception is None,
         "no_fatal_market_data_error": not fatal_errors,

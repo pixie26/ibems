@@ -59,6 +59,10 @@ CLIENT_ID_RECORDER = 33
 MAX_MESSAGES_PER_SECOND = 45
 
 
+class AdapterCallbackFailed(RuntimeError):
+    """An ib_async callback failed and the adapter state is no longer trustworthy."""
+
+
 class IbConfig:
     """Connection parameters. Credentials come from the environment only."""
 
@@ -69,12 +73,18 @@ class IbConfig:
         client_id: int = CLIENT_ID_EXECUTION,
         account: Optional[str] = None,
         read_only: bool = False,
+        request_timeout_seconds: float = 10.0,
     ):
+        if request_timeout_seconds <= 0:
+            raise ValueError(
+                "request_timeout_seconds must be positive; ib_async reads 0 as wait forever"
+            )
         self.host = host
         self.port = port
         self.client_id = client_id
         self.read_only = read_only
         self.account = account or os.environ.get("IB_ACCOUNT")
+        self.request_timeout_seconds = float(request_timeout_seconds)
 
     @staticmethod
     def credentials_note() -> str:
@@ -130,6 +140,14 @@ class IbAdapter:
         self._bucket = TokenBucket()
         self._ref_to_trade: dict[str, object] = {}
         self._connection_epoch = 0
+        self._fatal_callback_error: Optional[str] = None
+        self._event_wrappers: list[object] = []
+
+    @property
+    def order_capable(self) -> bool:
+        """A read-write IB connection must pass ExecutionHost's platform gate."""
+
+        return not self.config.read_only
 
     # -- lifecycle --------------------------------------------------------
 
@@ -143,6 +161,12 @@ class IbAdapter:
             ) from exc
 
         self._ib = IB()
+        # ib_async defaults RequestTimeout to 0, which means an omitted
+        # completion callback blocks the only event loop forever. The adapter,
+        # not its test harness, owns this deadline.
+        from .quote_recorder import enforce_request_deadline  # noqa: PLC0415
+
+        enforce_request_deadline(self._ib, self.config.request_timeout_seconds)
         self._ib.connect(
             self.config.host,
             self.config.port,
@@ -169,12 +193,39 @@ class IbAdapter:
         """
         ib = self._ib
         assert ib is not None
-        ib.orderStatusEvent += self._on_order_status
-        ib.execDetailsEvent += self._on_exec_details
-        ib.commissionReportEvent += self._on_commission
-        ib.errorEvent += self._on_error
-        ib.disconnectedEvent += self._on_disconnected
-        ib.pendingTickersEvent += self._on_tickers
+        bindings = (
+            (ib.orderStatusEvent, "orderStatus", self._on_order_status),
+            (ib.execDetailsEvent, "execDetails", self._on_exec_details),
+            (ib.commissionReportEvent, "commissionReport", self._on_commission),
+            (ib.errorEvent, "error", self._on_error),
+            (ib.disconnectedEvent, "disconnected", self._on_disconnected),
+            (ib.pendingTickersEvent, "pendingTickers", self._on_tickers),
+        )
+        self._event_wrappers.clear()
+        for event, name, handler in bindings:
+            wrapped = self._guard_event(name, handler)
+            self._event_wrappers.append(wrapped)
+            event += wrapped
+
+    def _guard_event(self, name, handler):
+        """Turn eventkit-swallowed exceptions into a latched fatal state."""
+
+        def guarded(*args):
+            try:
+                handler(*args)
+            except BaseException as exc:
+                if self._fatal_callback_error is None:
+                    self._fatal_callback_error = (
+                        f"IB {name} callback raised {type(exc).__name__}: {exc}"
+                    )
+                if self._cb is not None:
+                    self._cb.on_disconnected(self._fatal_callback_error)
+
+        return guarded
+
+    def raise_if_failed(self) -> None:
+        if self._fatal_callback_error is not None:
+            raise AdapterCallbackFailed(self._fatal_callback_error)
 
     # -- Broker protocol --------------------------------------------------
 
@@ -182,9 +233,14 @@ class IbAdapter:
         self._cb = callbacks
 
     def is_connected(self) -> bool:
-        return bool(self._ib and self._ib.isConnected())
+        return bool(
+            self._fatal_callback_error is None
+            and self._ib
+            and self._ib.isConnected()
+        )
 
     def server_time(self) -> datetime:
+        self.raise_if_failed()
         assert self._ib is not None
         t = self._ib.reqCurrentTime()
         return t.astimezone(timezone.utc) if t.tzinfo else t.replace(tzinfo=timezone.utc)

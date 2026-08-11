@@ -128,7 +128,7 @@ Recorder 与交易路径隔离开发，只采集：
 - IB connection/error、`marketDataType`、server time；
 - local wall-clock 与 monotonic arrival timestamp。
 
-原始事件通过有界内存队列交给独立 writer，按 batch 写入 append-only gzip JSONL；callback 不执行 gzip/flush/fsync。收盘后生成 Parquet、健康报告和 SHA-256 manifest，并强制核对 callback、accepted、persisted 与 readback 计数。队列满、writer 异常或计数不一致都会 fail-closed。该 Recorder 是显式启动的只读研究进程；`execution_host` 不保存每条行情 tick，订单 Journal 的 durable-before-send 语义也没有被异步化。详细边界见 [Recorder 写入、测试与 Windows 部署边界](docs/RECORDER_STORAGE_AND_WINDOWS_POLICY_ZH.md)。
+原始事件通过有界内存队列交给独立 writer，按 batch 写入 append-only gzip JSONL；callback 不执行 gzip/flush/fsync。代码显式区分 `execution_minimal`、`evidence_sampled`、`research_full`，采样规则和 `handled → selected → enqueued → persisted → readback` 全链路均写入 manifest。独立 heartbeat publisher 不会替 event loop 刷新 pulse，因此 IB 请求整体卡住可以由外部 watchdog 发现。队列满、writer/heartbeat 异常、per-stream staleness、关闭超时或任一计数不一致都会 fail-closed。`execution_host` 不保存每条行情 tick，订单 Journal 的 durable-before-send 语义也没有被异步化。详细边界见 [Recorder 写入、测试与 Windows 部署边界](docs/RECORDER_STORAGE_AND_WINDOWS_POLICY_ZH.md)。
 
 当前实测已在 SPY OVERNIGHT 与正式 `RTH+SMART` bounded run 中直接观察到 LIVE BidAsk、AllLast 和 5 秒 bars 三路非零。早期 sleep 后读取 `Ticker.tickByTicks` 残余缓冲得到的 `AllLast=0` 已被判定为无效测量；现有 preflight 与 Recorder 都在 callback 中累计。两分钟结果证明三路可达，不等于 Full-RTH 全日无损；带 `handler_counts` 的下一轮 RTH probe 仍需关闭此前 Recorder/配对 preflight 的 BidAsk 数量差异。
 

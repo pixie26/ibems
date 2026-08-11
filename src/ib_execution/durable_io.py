@@ -66,17 +66,37 @@ def durable_atomic_write(path: str | Path, payload: bytes) -> None:
         os.close(fd)
 
     try:
-        _replace(tmp, target)
-        final_flags = os.O_RDWR if os.name == "nt" else os.O_RDONLY
-        final_fd = os.open(target, final_flags)
-        try:
-            os.fsync(final_fd)
-        finally:
-            os.close(final_fd)
-        _sync_parent(target.parent)
+        durable_replace(tmp, target, source_is_synced=True)
     except BaseException:
         try:
             tmp.unlink(missing_ok=True)
         except OSError:
             pass
         raise
+
+
+def durable_replace(
+    source: str | Path,
+    target: str | Path,
+    *,
+    source_is_synced: bool = False,
+) -> None:
+    """Publish an existing file with explicit platform durability semantics."""
+
+    src = Path(source)
+    dst = Path(target)
+    if not source_is_synced:
+        src_flags = os.O_RDWR if os.name == "nt" else os.O_RDONLY
+        src_fd = os.open(src, src_flags)
+        try:
+            os.fsync(src_fd)
+        finally:
+            os.close(src_fd)
+    _replace(src, dst)
+    final_flags = os.O_RDWR if os.name == "nt" else os.O_RDONLY
+    final_fd = os.open(dst, final_flags)
+    try:
+        os.fsync(final_fd)
+    finally:
+        os.close(final_fd)
+    _sync_parent(dst.parent)
