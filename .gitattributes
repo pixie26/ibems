@@ -1,0 +1,32 @@
+####################################################################
+#  Provenance requires byte-identical worktrees on every platform. #
+####################################################################
+#
+# `src/ib_execution/provenance.py::_digest_files` hashes file contents *as
+# they exist on disk*, because that is what actually ran. Without this file,
+# Git for Windows rewrites LF -> CRLF on checkout, so the very same commit
+# yields different `source_tree_sha256`, `config_tree_sha256` and
+# `dependency_lock_sha256` on Windows than on Linux.
+#
+# That is not a cosmetic difference. It means:
+#
+#   * `python -m ib_execution.provenance --check` can never pass on Windows,
+#     so the `windows-verify` CI job can never be green;
+#   * `attestation.validate()` reads the sign-off, evidence and risk config
+#     from the worktree, so `gate_b1_covers_worktree` is permanently false on
+#     Windows -- the check that proves "the code running here is the code that
+#     was reviewed" is inert on the intended deployment OS;
+#   * any future Gate freeze hash is OS-specific and therefore not a freeze.
+#
+# `-text` disables end-of-line conversion entirely, in both directions. The
+# bytes in the worktree are always exactly the bytes in the Git object, on
+# every platform, so the four provenance hashes are a property of the commit
+# rather than a property of the machine that checked it out.
+#
+# This is deliberately a blanket rule rather than a per-extension list: a new
+# file type must not be able to silently reintroduce platform-dependent
+# hashes. No tracked file contained CRLF when this was added, so nothing
+# needed renormalizing. The only tracked Windows scripts are `.ps1`, which
+# PowerShell parses with LF endings; there are no `.bat`/`.cmd` files, which
+# are the format that genuinely requires CRLF.
+* -text
