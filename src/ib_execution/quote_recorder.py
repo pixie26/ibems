@@ -77,6 +77,8 @@ from uuid import uuid4
 
 from .durable_io import durable_atomic_write, durable_replace
 from .event_loop_heartbeat import EventLoopHeartbeat
+from . import market_liveness
+from .market_liveness import LivenessAction, MarketLiveness
 from .processlock import ProcessLock, ProcessLockUnavailable
 from .recorder_modes import CapturePolicy, DataMode
 
@@ -88,9 +90,17 @@ FATAL_MARKET_DATA_CODES = frozenset({354, 10089, 10189, 10197})
 
 MARKET_STREAMS = ("BID_ASK", "ALL_LAST", "BAR_5S")
 
-# Per-stream gap thresholds. One number cannot serve all three: 5-second bars
-# arrive on a fixed cadence, quotes arrive continuously, prints do not.
+# OFFLINE, post-hoc. compute_health() reports gaps in a session that has
+# already been written, where a long gap is a fact about the recorded data
+# that a reader should see. Deliberately NOT the live decision: nothing in
+# the run loop may stop the session on these numbers, because during the run
+# a long BID_ASK/ALL_LAST gap is indistinguishable from a quiet tape. The
+# live split lives in market_liveness -- BAR_5S is time-driven and decidable,
+# the other two are event-driven and only ever recorded.
 DEFAULT_GAP_THRESHOLDS = {"BID_ASK": 5.0, "ALL_LAST": 30.0, "BAR_5S": 15.0}
+
+HEARTBEAT_STREAM = market_liveness.HEARTBEAT_STREAM
+ADVISORY_GAP_THRESHOLDS = dict(market_liveness.DEFAULT_ADVISORY_THRESHOLDS)
 
 
 @dataclass(frozen=True)
@@ -979,6 +989,7 @@ def finalize_day(
     selected_counts: Optional[dict[str, int]] = None,
     filtered_counts: Optional[dict[str, int]] = None,
     capture_policy: Optional[dict[str, Any]] = None,
+    liveness: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Close raw capture, write atomic Parquet, health JSON and a hash manifest.
 
@@ -1111,6 +1122,7 @@ def finalize_day(
         "problems": health.problems(),
         "write_accounting": write_accounting,
         "capture_policy": capture_policy,
+        "liveness": liveness,
         "files": {**hashes, health_path.name: _sha256(health_path)},
     }
     manifest_path = log.dir / "manifest.json"
@@ -1292,6 +1304,14 @@ class RecorderConfig:
     decision_pre_window_seconds: float = 30.0
     status_path: Optional[Path] = None
     heartbeat_publish_seconds: float = 1.0
+    bar_heartbeat_timeout_seconds: float = market_liveness.DEFAULT_BAR_TIMEOUT_SECONDS
+    transport_idle_timeout_seconds: float = market_liveness.DEFAULT_TRANSPORT_IDLE_SECONDS
+    # Generic tick 49 is the halt state, and a halt is the one thing that
+    # makes silence legitimate. Requesting it explicitly strictly dominates
+    # hoping it arrives in the default set: harmless if IB sends it anyway,
+    # necessary if it does not. Overridable so an operator can drop it if a
+    # Gateway rejects the list, rather than editing code at 3am.
+    market_data_generic_ticks: str = "49"
 
 
 class QuoteRecorder:
@@ -1356,26 +1376,34 @@ class QuoteRecorder:
         self._heartbeat: Optional[EventLoopHeartbeat] = None
         self._subscription_started_mono: Optional[float] = None
         self._last_handled_mono: dict[str, float] = {}
+        if self.config.transport_idle_timeout_seconds <= 0:
+            raise ValueError("transport_idle_timeout_seconds must be positive")
+        self.liveness = MarketLiveness(
+            bar_timeout_seconds=self.config.bar_heartbeat_timeout_seconds,
+        )
         self._sample_lock = threading.Lock()
         self._bidask_prebuffer: deque[tuple[float, RawTick]] = deque()
 
     def _note_handled(self, event_type: str) -> None:
         self.handled_events[event_type] = self.handled_events.get(event_type, 0) + 1
-        self._last_handled_mono[event_type] = time.monotonic()
+        now = time.monotonic()
+        self._last_handled_mono[event_type] = now
+        self.liveness.note_event(event_type, now)
 
     def stream_staleness(self, now_mono: Optional[float] = None) -> dict[str, float]:
-        """Return over-threshold stream ages while the socket may still be alive."""
+        """Over-threshold ages of the *event-driven* streams. Report only.
 
-        if self._subscription_started_mono is None:
-            return {}
-        now = time.monotonic() if now_mono is None else float(now_mono)
-        stale: dict[str, float] = {}
-        for stream in MARKET_STREAMS:
-            last = self._last_handled_mono.get(stream, self._subscription_started_mono)
-            age = max(0.0, now - last)
-            if age > DEFAULT_GAP_THRESHOLDS[stream]:
-                stale[stream] = age
-        return stale
+        Deliberately excludes BAR_5S and deliberately drives nothing. These
+        two streams arrive when the market has something to say, so a long
+        age is a fact about the tape, not about the subscription -- an
+        OVERNIGHT window on 2026-08-10 went 29.6s between prints while the
+        bar cadence never faltered. Acting on these numbers would make a
+        quiet tape indistinguishable in the report from a dead subscription,
+        which is precisely the condition the heartbeat exists to detect.
+        Ask :meth:`MarketLiveness.assess` what to *do*.
+        """
+
+        return self.liveness.advisory_ages(now_mono)
 
     def _note_selected(self, event_type: str) -> None:
         self.selected_events[event_type] = self.selected_events.get(event_type, 0) + 1
@@ -1593,8 +1621,9 @@ class QuoteRecorder:
         self._wired.clear()
         self._last_handled_mono.clear()
         self._subscription_started_mono = time.monotonic()
+        self.liveness.subscription_started(self._subscription_started_mono)
         self._limiter.wait(ib.sleep)
-        probe = ib.reqMktData(contract, "", False, False)
+        probe = ib.reqMktData(contract, self.config.market_data_generic_ticks, False, False)
         probe.marketDataType = 0  # distinguish an actual callback from ib_async's default
         deadline = time.monotonic() + 10.0
         while int(probe.marketDataType) == 0 and time.monotonic() < deadline:
@@ -1634,6 +1663,7 @@ class QuoteRecorder:
             selected_counts=self.selected_events,
             filtered_counts=self.filtered_events,
             capture_policy=self.capture_policy.manifest(),
+            liveness=self.liveness.manifest(),
         )
 
     def run(self) -> dict[str, Any]:  # pragma: no cover - requires a real Gateway/session
@@ -1735,12 +1765,26 @@ class QuoteRecorder:
                         contract_id=getattr(error_contract, "conId", 0) or 0,
                         special_conditions=f"IB_ERROR:{code}:{req_id}:{message}",
                     )
+                    # IB tells us about halts, farm outages and the
+                    # connectivity triple directly. Listening beats inferring
+                    # the same facts from durations several seconds later.
+                    self.liveness.note_status(code, message)
                     if code in {1101, 10225}:
                         self._resubscribe = True
                     if self._is_fatal_market_data_error(code, message):
                         self._fatal_prerequisite_error = (
                             f"IB market-data prerequisite failed ({code}): {message}"
                         )
+
+                def on_transport_idle(idle_seconds):
+                    # ib_async disarms itself after firing (wrapper.setTimeout(0)),
+                    # so re-arm or this only ever reports once per connection.
+                    self.liveness.note_transport_idle(float(idle_seconds))
+                    self._append(
+                        "SYSTEM", datetime.now(timezone.utc), contract_id=contract.conId,
+                        special_conditions=f"TRANSPORT_IDLE:{float(idle_seconds):.1f}s",
+                    )
+                    ib.setTimeout(cfg.transport_idle_timeout_seconds)
 
                 def on_disconnect():
                     self._append(
@@ -1754,6 +1798,11 @@ class QuoteRecorder:
 
                 ib.errorEvent += on_error
                 ib.disconnectedEvent += on_disconnect
+                ib.timeoutEvent += on_transport_idle
+                # Detects a silent *peer*. It runs on the event loop, so it
+                # cannot detect a stuck loop -- EventLoopHeartbeat owns that,
+                # from its own thread. Two failure domains, two detectors.
+                ib.setTimeout(cfg.transport_idle_timeout_seconds)
 
                 while datetime.now(session.start.tzinfo) < session.start:
                     if not cfg.wait_for_rth:
@@ -1769,26 +1818,37 @@ class QuoteRecorder:
                     if not ib.isConnected():
                         raise ConnectionError("IB disconnected during RTH")
                     ib.sleep(0.25)
-                    stale_streams = self.stream_staleness()
-                    self._pulse(phase="CAPTURING", stale_streams=stale_streams)
+                    self.liveness.note_halted(getattr(probe, "halted", float("nan")))
+                    state = self.liveness.assess()
+                    self._pulse(
+                        phase="CAPTURING",
+                        bar_age=state.heartbeat_age,
+                        liveness=state.action.value,
+                        expected_silence=state.expected_silence,
+                        advisory_ages=state.advisory_ages,
+                    )
                     # eventkit catches callback exceptions.  The callback
                     # records them; this loop must turn that state into the
                     # non-retryable/finalized failure path.
                     self._raise_if_fatal_error()
-                    if stale_streams:
-                        detail = ", ".join(
-                            f"{stream}={age:.1f}s"
-                            for stream, age in sorted(stale_streams.items())
-                        )
+                    if state.action is not LivenessAction.CONTINUE:
+                        # Mark the data before doing anything about it. A
+                        # labelled gap is usable in a backtest; an unlabelled
+                        # one silently claims continuity it does not have,
+                        # and that is the failure this whole layer exists to
+                        # prevent.
                         self._append(
                             "SYSTEM",
                             datetime.now(timezone.utc),
                             contract_id=contract.conId,
-                            special_conditions=f"STREAM_STALE:{detail}",
+                            special_conditions=f"GAP_SUSPECTED:{state.as_marker()}",
                         )
-                        raise ConnectionError(
-                            f"market-data stream stale while socket is connected: {detail}"
-                        )
+                    if state.action is LivenessAction.RECOVER_SUBSCRIPTION:
+                        # Recovery is a reconnect, which the reconnect budget
+                        # already bounds and escalates. Repeated heartbeat
+                        # loss therefore terminates the session on its own,
+                        # without a second escalation policy here.
+                        raise ConnectionError(f"market data not live: {state.reason}")
                     mdt = int(probe.marketDataType)
                     if mdt != last_mdt:
                         self._market_data_type = self.DATA_TYPE.get(mdt, f"UNKNOWN:{mdt}")

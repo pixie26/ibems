@@ -20,6 +20,8 @@ from typing import Any
 
 from ib_async import IB, StartupFetchNONE, Stock
 
+from ib_execution import market_liveness
+from ib_execution.market_liveness import LivenessAction
 from ib_execution.quote_recorder import (
     QuoteRecorder,
     RawEventLog,
@@ -60,6 +62,7 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         "broker_write_calls": [],
     }
     errors: list[dict[str, Any]] = []
+    liveness_events: list[dict[str, Any]] = []
     ib = IB()
     ib.RequestTimeout = args.request_timeout
     recorder = QuoteRecorder(
@@ -90,12 +93,20 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             contract_id=row["con_id"],
             special_conditions=f"IB_ERROR:{code}:{req_id}:{message}",
         )
+        recorder.liveness.note_status(code, message)
         if recorder._is_fatal_market_data_error(code, message):
             recorder._fatal_prerequisite_error = (
                 f"IB market-data prerequisite failed ({code}): {message}"
             )
 
+    def on_transport_idle(idle_seconds):
+        recorder.liveness.note_transport_idle(float(idle_seconds))
+        errors.append({"req_id": -1, "code": 0, "message": f"transport idle {idle_seconds}s", "con_id": 0})
+        ib.setTimeout(args.transport_idle_timeout)  # ib_async disarms after firing
+
     ib.errorEvent += on_error
+    ib.timeoutEvent += on_transport_idle
+    ib.setTimeout(args.transport_idle_timeout)
     try:
         ib.connect(
             args.host,
@@ -143,9 +154,27 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                     f"IB disconnected during bounded {session_label} probe"
                 )
             ib.sleep(0.25)
-            stale_streams = recorder.stream_staleness()
-            if stale_streams:
-                raise RuntimeError(f"market-data streams became stale: {stale_streams}")
+            recorder.liveness.note_halted(getattr(probe, "halted", float("nan")))
+            state = recorder.liveness.assess()
+            # Observed, never acted on. This probe's job is to test the
+            # machinery, and aborting on a quiet tape would report a normal
+            # illiquid OVERNIGHT window with the same words as a genuinely
+            # dead subscription -- destroying the distinction the run is
+            # supposed to establish. The operator reads the timeline.
+            if state.action is not LivenessAction.CONTINUE:
+                liveness_events.append(
+                    {
+                        "at_seconds": round(time.monotonic() - sample_started, 3),
+                        "action": state.action.value,
+                        "reason": state.reason,
+                        "bar_age_seconds": state.heartbeat_age,
+                        "expected_silence": state.expected_silence,
+                        "advisory_ages": {
+                            stream: round(age, 3)
+                            for stream, age in sorted(state.advisory_ages.items())
+                        },
+                    }
+                )
     except Exception as exc:  # report the failure as evidence, then exit fail-closed
         exception = exc
     finally:
@@ -209,6 +238,24 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             "selected_counts": dict(sorted(recorder.selected_events.items())),
             "filtered_counts": dict(sorted(recorder.filtered_events.items())),
             "capture_policy": recorder.capture_policy.manifest(),
+            # The liveness timeline, recorded and not acted on. A quiet tape
+            # and a dead subscription both appear here; telling them apart is
+            # what the bar-cadence heartbeat and the expected_silence field
+            # are for, and it is a judgement the operator makes from the
+            # evidence rather than one the probe makes by aborting.
+            "liveness": recorder.liveness.manifest(),
+            "liveness_events": liveness_events,
+            # Not in `checks` on purpose. Promoting the bar heartbeat to a
+            # pass/fail condition before these are measured would repeat the
+            # mistake it replaces: acting on an assumption about cadence that
+            # no run on a real Gateway has yet confirmed.
+            "liveness_promotion_blocked_on": [
+                "does reqRealTimeBars keep emitting through a halt (tick 49 = 1) "
+                "and a volatility pause (tick 49 = 2)",
+                "does tick 49 arrive without being requested in genericTickList",
+                "does the 5s cadence hold across the open, the lunch lull and the close",
+                "why useRTH=True still delivers bars on the OVERNIGHT route",
+            ],
             "writer_accounting": log.write_stats() if log is not None else None,
             "raw_event_count": len(rows),
             "stream_counts": {
@@ -299,6 +346,12 @@ def main() -> int:
     parser.add_argument("--market-data-exchange", default=None)
     parser.add_argument("--sample-seconds", type=float, default=120.0)
     parser.add_argument("--request-timeout", type=float, default=10.0)
+    parser.add_argument(
+        "--transport-idle-timeout",
+        type=float,
+        default=market_liveness.DEFAULT_TRANSPORT_IDLE_SECONDS,
+        help="seconds with no data of any kind from TWS before recording an idle event",
+    )
     parser.add_argument("--raw-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()

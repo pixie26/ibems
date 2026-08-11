@@ -48,7 +48,28 @@ manifest 保存完整链路：`handled → selected → enqueued → persisted �
 
 Recorder 现在有独立 heartbeat publisher 线程，但该线程不会自行刷新 event-loop 时间。只有 IB event loop 调用 `pulse()` 才会推进 `heartbeat_mono`；因此 `reqCurrentTime` 或其他 IB 请求卡住时，publisher 虽仍能写状态文件，外部 watchdog 看到的 pulse 仍会持续变旧。
 
-生产/验证运行应把 `scripts/run_recorder_watchdog.py` 作为独立进程启动。默认建议 heartbeat timeout 15 秒、再等待 15 秒 grace；watchdog 只告警和终止 Recorder，不下单、不重启。每路行情也有独立运行时 staleness：socket 仍连接但 BidAsk、AllLast 或 BAR_5S 超过各自阈值时，Recorder 会记录 `STREAM_STALE` 并重建订阅，不能静默完成。
+生产/验证运行应把 `scripts/run_recorder_watchdog.py` 作为独立进程启动。默认建议 heartbeat timeout 15 秒、再等待 15 秒 grace；watchdog 只告警和终止 Recorder，不下单、不重启。
+
+## 行情 liveness：只有 bar 有资格中断运行
+
+原先三路行情各有一个运行时阈值，任何一路超时都记 `STREAM_STALE` 并重建订阅。这个设计有一个无法通过调参解决的缺陷：对**事件驱动**的流，"5 秒没有 BidAsk" 和 "5 秒内没有报价变化" 是同一个观测，两者在信息上不可区分。结果是一个正常清淡的夜盘会产生和"订阅已死"完全相同的报错 —— 而后者正是这套机制存在的理由。
+
+真实行情协议（ITCH / OPRA / CME MDP 3.0）不靠计时解决这件事，靠的是每通道单调序列号：收到 1001 再收到 1003 就**确定**丢了 1002，不需要阈值。IB 不提供序列号，但提供了另一半 —— `reqRealTimeBars` 是**时间驱动**的。
+
+2026-08-10 的 OVERNIGHT 实测（[`GATE_B2_OVERNIGHT_20260810.md`](GATE_B2_OVERNIGHT_20260810.md) §3，120.047 秒窗口）直接观察到：AllLast 只有 13 笔、最大间隔 29.641 秒，同一窗口 5 秒 bar 有 25 根、最大间隔 5.235 秒。成交几乎停摆，bar 节奏纹丝不动。即使 `whatToShow="TRADES"`，零成交的 5 秒窗口 IB 照样发 bar。
+
+因此现在的划分是：
+
+| 流 | 性质 | 权限 |
+|---|---|---|
+| `BAR_5S` | 时间驱动 | heartbeat，可中断运行（默认 12 秒 = 2 个周期 + 余量） |
+| `BID_ASK` / `ALL_LAST` | 事件驱动 | 只记录进报告，**永远不中断运行** |
+
+"这段静默要不要报警"由 IB 的显式信号回答，不由时长推断：generic tick 49（0=正常，1=停牌，2=波动性熔断）、market data farm 状态码 2103/2105 与 2104/2106、以及 1100/1101/1102 连接三元组。1101 表示订阅已丢必须重订，1102 表示订阅保留、重订反而会自己制造一段缺口。2108 是 IB 明说的"非错误"，不当作故障 —— 把它当故障是让 operator 学会无视告警的最快方式。另外 `ib.setTimeout()` / `timeoutEvent` 监听"完全没有任何数据从 TWS 过来"，它跑在 event loop 上，只能发现对端沉默；本地 loop 卡死由独立线程的 `EventLoopHeartbeat` 负责，两个失败域两个探测器。
+
+任何非 CONTINUE 判定都**先**往 raw log 写 `GAP_SUSPECTED` 再决定动作。被标注的缺口回测可用，未标注的缺口会默默宣称自己是连续的 —— 后者才是这一层真正要防的事故。恢复动作就是重连，由既有 `ReconnectBudget` 负责限次和升级，不另设第二套升级策略。
+
+仍需真实 Gateway 实测才能把 bar heartbeat 提升为 probe 的 pass/fail 条件（当前只记录、不判定）：停牌期间 bar 是否继续、tick 49 是否必须显式在 `genericTickList` 中请求、5 秒节奏能否覆盖开盘/午盘/收盘的长窗口、以及 `useRTH=True` 在 OVERNIGHT 路由下的真实语义。**未测就当作 pass 条件，等于重犯它所替换的错误。**
 
 ## 测试策略
 

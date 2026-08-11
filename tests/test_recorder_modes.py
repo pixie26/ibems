@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from ib_execution.market_liveness import LivenessAction
 from ib_execution.quote_recorder import (
     QuoteRecorder,
     RawEventLog,
@@ -118,16 +119,38 @@ def test_callback_accounting_mismatch_refuses_finalization(tmp_path):
         )
 
 
-def test_per_stream_staleness_detects_a_live_socket_with_dead_subscriptions(tmp_path):
+def test_liveness_detects_a_live_socket_with_a_dead_bar_subscription(tmp_path):
+    """The socket is up and quotes still flow, but the bar cadence stopped.
+
+    Bars are time-driven, so their absence is decidable where a quote gap is
+    not -- this is the one market-data observation allowed to stop the run.
+    """
     recorder = QuoteRecorder(tmp_path, mode=DataMode.RESEARCH_FULL)
-    recorder._subscription_started_mono = 100.0
-    recorder._last_handled_mono = {
-        "BID_ASK": 119.0,
-        "ALL_LAST": 119.0,
-        "BAR_5S": 100.0,
-    }
-    stale = recorder.stream_staleness(now_mono=120.0)
-    assert stale == {"BAR_5S": 20.0}
+    recorder.liveness.subscription_started(100.0)
+    for stream in ("BID_ASK", "ALL_LAST"):
+        recorder.liveness.note_event(stream, 119.0)
+
+    state = recorder.liveness.assess(now_mono=120.0)
+
+    assert state.action is LivenessAction.RECOVER_SUBSCRIPTION
+    assert state.heartbeat_lost is True
+    assert state.heartbeat_age == 20.0
+
+
+def test_quote_staleness_is_reported_but_never_acts(tmp_path):
+    """The mirror image: bars healthy, quotes silent. Report only.
+
+    A long BID_ASK gap on a live subscription is a fact about the tape.
+    Acting on it is what made a quiet OVERNIGHT window produce the same
+    failure text as a genuinely dead feed.
+    """
+    recorder = QuoteRecorder(tmp_path, mode=DataMode.RESEARCH_FULL)
+    recorder.liveness.subscription_started(100.0)
+    recorder.liveness.note_event("BAR_5S", 118.0)
+
+    assert recorder.stream_staleness(now_mono=120.0) == {"BID_ASK": 20.0}
+    assert "BAR_5S" not in recorder.stream_staleness(now_mono=120.0)
+    assert recorder.liveness.assess(now_mono=120.0).action is LivenessAction.CONTINUE
 
 
 def test_decision_window_promotes_the_complete_predecision_bidask_ring(tmp_path):
