@@ -84,7 +84,7 @@ Recorder 现在有独立 heartbeat publisher 线程，但该线程不会自行�
 - gzip → Parquet → readback → schema/hash/manifest；
 - callback handler 与 persisted 计数。
 
-另外覆盖 60 秒虚拟 session 的开收盘/gap 边界、writer drain timeout 不释放仍在工作的 session lock、Recorder 进程强杀后的 gzip prefix 恢复，以及 event-loop pulse 停止时外部 watchdog 判定 stale。
+另外覆盖 60 秒虚拟 session 的开收盘/gap 边界、writer drain timeout 不释放仍在工作的 session lock、Recorder 进程强杀后的 gzip prefix salvage，以及 event-loop pulse 停止时外部 watchdog 判定 stale。现有强杀测试证明可读前缀能够恢复并保留 `crashed-*` 段；仍需补充明确的段级完整性判定，并让读取/manifest 明示不完整尾段如何被丢弃和计数，避免把 prefix salvage 误读成完整 segment。
 
 重型吞吐验证已移到 `.github/workflows/recorder-soak.yml`：Windows/Linux 每周或手动写入并 readback 一百万事件，输出吞吐、字节数、队列水位、writer lag、fsync latency 和零丢失对账。普通 PR CI 不重复写一整天数据。
 
@@ -103,11 +103,11 @@ Windows 不再调用 `os.open(directory, O_RDONLY)`，也不会在 replace 已�
 
 本机真实 NTFS safe drill 已直接通过：两进程只能一个持锁、holder 强杀后 successor 可取得锁、连续 durable replace 可读、publication writer 中途强杀后目标仍是完整 JSON generation。证据由 `scripts/run_windows_ntfs_safe_drill.py` 生成。
 
-真实 disk-full 已提供隔离 VHD runner：`scripts/run_windows_ntfs_vhd_disk_full.ps1` 只在 `artifacts/` 新建 128–512MB VHD、格式化该临时盘、运行 execution-host ENOSPC drill，最后卸载删除；`.github/workflows/windows-ntfs-fault.yml` 可在独立 Windows runner 上封存结果。本机尝试因当前会话没有可用 Windows 磁盘管理提权而未创建 VHD，主工作盘没有被写满。
+真实 disk-full 已提供隔离 VHD runner：`scripts/run_windows_ntfs_vhd_disk_full.ps1` 只在 `artifacts/` 新建 128–512MB VHD、格式化该临时盘、运行 execution-host ENOSPC drill，最后卸载删除；`.github/workflows/windows-ntfs-fault.yml` 可在独立 Windows runner 上封存结果。本机尝试因当前会话没有可用 Windows 磁盘管理提权而未创建 VHD，主工作盘没有被写满。该实验不阻塞 B2：Recorder 已通过 `dropped_count` / `writer_error` 暴露失败，当前后果是研究数据不完整而非无审计继续下单。VHD workflow 保留为手动、隔离 runner 项，绝不在主盘执行；有真实 order Journal 路径后，应以 Journal fail-closed 为主要被测对象。
 
 ## 仍未解除的授权边界
 
-Windows 单元、子进程和完整套件通过，只证明当前 API 调用形状和互斥行为可用；它不等于真实 NTFS 故障语义已经闭环。
+Windows 单元、子进程和完整套件通过，只证明当前 API 调用形状和互斥行为可用；它不等于真实 NTFS 故障语义已经闭环。以下项目是 B3/order-capable Windows deployment 的前置证据，不是 B2 只读 Gateway/Recorder 的 blocker：
 
 任何 order-capable Windows deployment 前仍必须在生产等价 OS/volume 上完成并封存：
 
@@ -118,6 +118,8 @@ Windows 单元、子进程和完整套件通过，只证明当前 API 调用形�
 - execution service 强杀、ownership 继承与 startup refusal；
 - volume failure-domain 判定。
 
-在这些证据完成前，Windows 只授权 read-only Recorder/Gateway validation；`order_authorization` 仍为 `NONE`。若生产执行放在已有 Linux 故障证据覆盖的环境，Windows 可继续作为开发和只读观测机，但 Linux freeze 也不能自动为新的 B2 代码背书。
+其中 flush stall、fence/witness publication、journal WAL damage/rollback、service 强杀和 volume failure-domain 都属于订单持久化故障域；相关 order Journal 代码与授权未进入真实 broker 路径前，不在 B2 重复做高风险本机实验。B2 当前只保留低风险的 Recorder gzip 尾段完整性小项。
+
+在这些 B3/order-capable 证据完成前，Windows 只授权 read-only Recorder/Gateway validation；`order_authorization` 仍为 `NONE`。若生产执行放在已有 Linux 故障证据覆盖的环境，Windows 可继续作为开发和只读观测机，但 Linux freeze 也不能自动为新的 B2 代码背书。
 
 该限制现在不仅是文档：`HostConfig.broker_capability=order_capable` 时，启动前必须提供平台匹配的 exact-freeze capability evidence，包含 owner `PAPER/LIVE` 授权、source tree hash、全部必需 fault drill PASS 和 artifact SHA-256；缺任一项都在 broker 构造前拒绝启动。默认 capability 是 `simulation`，当前没有任何通过文件，也不会因测试绿色自动产生授权。

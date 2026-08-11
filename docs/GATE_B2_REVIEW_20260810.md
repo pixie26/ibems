@@ -67,7 +67,7 @@ run 继续跑完，report 写 `no_exception: true`、`passed: true`。
 `_raise_if_fatal_error()` 及主循环结构测试，使 callback 失败进入不可重试、会写
 `RECORDER_ERROR` 的 finalize 路径。
 
-## 3. 需要解释的观测：两轮 recorder 的 BidAsk 都比配对 preflight 少约 40%
+## 3. 已关闭：跨窗口约 40% 计数差异不是有效测量
 
 | session | preflight BidAsk / AllLast / bars | recorder BidAsk / AllLast / bars | 窗口 |
 |---|---|---|---|
@@ -80,40 +80,29 @@ BidAsk：−39.3% 和 −43.0%。AllLast：−10.3% 和 **+23%**。
 两侧计数语义完全相同（都在 `updateEvent` 里遍历 `updated.tickByTicks`）；窗口长度相同；
 probe 的 readback 走 `log.read_all()`，覆盖全部 segment。
 
-这是需要解释的重复模式，但当前数据**不能排除行情状态漂移**。RTH 两个采样窗口是顺序
-运行，前一窗口结束到后一进程启动约 1.5 分钟；OVERNIGHT 的间隔约 6.4 分钟。报价更新率
-和成交率不要求分钟级同向变化，两个非同时样本也不足以给出“不是噪声”的统计结论。
+RTH 两个采样窗口是顺序运行，前一窗口结束到后一进程启动约 1.5 分钟；OVERNIGHT 的间隔
+约 6.4 分钟。SPY RTH BidAsk 在这些样本里约为 214 笔/秒量级，报价更新率和成交率并不要求
+相邻分钟同向或稳定。没有共同窗口，就不能从绝对计数差异推出丢数据；这组数字从来不是
+有效的损失率测量。这里的严谨结论是“测量无效”，不是“差异原因已经解释”。
 
-代码里有两条真实的候选机制，我**不主张**已经确定是哪一条：
-
-- **写路径**：`_append` 在 callback 内同步序列化并写 gzip。BidAsk 约 213 tick/s 是三路里
-  最快的一路，backpressure 下受损最重——与观测到的不对称方向一致。
-- **上游/客户端处理差异**：两侧都发了 `reqMktData` probe；原文称 preflight 没发是事实错误。
-  真实差异包括 Recorder callback 内同步 gzip 写入及 subscription pacing。若客户端处理不过来，
-  最高频 BidAsk 最可能先表现出差异，但现有证据不能定位到 IB、socket/event loop 或写路径。
-
-**第一层判定（只读、两分钟）：** report 同时记录 callback 侧 `handler_counts` 和落盘
-readback `stream_counts`，两者不等时 probe 失败。这能判断“已进入 handler 的事件”是否在
-callback→gzip→readback 路径丢失。
-
-1. 若 `handler_counts > stream_counts`，丢失在 callback 进入后到落盘 readback 之间，属于必须修的 bug。
-2. 若两者相等，只能证明 Recorder 完整保存了**已交给 handler 的事件**；不能用一次新的绝对
-   BidAsk 数与旧窗口比较来关闭本条。
-3. 要判断 Recorder 是否导致 callback 前的缺失，需要两个独立进程/事件循环在同一重叠窗口、
-   同一路由同时采样：一个纯计数 control，一个真实 Recorder。只有这种同步 A/B 才能把市场
-   时间漂移从 client/write backpressure 中分离出来。
+真正可判定的写路径问题已经用直接对账回答：report 同时记录 callback 侧 `handler_counts`
+和落盘 readback `stream_counts`，两者不等时 probe 失败。这能判断“已进入 handler 的事件”
+是否在 callback→gzip→readback 路径丢失。
 
 **2026-08-11 RTH 第一层实验已完成：** `clientId=960`、`readonly=True`、`SPY SMART`，
 120.406 秒内 handler / raw readback 均为 `8972 / 1707 / 25`，三路逐项完全相等，
 `write_path_lost_nothing=true`、`no_swallowed_callback_failure=true`、零 broker write，report
 SHA-256 `0cb4c95b86d39e054b3c384bf8a225958609cf4c5dff167b49177ed9c4e02edc`。
-这关闭了本窗口中“handler 已收到但 callback→gzip→readback 丢失”的假设；它**没有**解释
-旧的约 40% 顺序窗口差异（本轮 BidAsk 绝对数甚至更低，因此更不能拿旧绝对数作基准）。
+这关闭了本窗口中“handler 已收到但 callback→gzip→readback 丢失”的假设。另有本机
+million-event soak 在 10,000 events/s 下达到 1,000,000 accepted/persisted/readback、
+dropped=0，为写路径提供了独立压力证据。两项合起来证明的是 Recorder 已接收事件的写路径，
+不是 IB tick-by-tick 相对于交易所原始 feed 的完整性。
 
-在此之前，**`OBSERVED - RTH BOUNDED PASS` 只能读作「三路都拿到了 LIVE 数据」，
-不能读作「Recorder 无损」。**
+因此不再安排同步 A/B。即使两个 IB 客户端在同窗得到相同计数，也没有交易所级“正确条数”
+可对照；若不同，也无法从中定位或修复 IB 的 conflation/分发行为。额外占用两条 market-data
+line 与两个 clientId 还会重新引入 `10197` competing-session 风险，而不会改变 B2 决策。
 
-## 4. 流程：`main` 现在是红的，而 `STATE.json` 在说谎
+## 4. 历史流程发现：`main` 曾经是红的，而 `STATE.json` 当时失真
 
 - `ae12307` 和 `ef8ec7e` 直接推到 `main`，绕过 PR；CI run 44 / 45 **都是 failure**，
   从 2026-08-09 17:45 UTC 起 `main` 一直红着。
@@ -125,6 +114,10 @@ SHA-256 `0cb4c95b86d39e054b3c384bf8a225958609cf4c5dff167b49177ed9c4e02edc`。
 
 **机制是对的，被绕过的是流程。** 这一轮唯一能自动发现 attestation 失效的哨兵按设计
 亮了红灯，然后红灯被忽略了 22 小时。本分支已重新生成 `STATE.json`，套件恢复全绿。
+
+**当前处置（2026-08-12）：** `980f655` 用 `.gitattributes` 固定跨平台工作树字节并重新生成
+`STATE.json`，`85f4084` 纳入新的 production liveness 逻辑；在 Windows 重新物化 LF 工作树后，
+完整 pytest 与 `provenance --check` 均通过。以上只修复 provenance/测试状态，不自动使 B2 PASS。
 
 ### 但这里有一个会持续制造压力的设计问题
 
@@ -165,25 +158,31 @@ Windows 换行改写历史事实；后者仍由现有 `attestation.validate` 派
 改进配方：在断网前建立 SPY 三路订阅，记录各 stream 最后到达时间、1100/recovery code、
 恢复后的首条到达与是否需要 resubscribe；受控解除 outbound block。它仍在只读边界内，
 但结果应写成“观察到 1101/1102 中哪一个以及 stream 如何恢复”，不能预注册为必取 1101。
-本分支已把 `run_ib_readonly_network_fault_probe.py` 改为持有三路订阅并记录 recovery 后逐流
-增量；尚未执行新的防火墙故障轮次。该 probe 仍是测量 harness，不等于已把真实 fault 注入
-`QuoteRecorder.run()`；production staleness/final health 的真实 Gateway 验证仍是单独待办。
+`run_ib_readonly_network_fault_probe.py` 已改为持有三路订阅并记录 recovery 后逐流增量；
+`QuoteRecorder.run()` 也已接入 bar heartbeat、1101 重订/1102 不重订、`GAP_SUSPECTED`、
+generic tick 49 与 transport timeout re-arm。尚未执行新的防火墙故障轮次。下一轮应把“持订阅
+断网”和 production `run()` 的真实 fault 验证合并为同一次 operator-controlled interruption；
+单独跑测量 harness 不能关闭 production 路径。
 
-而 1101 本身不是重点。**重点是它之后的状态**：订阅已死，socket 还活着，
-`isConnected()` 为 True，没有异常，tick 就是不来了。这正是 Recorder 的 per-stream
-staleness health 存在的唯一理由，而它**从未对着真实 Gateway 跑过**。
+而 1101 本身不是重点。**重点是它之后的状态**：订阅可能已死，socket 仍活着，
+`isConnected()` 为 True，没有异常，行情却不再恢复。当前实现用预期每 5 秒到达的 bar 作为
+可判定 heartbeat；BidAsk / AllLast 是事件驱动流，其 staleness 只记录、不驱动恢复。这套
+production liveness 逻辑仍**从未对着真实 Gateway 故障跑过**。
 第 1、2 条说明这个静默失败家族在这个代码库里已经出现过两次；这是同一家族里
 还没被实测的第三个成员，也是我认为当前剩余的只读测试里价值最高的一个。
 
 ## 下一步建议顺序
 
-1. 重新生成 `STATE.json`，恢复 `main` 绿灯；之后 B2 改动一律走 PR。**（本分支已做）**
-2. 带 `handler_counts` 的 RTH bounded run 已关闭本窗口的 handler 后写路径丢失；另做同步
-   独立进程 A/B 才能关闭旧窗口约 40% 差异。
-3. 持订阅断网，观察实际 recovery code、resubscribe 与 per-stream staleness；不预设必为 1101。
-4. `STATE.json` 字段拆分并保留原失效规则。**（本分支已做）**
-5. 完成 `PENDING DOC REVIEW` 的逐项官方文档复核。
-6. Windows/full-suite gap 处置，然后形成 B2 自己的 exact-freeze——不借 B1 attestation 背书。
+1. `.gitattributes` 固定跨平台工作树字节并重新生成 `STATE.json`；完整测试与 provenance
+   在 Windows 工作树通过。**（`980f655` + `85f4084` 后已完成）**
+2. 旧窗口约 40% 差异按“不是有效测量”关闭，不再安排同步 A/B；handler 对账与 million-event
+   soak 已直接证明 Recorder 写路径在各自覆盖窗口内无损。
+3. 最高优先级：用真实 `QuoteRecorder.run()` 持三路订阅做一次受控断网，观察实际 recovery
+   code、1101 重订/1102 不重订、`GAP_SUSPECTED`、bar heartbeat 与恢复后逐流增量。
+4. 运行一次 Full-RTH 全日 health，同时覆盖 `finalize_day`、开/午/收盘 bar cadence、长期内存、
+   磁盘和队列水位，并解释 OVERNIGHT route 下 `useRTH=True` 仍有 bar 的直接行为。
+5. 完成 Recorder 强杀后 gzip 段级完整性/尾段处置，以及 attestation 统一读取 Git 对象。
+6. 完成 `PENDING DOC REVIEW` 并形成 B2 自己的 exact-freeze——不借 B1 attestation 背书。
 7. 只读证据封存后，owner 单独决定是否授权 1 股 SPY paper-order 子阶段。
 
 当前没有任何 paper-order 或 live-order 授权，本复核不改变这一点。

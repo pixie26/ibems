@@ -128,9 +128,9 @@ Recorder 与交易路径隔离开发，只采集：
 - IB connection/error、`marketDataType`、server time；
 - local wall-clock 与 monotonic arrival timestamp。
 
-原始事件通过有界内存队列交给独立 writer，按 batch 写入 append-only gzip JSONL；callback 不执行 gzip/flush/fsync。代码显式区分 `execution_minimal`、`evidence_sampled`、`research_full`，采样规则和 `handled → selected → enqueued → persisted → readback` 全链路均写入 manifest。独立 heartbeat publisher 不会替 event loop 刷新 pulse，因此 IB 请求整体卡住可以由外部 watchdog 发现。队列满、writer/heartbeat 异常、per-stream staleness、关闭超时或任一计数不一致都会 fail-closed。`execution_host` 不保存每条行情 tick，订单 Journal 的 durable-before-send 语义也没有被异步化。详细边界见 [Recorder 写入、测试与 Windows 部署边界](docs/RECORDER_STORAGE_AND_WINDOWS_POLICY_ZH.md)。
+原始事件通过有界内存队列交给独立 writer，按 batch 写入 append-only gzip JSONL；callback 不执行 gzip/flush/fsync。代码显式区分 `execution_minimal`、`evidence_sampled`、`research_full`，采样规则和 `handled → selected → enqueued → persisted → readback` 全链路均写入 manifest。独立 heartbeat publisher 不会替 event loop 刷新 pulse，因此 IB 请求整体卡住可以由外部 watchdog 发现。队列满、writer/heartbeat 异常、5 秒 bar heartbeat 丢失、关闭超时或任一计数不一致都会 fail-closed；BidAsk / AllLast 属于事件驱动流，其 staleness 只记录、不单独触发恢复。`execution_host` 不保存每条行情 tick，订单 Journal 的 durable-before-send 语义也没有被异步化。详细边界见 [Recorder 写入、测试与 Windows 部署边界](docs/RECORDER_STORAGE_AND_WINDOWS_POLICY_ZH.md)。
 
-当前实测已在 SPY OVERNIGHT 与正式 `RTH+SMART` bounded run 中直接观察到 LIVE BidAsk、AllLast 和 5 秒 bars 三路非零。早期 sleep 后读取 `Ticker.tickByTicks` 残余缓冲得到的 `AllLast=0` 已被判定为无效测量；现有 preflight 与 Recorder 都在 callback 中累计。两分钟结果证明三路可达，不等于 Full-RTH 全日无损；带 `handler_counts` 的下一轮 RTH probe 仍需关闭此前 Recorder/配对 preflight 的 BidAsk 数量差异。
+当前实测已在 SPY OVERNIGHT 与正式 `RTH+SMART` bounded run 中直接观察到 LIVE BidAsk、AllLast 和 5 秒 bars 三路非零。早期 sleep 后读取 `Ticker.tickByTicks` 残余缓冲得到的 `AllLast=0` 已被判定为无效测量；现有 preflight 与 Recorder 都在 callback 中累计。2026-08-11 的 RTH handler-count run 中，handler 与 raw readback 均为 `8972/1707/25`，直接证明该窗口 callback→gzip→readback 无丢失。旧 preflight 与 Recorder 位于不重叠窗口，约 40% 的 BidAsk 计数差异从来不是有效的丢包测量，现已关闭且不再安排同步 A/B；这仍不等于 IB 上游无损或 Full-RTH 全日 health。
 
 ```powershell
 # Broker-write-free Gateway 与稳定快照预检
@@ -204,9 +204,10 @@ python -m ib_execution.execution_host --journal D:\ibems-data\journal.db \
 ## 下一步
 
 1. **策略 Gate A 独立推进。** 在策略仓库完成真实成本、数据质量和统计不确定性判断；若结论为 `NO_GO` 或 `INSUFFICIENT_EVIDENCE`，且没有独立第二消费者，就停止投资交易型 IB Adapter。
-2. **Gate B2 RTH 行情证据已完成。** 正式 `RTH+SMART` preflight 与 bounded Recorder 均运行超过 120 秒，LIVE BidAsk / AllLast / 5s bars 全部非零；该结果仍不等于 Full-RTH 全日 coverage。
-3. **完成 documented-vs-observed 复核与 B2 freeze。** 周末空状态、client/Gateway 故障和 `1100 -> 1102` 已有直接观测；仍需官方文档逐项复核、Windows/provenance gap 处置，并把 B2 source、tests、docs 和 evidence 绑定到新的可复查 tree。
-4. **只读阶段不下单。** `completed orders` 被 Gateway Read-Only policy 阻断；不关闭保护追测。非空 reconciliation、订单身份和 callback 保留到另行授权的 paper-order 子阶段。
-5. **paper order 必须重新授权。** 只读证据封存后，owner 才单独决定是否运行 1 股 SPY paper-order protocol；B1 PASS 或 B2 只读结果都不自动构成该授权。MOC、多策略、live capital 和自动 watchdog takeover 继续推迟。
+2. **最高优先级是持三路订阅的受控断网。** 在一次 operator 明确确认的窗口中，用真实 `QuoteRecorder.run()` 同时验证实际 1101/1102、1101 重订/1102 不重订、`GAP_SUSPECTED`、bar heartbeat 与恢复后逐流增量；不预设必须得到 1101。
+3. **随后运行一次 Full-RTH 全日 health。** 同时验证 `finalize_day` 全日 coverage、开盘/午盘/收盘的 5 秒 bar 节奏，以及长时间内存、磁盘和队列水位；在直接观测前，bar heartbeat 仍不能被宣称为全时段有效承重结构。
+4. **完成本地剩余小项与 B2 freeze。** 为强杀后的 gzip 段增加明确的段级完整性判定和不完整尾段处置；统一 attestation 从 Git 对象读取历史冻结事实；完成官方文档复核，并把 B2 source、tests、docs 和 evidence 绑定到新的可复查 tree。
+5. **只读阶段不下单。** `completed orders` 被 Gateway Read-Only policy 阻断；不关闭保护追测。非空 reconciliation、订单身份和 callback 保留到另行授权的 paper-order 子阶段。
+6. **paper order 必须重新授权。** 只读证据封存后，owner 才单独决定是否运行 1 股 SPY paper-order protocol；B1 PASS 或 B2 只读结果都不自动构成该授权。MOC、多策略、live capital 和自动 watchdog takeover 继续推迟；live order 继续禁止。
 
 当前第二个独立使用者仍为 `NONE_CONFIRMED`。QQQ 与 SPY 属于同一日内动量命题，不能单独证明继续建设交易 Adapter 的经济必要性。**平台越成熟，越不能反过来成为「所以策略应该交易」的理由。**
