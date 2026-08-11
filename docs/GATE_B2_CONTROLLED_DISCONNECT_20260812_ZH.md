@@ -18,7 +18,7 @@
 - `writer_error=null`、`dropped_count=0`，失败在 IB 请求/前置条件，不在写路径；
 - 该失败证据不得删除或改写成成功轮次。
 
-第二次使用配置覆盖 `market_data_generic_ticks=""`，不改生产代码，artifact 为
+第二次使用配置覆盖 `market_data_generic_ticks=""`，当时不改生产代码，artifact 为
 `artifacts/ib_preflight/20260812_controlled_disconnect_real_run_retry_empty_generic_ticks/`。进程 PID 18488、
 clientId 961，于约 13:00 ET 开始，当前仍为 `CAPTURING / READ_ONLY / research_full`。因为没有从 09:30 ET
 开始，它无论是否运行到收盘都只是**部分日长跑**，绝不是 Full-RTH。
@@ -64,6 +64,25 @@ clientId 961，于约 13:00 ET 开始，当前仍为 `CAPTURING / READ_ONLY / re
 100 秒 outage 的单元测试由约 400 条降为 START、CHECKPOINT、END 三条；实质状态变化可额外产生 UPDATE。
 但当前 PID 18488 在代码修改前已加载旧实现，所以这次真实 artifact 只能证明旧问题存在，**不能证明新
 incident 实现在真实 Gateway 上已通过**。下一次 Recorder 启动才会加载修正。
+
+### 3.1b generic tick 49 的默认值本身就是缺陷
+
+当时只用配置覆盖绕过，生产默认仍是 `market_data_generic_ticks="49"`，也没有任何地方处理 error 321
+——**下一次用默认配置启动的 `run()` 会以完全相同的方式失败**。引入该默认值时的论证是"显式请求严格占优：
+IB 本来就发就无害，不发就必需"。这个论证被真实 Gateway 证伪了：请求一个不被支持的 generic tick 不是
+免费的，它会连带废掉整个 `reqMktData`。
+
+已修正：默认回到 `""`；operator 可在支持 tick 49 的环境显式 opt-in；两个方向都有回归测试。
+
+更重要的是随之而来的**设计后果**：停牌抑制器现在没有输入源。没有 tick 49，真实停牌在本探测器眼中
+与订阅死亡完全相同。因此 manifest 新增 `halt_state_available` / `halt_state_note`，明确记录抑制器当时
+是否接通；读者不得把"没有 halt marker"读成"没有停牌"。
+
+由此还暴露一个尚未决定的策略问题：停牌期间若 bar 停止且无 tick 49 解释，当前路径是
+`RECOVER_SUBSCRIPTION` → 重连 → 仍无 bar → 再重连 →**耗尽 `ReconnectBudget` 后整个 session 终止**。
+对只读 Recorder 而言，"整天数据没了"比"一段被标注的缺口"更糟；fail-closed 的直觉适用于订单路径，
+不一定适用于数据采集。是否应在有限次恢复失败后降级为"保持 incident 打开并继续记录"，需 owner 决定，
+本文不擅自改变。
 
 ### 3.2 非致命 ib_async callback 异常
 

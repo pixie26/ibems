@@ -491,3 +491,47 @@ def test_the_production_loop_no_longer_stops_on_event_driven_gaps():
 
 def test_the_production_loop_asks_for_the_halt_state():
     assert "note_halted" in _loop_source()
+
+
+# -- the halt suppressor must admit when it has no input --------------
+
+
+def test_a_gateway_that_refuses_tick_49_is_recorded_as_a_blind_suppressor():
+    """Real Gateway, 2026-08-12: error 321 for tick 49 on a STK contract.
+
+    Requesting it was argued to strictly dominate not requesting it. It does
+    not: the rejection took the whole reqMktData probe with it, and the run
+    failed its prerequisites with three zero streams. What survives is the
+    reporting duty -- with no halt input, a genuine halt looks exactly like a
+    dead subscription to this detector, and the manifest has to say so
+    instead of letting an absent halt marker read as "not halted".
+    """
+    liveness = _live()
+    liveness.note_halt_state_source(True, detail="market_data_generic_ticks='49'")
+    liveness.note_halt_state_unavailable("IB rejected the market-data request (321)")
+
+    manifest = liveness.manifest()
+
+    assert manifest["halt_state_available"] is False
+    assert "321" in str(manifest["halt_state_note"])
+    # Blind is not the same as "not halted": silence stays unexplained.
+    assert liveness.expected_silence() is None
+    assert liveness.assess(300.0).action is LivenessAction.RECOVER_SUBSCRIPTION
+
+
+def test_not_requesting_the_halt_tick_is_disclosed_too():
+    """The default path. Blind by construction is still blind."""
+    liveness = _live()
+    liveness.note_halt_state_source(False, detail="market_data_generic_ticks=''")
+
+    assert liveness.manifest()["halt_state_available"] is False
+
+
+def test_an_arriving_halt_value_proves_the_suppressor_is_connected():
+    liveness = _live()
+    liveness.note_halt_state_source(True)
+    assert liveness.manifest()["halt_state_available"] is None  # asked, not yet answered
+
+    liveness.note_halted(0.0)
+
+    assert liveness.manifest()["halt_state_available"] is True

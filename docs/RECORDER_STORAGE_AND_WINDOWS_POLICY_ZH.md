@@ -96,7 +96,7 @@ Gateway 还直接拒绝 STK generic tick 49（error 321），当前实测运行�
 - gzip → Parquet → readback → schema/hash/manifest；
 - callback handler 与 persisted 计数。
 
-另外覆盖 60 秒虚拟 session 的开收盘/gap 边界、writer drain timeout 不释放仍在工作的 session lock、Recorder 进程强杀后的 gzip prefix salvage，以及 event-loop pulse 停止时外部 watchdog 判定 stale。现有强杀测试证明可读前缀能够恢复并保留 `crashed-*` 段；仍需补充明确的段级完整性判定，并让读取/manifest 明示不完整尾段如何被丢弃和计数，避免把 prefix salvage 误读成完整 segment。
+另外覆盖 60 秒虚拟 session 的开收盘/gap 边界、writer drain timeout 不释放仍在工作的 session lock、Recorder 进程强杀后的 gzip prefix salvage，以及 event-loop pulse 停止时外部 watchdog 判定 stale。现有强杀测试证明可读前缀能够恢复并保留 `crashed-*` 段。**该段现在必须被披露**：`compute_health` 收集所有 `crashed-*` 段名进 `salvaged_segments`，写入 `health.json`，并产生一条 `capture truncated: ...` problem，使 `health_ok=false`。此前唯一痕迹是 `file_hashes` 里的一个文件名，读者必须自己注意到，而 `health_ok` 仍为 true —— 一个丢了尾巴的交易日和一个完整交易日在 manifest 里长得一样。salvage 出来的行是真的，值得恢复；但该段在内核停下 writer 的地方结束，任何从它得到的计数都不完整，因此不能报成干净的一天。仍待补的是**段级**（而非整段丢弃）完整性判定：明示尾部被丢弃了多少字节。
 
 重型吞吐验证已移到 `.github/workflows/recorder-soak.yml`：Windows/Linux 每周或手动写入并 readback 一百万事件，输出吞吐、字节数、队列水位、writer lag、fsync latency 和零丢失对账。普通 PR CI 不重复写一整天数据。
 

@@ -152,3 +152,73 @@ def test_sixty_second_virtual_session_exercises_all_gap_boundaries():
         clock_skew_samples=[0.0],
     )
     assert health.ok(), health.problems()
+
+
+def test_a_salvaged_segment_stops_the_day_reporting_itself_as_clean(tmp_path):
+    """Prefix salvage recovers real rows -- and hides how many it did not.
+
+    A ``crashed-`` segment ends wherever the kernel happened to stop the
+    writer, so no count taken from it is complete. The recovery is still
+    worth doing, but before this the only trace was a filename inside
+    ``file_hashes``: ``health_ok`` stayed true and ``problems`` said nothing,
+    so a truncated day was indistinguishable from a whole one in the
+    manifest a backtest would read months later.
+    """
+    ready = tmp_path / "ready.txt"
+    helper = Path(__file__).parent / "helpers" / "recorder_crash_holder.py"
+    env = os.environ.copy()
+    source = str(Path(__file__).parents[1] / "src")
+    env["PYTHONPATH"] = source + os.pathsep + env.get("PYTHONPATH", "")
+    process = subprocess.Popen(
+        [sys.executable, str(helper), str(tmp_path), str(ready), SESSION.isoformat()],
+        env=env,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert ready.exists(), "crash holder did not publish readiness"
+        process.kill()
+        process.wait(timeout=5)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+    recovered = RawEventLog(tmp_path, session=SESSION)
+    try:
+        health = compute_health(
+            recovered,
+            session_open=datetime(2026, 8, 11, 13, 30, tzinfo=timezone.utc),
+            session_close=datetime(2026, 8, 11, 20, 0, tzinfo=timezone.utc),
+            clock_skew_samples=[0.0],
+        )
+    finally:
+        recovered.close()
+
+    assert health.salvaged_segments, "the crashed segment must be named, not just hashed"
+    assert all(name.startswith("crashed-") for name in health.salvaged_segments)
+    assert health.ok() is False
+    assert any("capture truncated" in problem for problem in health.problems())
+    assert health.as_dict()["salvaged_segments"] == sorted(health.salvaged_segments)
+
+
+def test_a_clean_session_reports_no_salvage(tmp_path):
+    """The mirror: the disclosure must not fire on an ordinary session."""
+    log = RawEventLog(tmp_path, session=SESSION)
+    log.append(_tick(1), now_mono=1.0)
+    log.close()
+
+    reopened = RawEventLog(tmp_path, session=SESSION)
+    try:
+        health = compute_health(
+            reopened,
+            session_open=datetime(2026, 8, 11, 13, 30, tzinfo=timezone.utc),
+            session_close=datetime(2026, 8, 11, 20, 0, tzinfo=timezone.utc),
+            clock_skew_samples=[0.0],
+        )
+    finally:
+        reopened.close()
+
+    assert health.salvaged_segments == []
+    assert not any("capture truncated" in problem for problem in health.problems())

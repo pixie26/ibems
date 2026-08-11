@@ -177,3 +177,24 @@ def test_decision_window_promotes_the_complete_predecision_bidask_ring(tmp_path)
     assert len(rows) == 3
     assert recorder.selected_events == {"BID_ASK": 3}
     assert recorder.filtered_events == {}
+
+
+def test_the_halt_tick_is_not_requested_by_default(tmp_path):
+    """A real Gateway answered error 321 and the whole subscription failed.
+
+    docs/GATE_B2_CONTROLLED_DISCONNECT_20260812_ZH.md section 1: the probe
+    never got a LIVE marketDataType callback and the run ended with three
+    zero streams. Asking for an unsupported generic tick can cost the entire
+    market-data request, so the default must be the set the Gateway serves.
+    """
+    recorder = QuoteRecorder(tmp_path, mode=DataMode.RESEARCH_FULL)
+
+    assert recorder.config.market_data_generic_ticks == ""
+
+
+def test_an_operator_can_still_opt_into_the_halt_tick(tmp_path):
+    recorder = QuoteRecorder(
+        tmp_path, mode=DataMode.RESEARCH_FULL, market_data_generic_ticks="49"
+    )
+
+    assert recorder.config.market_data_generic_ticks == "49"

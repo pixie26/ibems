@@ -92,6 +92,12 @@ from .recorder_modes import CapturePolicy, DataMode
 # just produces the same error at a slower rate.
 FATAL_MARKET_DATA_CODES = frozenset({354, 10089, 10189, 10197})
 
+# Generic tick 49 carries the halt state. A real Gateway rejected it for a
+# STK contract with error 321 on 2026-08-12 and the whole reqMktData probe
+# came back empty, so it is requested only when an operator opts in.
+HALT_GENERIC_TICK = "49"
+REQUEST_VALIDATION_ERROR = 321
+
 MARKET_STREAMS = ("BID_ASK", "ALL_LAST", "BAR_5S")
 
 # OFFLINE, post-hoc. compute_health() reports gaps in a session that has
@@ -857,6 +863,9 @@ class DailyHealth:
     file_hashes: Optional[dict[str, str]] = None
     required_streams: tuple[str, ...] = ()
     fatal_errors: Optional[list[str]] = None
+    #: Segments salvaged from a process that died mid-write. The rows are
+    #: real, but the tail of each one is gone by definition.
+    salvaged_segments: list[str] = field(default_factory=list)
     min_coverage: float = 0.99
     max_median_skew_seconds: float = 2.0
 
@@ -879,6 +888,20 @@ class DailyHealth:
                 out.extend(health.problems(self.min_coverage))
         if self.fatal_errors:
             out.extend(f"fatal recorder error: {error}" for error in self.fatal_errors)
+        if self.salvaged_segments:
+            # The rows in a salvaged segment are genuine, so the recovery is
+            # worth doing -- but a segment whose writer was killed mid-stream
+            # is missing an unknown number of events at its tail, and no
+            # count taken from it can be complete. Before this, the only
+            # trace was a "crashed-" filename inside `file_hashes`, which a
+            # reader had to notice: `health_ok` stayed true and `problems`
+            # said nothing. A day that lost its tail must not report itself
+            # as a clean day, whatever the coverage arithmetic works out to.
+            out.append(
+                "capture truncated: "
+                + ", ".join(sorted(self.salvaged_segments))
+                + " were salvaged from a killed writer and end at an unknown point"
+            )
         return out
 
     def ok(self) -> bool:
@@ -897,6 +920,7 @@ class DailyHealth:
             "file_hashes": self.file_hashes,
             "required_streams": list(self.required_streams),
             "fatal_errors": self.fatal_errors or [],
+            "salvaged_segments": sorted(self.salvaged_segments),
             "min_coverage": self.min_coverage,
             "max_median_skew_seconds": self.max_median_skew_seconds,
             "problems": self.problems(),
@@ -968,7 +992,24 @@ def compute_health(
         cross_stream=compute_cross_stream_diagnostics(rows),
         required_streams=required_streams,
         fatal_errors=fatal_errors,
+        # The health maths is also driven by in-memory row sources in tests,
+        # which have no segments at all; absent segments means nothing was
+        # salvaged, not that the question is unanswerable.
+        salvaged_segments=[
+            path.name
+            for path in (getattr(log, "segments", None) or (lambda: []))()
+            if path.name.startswith("crashed-")
+        ],
     )
+
+
+def _same_halt_state(previous: float, current: float) -> bool:
+    """NaN != NaN, so "still unknown" must not read as a transition."""
+    previous_unknown = previous is None or math.isnan(previous)
+    current_unknown = current is None or math.isnan(current)
+    if previous_unknown or current_unknown:
+        return previous_unknown and current_unknown
+    return int(previous) == int(current)
 
 
 def _sha256(path: Path) -> str:
@@ -1310,12 +1351,17 @@ class RecorderConfig:
     heartbeat_publish_seconds: float = 1.0
     bar_heartbeat_timeout_seconds: float = market_liveness.DEFAULT_BAR_TIMEOUT_SECONDS
     transport_idle_timeout_seconds: float = market_liveness.DEFAULT_TRANSPORT_IDLE_SECONDS
-    # Generic tick 49 is the halt state, and a halt is the one thing that
-    # makes silence legitimate. Requesting it explicitly strictly dominates
-    # hoping it arrives in the default set: harmless if IB sends it anyway,
-    # necessary if it does not. Overridable so an operator can drop it if a
-    # Gateway rejects the list, rather than editing code at 3am.
-    market_data_generic_ticks: str = "49"
+    # Generic tick 49 is the halt state. Requesting it was argued to
+    # "strictly dominate" hoping it arrives by default -- harmless if IB
+    # sends it anyway, necessary if it does not. A real Gateway disproved
+    # that on 2026-08-12: it answered error 321 for a STK contract, the
+    # reqMktData probe never produced a LIVE marketDataType callback, and
+    # the whole run failed its prerequisites with three zero streams
+    # (docs/GATE_B2_CONTROLLED_DISCONNECT_20260812_ZH.md section 1).
+    # Requesting an unsupported tick is not free: it can cost the entire
+    # subscription. Default back to the set the Gateway is known to serve,
+    # and let an operator opt in where tick 49 is actually supported.
+    market_data_generic_ticks: str = ""
 
 
 class QuoteRecorder:
@@ -1628,7 +1674,12 @@ class QuoteRecorder:
         self._subscription_started_mono = time.monotonic()
         self.liveness.subscription_started(self._subscription_started_mono)
         self._limiter.wait(ib.sleep)
-        probe = ib.reqMktData(contract, self.config.market_data_generic_ticks, False, False)
+        generic_ticks = self.config.market_data_generic_ticks
+        self.liveness.note_halt_state_source(
+            HALT_GENERIC_TICK in [t.strip() for t in generic_ticks.split(",") if t.strip()],
+            detail=f"market_data_generic_ticks={generic_ticks!r}",
+        )
+        probe = ib.reqMktData(contract, generic_ticks, False, False)
         probe.marketDataType = 0  # distinguish an actual callback from ib_async's default
         deadline = time.monotonic() + 10.0
         while int(probe.marketDataType) == 0 and time.monotonic() < deadline:
@@ -1776,6 +1827,16 @@ class QuoteRecorder:
                     # connectivity triple directly. Listening beats inferring
                     # the same facts from durations several seconds later.
                     self.liveness.note_status(code, message)
+                    if code == REQUEST_VALIDATION_ERROR:
+                        # 321 is IB's generic "error validating request", so
+                        # it is not proof that the halt tick specifically was
+                        # refused -- but if we asked for it and the Gateway
+                        # rejected the request, the suppressor has no input
+                        # either way, and the report must not let a reader
+                        # read a missing halt marker as "not halted".
+                        self.liveness.note_halt_state_unavailable(
+                            f"IB rejected the market-data request ({code}): {message}"
+                        )
                     if code in {1101, 10225}:
                         self._resubscribe = True
                     if self._is_fatal_market_data_error(code, message):
@@ -1820,12 +1881,28 @@ class QuoteRecorder:
 
                 probe, _tickers, bars = self._subscribe(ib, contract)
                 last_mdt = None
+                last_halted = float("nan")
                 last_server_probe = time.monotonic()
                 while datetime.now(session.end.tzinfo) < session.end:
                     if not ib.isConnected():
                         raise ConnectionError("IB disconnected during RTH")
                     ib.sleep(0.25)
-                    self.liveness.note_halted(getattr(probe, "halted", float("nan")))
+                    halted = getattr(probe, "halted", float("nan"))
+                    if not _same_halt_state(last_halted, halted):
+                        # A halt cannot be scheduled -- SPY essentially never
+                        # halts -- so "do bars keep flowing through one?"
+                        # cannot be answered by an experiment. Recording each
+                        # transition turns it into passive collection: if a
+                        # halt ever does happen on a Gateway that serves tick
+                        # 49, the evidence lands in the raw log beside the bar
+                        # timeline. On a Gateway that rejects tick 49 this
+                        # simply never fires.
+                        self._append(
+                            "SYSTEM", datetime.now(timezone.utc), contract_id=contract.conId,
+                            special_conditions=f"HALT_STATE:{halted}",
+                        )
+                        last_halted = halted
+                    self.liveness.note_halted(halted)
                     state = self.liveness.assess()
                     self._pulse(
                         phase="CAPTURING",

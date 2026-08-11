@@ -375,6 +375,13 @@ class MarketLiveness:
         #: than alarmed. A detector that never suppresses is not measuring.
         self.suppressed_assessments = 0
         self.heartbeat_losses = 0
+        #: Whether tick 49 is actually reaching us. A reader interpreting a
+        #: GAP_SUSPECTED needs to know whether the halt suppressor was even
+        #: connected: with no halt input, a genuine halt is indistinguishable
+        #: from a dead subscription, and this detector will call it the
+        #: latter. Unknown until the recorder says which it is.
+        self._halt_state_available: Optional[bool] = None
+        self._halt_state_note: Optional[str] = None
 
     # -- observations -------------------------------------------------
 
@@ -397,6 +404,28 @@ class MarketLiveness:
         if value is None or (isinstance(value, float) and math.isnan(value)):
             return
         self._halted = int(value)
+        self._halt_state_available = True
+        self._halt_state_note = "tick 49 observed"
+
+    def note_halt_state_source(self, requested: bool, detail: str = "") -> None:
+        """Record whether tick 49 was even asked for.
+
+        Called at subscribe time. If it was not requested, the suppressor is
+        blind by construction and the report must say so rather than let a
+        reader assume an absent halt marker means "not halted".
+        """
+        if requested:
+            if self._halt_state_available is None:
+                self._halt_state_available = None  # decided by arrival or by 321
+                self._halt_state_note = detail or "tick 49 requested; awaiting first value"
+            return
+        self._halt_state_available = False
+        self._halt_state_note = detail or "tick 49 not requested"
+
+    def note_halt_state_unavailable(self, detail: str) -> None:
+        """The Gateway refused to serve the halt tick (e.g. error 321)."""
+        self._halt_state_available = False
+        self._halt_state_note = detail
 
     def note_status(self, code: int, message: str = "") -> None:
         """Classify an IB error/status code into liveness facts."""
@@ -562,6 +591,8 @@ class MarketLiveness:
             "advisory_thresholds": dict(self.advisory_thresholds),
             "advisory_streams_never_stop_the_run": True,
             "halt_state": self._halted,
+            "halt_state_available": self._halt_state_available,
+            "halt_state_note": self._halt_state_note,
             "open_outages": [self._outages[code] for code in sorted(self._outages)],
             "suppressed_assessments": self.suppressed_assessments,
             "suppressed_assessments_are_poll_count": True,
