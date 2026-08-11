@@ -541,6 +541,54 @@ class RawEventLog:
             + list(self.dir.glob("crashed-*.jsonl.gz"))
         )
 
+    def segment_integrity(self) -> list[dict[str, Any]]:
+        """Per-segment: what was readable, and where the stream stopped.
+
+        "A segment was salvaged" is a weaker statement than a reader needs.
+        A gzip stream truncated by SIGKILL cannot tell you how many events
+        were lost -- the original uncompressed length died with the process
+        -- but it can tell you exactly how far the readable prefix got and
+        why it stopped, which bounds the claim instead of leaving it open.
+
+        ``complete`` means the gzip footer was present, so the file is the
+        whole of what the writer wrote. ``trailing_partial_bytes`` is a
+        half-written final record that was discarded; it is a floor on the
+        loss, never the total, because whatever followed it was never
+        flushed at all.
+        """
+        report: list[dict[str, Any]] = []
+        for seg in self.segments():
+            rows = 0
+            decompressed = 0
+            trailing_partial = 0
+            complete = True
+            error: Optional[str] = None
+            try:
+                with gzip.open(seg, "rb") as fh:
+                    for line in fh:
+                        decompressed += len(line)
+                        if line.endswith(b"\n"):
+                            rows += 1
+                        else:
+                            # No newline: the writer stopped mid-record.
+                            trailing_partial = len(line)
+            except (EOFError, OSError, gzip.BadGzipFile) as exc:
+                complete = False
+                error = f"{type(exc).__name__}: {exc}"
+            report.append(
+                {
+                    "segment": seg.name,
+                    "salvaged": seg.name.startswith("crashed-"),
+                    "compressed_bytes": seg.stat().st_size,
+                    "decompressed_bytes": decompressed,
+                    "readable_rows": rows,
+                    "trailing_partial_bytes": trailing_partial,
+                    "gzip_stream_complete": complete,
+                    "read_error": error,
+                }
+            )
+        return report
+
     def read_all(self) -> Iterator[dict[str, Any]]:
         with self._state_lock:
             open_for_writes = self._accepting and not self._closed
@@ -871,6 +919,9 @@ class DailyHealth:
     #: longer exits on unexplained silence, so this report is the only thing
     #: standing between "recorded a labelled gap" and "quietly short a day".
     liveness_incidents: Optional[dict[str, Any]] = None
+    #: Per-segment readable prefix and stop reason. Bounds the loss that
+    #: ``salvaged_segments`` only announces.
+    segment_integrity: list[dict[str, Any]] = field(default_factory=list)
     min_coverage: float = 0.99
     max_median_skew_seconds: float = 2.0
 
@@ -903,10 +954,21 @@ class DailyHealth:
             # reader had to notice: `health_ok` stayed true and `problems`
             # said nothing. A day that lost its tail must not report itself
             # as a clean day, whatever the coverage arithmetic works out to.
+            detail = []
+            for entry in self.segment_integrity:
+                if not entry.get("salvaged"):
+                    continue
+                detail.append(
+                    f"{entry['segment']} (kept {entry['readable_rows']} rows / "
+                    f"{entry['decompressed_bytes']} bytes, discarded "
+                    f"{entry['trailing_partial_bytes']} trailing bytes, "
+                    f"gzip_complete={entry['gzip_stream_complete']})"
+                )
             out.append(
                 "capture truncated: "
-                + ", ".join(sorted(self.salvaged_segments))
-                + " were salvaged from a killed writer and end at an unknown point"
+                + ", ".join(detail or sorted(self.salvaged_segments))
+                + " -- salvaged from a killed writer; the readable prefix is bounded "
+                "above, the loss beyond it is not knowable from the file"
             )
         return out
 
@@ -957,6 +1019,7 @@ class DailyHealth:
             "required_streams": list(self.required_streams),
             "fatal_errors": self.fatal_errors or [],
             "salvaged_segments": sorted(self.salvaged_segments),
+            "segment_integrity": self.segment_integrity,
             "liveness_incidents": self.liveness_incidents,
             "min_coverage": self.min_coverage,
             "max_median_skew_seconds": self.max_median_skew_seconds,
@@ -1037,6 +1100,7 @@ def compute_health(
             for path in (getattr(log, "segments", None) or (lambda: []))()
             if path.name.startswith("crashed-")
         ],
+        segment_integrity=(getattr(log, "segment_integrity", None) or (lambda: []))(),
     )
 
 
