@@ -1,6 +1,6 @@
 # Recorder 写入、测试与 Windows 部署边界
 
-更新：2026-08-11。
+更新：2026-08-12。
 
 本文回答三个容易被混在一起的问题：实际交易必须持久化什么、研究型 Recorder 如何避免阻塞行情 callback、以及 Windows 测试通过是否等于允许发单。
 
@@ -67,21 +67,46 @@ Recorder 现在有独立 heartbeat publisher 线程，但该线程不会自行�
 
 "这段静默要不要报警"由 IB 的显式信号回答，不由时长推断：generic tick 49（0=正常，1=停牌，2=波动性熔断）、market data farm 状态码 2103/2105 与 2104/2106、以及 1100/1101/1102 连接三元组。1101 表示订阅已丢必须重订，1102 表示订阅保留、重订反而会自己制造一段缺口。2108 是 IB 明说的"非错误"，不当作故障 —— 把它当故障是让 operator 学会无视告警的最快方式。另外 `ib.setTimeout()` / `timeoutEvent` 监听"完全没有任何数据从 TWS 过来"，它跑在 event loop 上，只能发现对端沉默；本地 loop 卡死由独立线程的 `EventLoopHeartbeat` 负责，两个失败域两个探测器。
 
+真实 Gateway 在 2026-08-12 对 STK 的 generic tick 49 直接返回 error 321，整个 `reqMktData` 因此拿不到 LIVE 回调，三路全部归零。**默认已改回不请求 tick 49**（`market_data_generic_ticks=""`），需要停牌态的环境由 operator 显式传入 `"49"` 才会请求。这个默认值反过来意味着停牌抑制器在多数环境下没有输入：`MarketLiveness.manifest()` 现在带 `halt_state_available` / `halt_state_note`，读者不得把"没有 halt marker"读成"没有停牌"——它更可能是"这套环境根本拿不到这个信号"。
+
 任何非 CONTINUE 判定都必须**先**留下 raw-log 证据再决定动作，但不能把 0.25 秒 polling cadence
 伪装成 incident count。2026-08-12 的真实断网旧进程为一个持续 outage 写了 380 条
 `GAP_SUSPECTED`；新实现改为事件生命周期：IB 明示 1100/farm-down 使用
 `FEED_OUTAGE_START/UPDATE/CHECKPOINT/END`，halt/calendar 使用 `EXPECTED_SILENCE_*`，没有解释的 bar
 丢失才使用 `GAP_SUSPECTED_*`。相同状态不重复，默认每 60 秒最多一个 checkpoint；reconnect、1102 或
 重发订阅本身不能闭合 coverage incident，只有 incident 开始后的首个真实 BAR_5S 才能写 END。进程在
-恢复前崩溃会留下 START 无 END，manifest 明示 open incident，而不是制造恢复。恢复动作仍由既有
-`ReconnectBudget` 负责限次和升级，不另设第二套策略。
+恢复前崩溃会留下 START 无 END，manifest 明示 open incident，而不是制造恢复。
+
+### 修复动作：先修最小的坏东西，永不因静默退出
+
+没有 tick 49 时，一次停牌会让 bar 停、又拿不到任何解释——旧实现把这类"未解释的心跳丢失"直接交给
+`ReconnectBudget`（15 分钟 5 次、全天 20 次的爆发闸），一次 5 分钟的停牌就足以在一两分钟内耗尽爆发闸，
+提前终止整个 session，剩下的交易时段一条数据都录不到。这是 owner 的明确决定：**对一个唯一产出是数据
+的进程，"整天没数据"比"一段被标注的缺口"更差；只读 Recorder 上不应套用下单路径"宁可什么都不做"的
+fail-closed 直觉。**
+
+修复动作由 `RecoveryScheduler` 决定，两条规则：
+
+- **修最小的坏东西**：如果 bar 停了但 BidAsk/AllLast 仍在到达，说明 socket 和两路 tick-by-tick 订阅
+  都还活着——为了修一路死掉的 bar 去重连整个连接，等于用锤子砸掉两路还好着的数据。此时只
+  `cancelRealTimeBars` + 重新 `reqRealTimeBars`，不碰 socket，代价接近零，可以每 120 秒试一次。只有
+  三路全静、确实没有东西可保护时，才做完整重连。
+- **重试频率取决于重试的代价，不取决于问题的严重性**：三路全静时完整重连从 5 分钟起步，每次失败翻倍到
+  30 分钟封顶——第一百次失败既不会更可能修好，也不值得再写一条一样的审计记录。IB 的任何一条入站消息
+  都会把下次尝试拉到最多一个基础间隔之后，但不会取消当前等待，避免断网期间对端一多话，退避就被打成锤子。
+
+这类修复调用**故意不计入** `ReconnectBudget`：那个预算是用来防止对着一个真实错误反复抖动，而这条路径已
+经由自己的退避节流，停止条件是收盘，不是次数上限。它们单独计数，写进 `liveness.recovery` manifest。
+
+**配套的诚实性约束**：既然不再退出，`health_ok` 就必须能如实反映丢失。`FEED_OUTAGE`、`GAP_SUSPECTED`
+以及任何在收盘时仍未闭合的 incident，现在都会让当天 `health_ok=false`，并把次数、总时长、未闭合 incident
+的 id 和已持续时长写进 `problems`。单纯的 `EXPECTED_SILENCE`（停牌、日历静默）不会让当天失败——那样会
+训练读者无视 `health_ok`，连真实故障一起无视掉。
 
 持三路订阅的真实 production fault 已观察 1100→1102、不重订和三路恢复，证明 bar heartbeat 路径确实
-进入真实 `run()`；但未观察 1101，新 incident 生命周期又是在该运行启动后加入，不能倒推为真实 PASS。
-Gateway 还直接拒绝 STK generic tick 49（error 321），当前实测运行通过
-`market_data_generic_ticks=""` 覆盖继续；因此停牌态仍未有直接观测。仍需 Full-RTH 覆盖开盘/午盘/收盘
-5 秒节奏，并解释 `useRTH=True` 在 OVERNIGHT route 下的行为。**未测就当作 pass 条件，等于重犯它所
-替换的错误。**
+进入真实 `run()`；但未观察 1101，新 incident 生命周期和上面这套修复策略又都是在该运行启动后加入的，
+不能倒推为真实 PASS。仍需 Full-RTH 覆盖开盘/午盘/收盘 5 秒节奏，并解释 `useRTH=True` 在 OVERNIGHT
+route 下的行为。**未测就当作 pass 条件，等于重犯它所替换的错误。**
 
 ## 测试策略
 

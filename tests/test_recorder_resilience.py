@@ -222,3 +222,213 @@ def test_a_clean_session_reports_no_salvage(tmp_path):
 
     assert health.salvaged_segments == []
     assert not any("capture truncated" in problem for problem in health.problems())
+
+
+def _health_with_incidents(incidents):
+    from ib_execution.quote_recorder import ClockSkew, DailyHealth
+
+    return DailyHealth(
+        session=SESSION.isoformat(),
+        events=10,
+        market_data_type="LIVE",
+        clock_skew=ClockSkew.from_samples([0.0]),
+        disconnects=0,
+        liveness_incidents=incidents,
+    )
+
+
+def test_a_day_that_lost_coverage_cannot_report_itself_as_clean():
+    """The counterweight to never exiting on unexplained silence.
+
+    Staying alive through a gap beats losing the rest of the day only while
+    the gap is impossible to overlook. So the incidents that mean lost
+    coverage fail the day here, rather than sitting in the manifest as an
+    advisory number a reader has to go looking for.
+    """
+    health = _health_with_incidents(
+        {
+            "incident_count": 2,
+            "incident_by_kind": {"FEED_OUTAGE": 1, "GAP_SUSPECTED": 1},
+            "total_seconds_by_kind": {"FEED_OUTAGE": 101.8, "GAP_SUSPECTED": 42.0},
+            "open_incident_count": 0,
+            "open_incident": None,
+        }
+    )
+
+    problems = health.problems()
+
+    assert health.ok() is False
+    assert any("FEED_OUTAGE" in p and "102s" in p for p in problems), problems
+    assert any("GAP_SUSPECTED" in p for p in problems)
+
+
+def test_market_data_that_never_came_back_is_named_as_such():
+    health = _health_with_incidents(
+        {
+            "incident_count": 1,
+            "incident_by_kind": {"GAP_SUSPECTED": 1},
+            "total_seconds_by_kind": {"GAP_SUSPECTED": 9000.0},
+            "open_incident_count": 1,
+            "open_incident": {
+                "incident_id": "gap_suspected-0001",
+                "kind": "GAP_SUSPECTED",
+                "duration_seconds": 9000.0,
+                "max_heartbeat_age_seconds": 9000.0,
+            },
+        }
+    )
+
+    assert health.ok() is False
+    assert any("never recovered before the session ended" in p for p in health.problems())
+
+
+def test_expected_silence_alone_does_not_fail_the_day():
+    """A halt or a scheduled auction is not lost coverage.
+
+    Failing on it would train the reader to ignore health_ok, taking the
+    real failures with it.
+    """
+    health = _health_with_incidents(
+        {
+            "incident_count": 1,
+            "incident_by_kind": {"EXPECTED_SILENCE": 1},
+            "total_seconds_by_kind": {"EXPECTED_SILENCE": 300.0},
+            "open_incident_count": 0,
+            "open_incident": None,
+        }
+    )
+
+    assert health.problems() == []
+    assert health.ok() is True
+
+
+def _kill_a_recorder_mid_session(tmp_path):
+    ready = tmp_path / "ready.txt"
+    helper = Path(__file__).parent / "helpers" / "recorder_crash_holder.py"
+    env = os.environ.copy()
+    source = str(Path(__file__).parents[1] / "src")
+    env["PYTHONPATH"] = source + os.pathsep + env.get("PYTHONPATH", "")
+    process = subprocess.Popen(
+        [sys.executable, str(helper), str(tmp_path), str(ready), SESSION.isoformat()],
+        env=env,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert ready.exists(), "crash holder did not publish readiness"
+        process.kill()
+        process.wait(timeout=5)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def test_a_recorder_killed_at_eleven_can_finish_the_day(tmp_path):
+    """The drill for the thing most likely to actually happen.
+
+    Not an injected fault -- a full-day run that simply dies partway
+    through. The design says a successor takes a new run_id and keeps
+    recording the same session, and finalize folds every run into one file.
+    That has never been exercised end to end: the existing crash test stops
+    at "the prefix is readable", and the multi-run fold test never involves
+    a kill. This runs both halves as one story, because the interesting
+    failure is at the seam.
+    """
+    from ib_execution.quote_recorder import finalize_day
+
+    _kill_a_recorder_mid_session(tmp_path)
+
+    successor = RawEventLog(tmp_path, session=SESSION)
+    for i in range(2, 5):
+        successor.append(_tick(i), now_mono=float(i))
+    successor.close()
+
+    reopened = RawEventLog(tmp_path, session=SESSION)
+    manifest = finalize_day(
+        reopened,
+        session_open=datetime(2026, 8, 11, 13, 30, tzinfo=timezone.utc),
+        session_close=datetime(2026, 8, 11, 20, 0, tzinfo=timezone.utc),
+        clock_skew_samples=[0.0],
+    )
+    reopened.close()
+
+    # The dead run's salvaged row and the successor's rows are all present,
+    # in one file, distinguishable by run.
+    assert manifest["rows"] == 4
+    assert manifest["parquet_rows_verified"] == 4
+    # Two distinct runs, so a reader can tell the dead run's salvaged row
+    # from the successor's. _tick() stamps a fixed id; the killed process
+    # generated its own.
+    assert len(manifest["recorder_run_ids"]) == 2
+    assert "resilience" in manifest["recorder_run_ids"]
+    # ...and the day still refuses to call itself clean.
+    assert manifest["health_ok"] is False
+    assert any("capture truncated" in problem for problem in manifest["problems"])
+
+
+def test_the_successor_does_not_overwrite_the_dead_runs_segments(tmp_path):
+    """A same-day restart must add to the session, never replace it."""
+    _kill_a_recorder_mid_session(tmp_path)
+    session_dir = tmp_path / SESSION.isoformat()
+    # The rename from .partial- to crashed- is the successor's first act,
+    # under the session lock, so there is nothing to see before it starts.
+    assert not list(session_dir.glob("crashed-*.jsonl.gz"))
+
+    successor = RawEventLog(tmp_path, session=SESSION)
+    salvaged = {p.name for p in session_dir.glob("crashed-*.jsonl.gz")}
+    assert salvaged, "precondition: the kill left a salvaged segment"
+    successor.append(_tick(2), now_mono=2.0)
+    successor.close()
+
+    assert salvaged <= {p.name for p in session_dir.glob("crashed-*.jsonl.gz")}
+    assert {p.name for p in session_dir.glob("segment-*.jsonl.gz")}
+
+
+def test_the_loss_is_bounded_not_merely_announced(tmp_path):
+    """"A segment was salvaged" does not tell a reader how much is missing.
+
+    The truncated stream cannot say how many events died with the process,
+    but it can say exactly how far the readable prefix reached and why it
+    stopped. That bounds the claim instead of leaving it open.
+    """
+    _kill_a_recorder_mid_session(tmp_path)
+
+    reopened = RawEventLog(tmp_path, session=SESSION)
+    try:
+        integrity = reopened.segment_integrity()
+    finally:
+        reopened.close()
+
+    salvaged = [entry for entry in integrity if entry["salvaged"]]
+    assert salvaged, "precondition: the kill left a salvaged segment"
+    for entry in salvaged:
+        assert entry["readable_rows"] >= 1
+        assert entry["decompressed_bytes"] > 0
+        assert entry["compressed_bytes"] > 0
+        assert entry["trailing_partial_bytes"] >= 0
+        assert set(entry) == {
+            "segment", "salvaged", "compressed_bytes", "decompressed_bytes",
+            "readable_rows", "trailing_partial_bytes", "gzip_stream_complete",
+            "read_error",
+        }
+
+
+def test_a_clean_segment_reports_a_complete_gzip_stream(tmp_path):
+    log = RawEventLog(tmp_path, session=SESSION)
+    log.append(_tick(1), now_mono=1.0)
+    log.close()
+
+    reopened = RawEventLog(tmp_path, session=SESSION)
+    try:
+        integrity = reopened.segment_integrity()
+    finally:
+        reopened.close()
+
+    assert integrity
+    for entry in integrity:
+        assert entry["salvaged"] is False
+        assert entry["gzip_stream_complete"] is True
+        assert entry["trailing_partial_bytes"] == 0
+        assert entry["read_error"] is None

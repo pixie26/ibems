@@ -71,6 +71,7 @@ import time
 from collections import defaultdict, deque
 from dataclasses import asdict, dataclass, field, fields
 from datetime import date, datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Optional
 from uuid import uuid4
@@ -540,6 +541,54 @@ class RawEventLog:
             + list(self.dir.glob("crashed-*.jsonl.gz"))
         )
 
+    def segment_integrity(self) -> list[dict[str, Any]]:
+        """Per-segment: what was readable, and where the stream stopped.
+
+        "A segment was salvaged" is a weaker statement than a reader needs.
+        A gzip stream truncated by SIGKILL cannot tell you how many events
+        were lost -- the original uncompressed length died with the process
+        -- but it can tell you exactly how far the readable prefix got and
+        why it stopped, which bounds the claim instead of leaving it open.
+
+        ``complete`` means the gzip footer was present, so the file is the
+        whole of what the writer wrote. ``trailing_partial_bytes`` is a
+        half-written final record that was discarded; it is a floor on the
+        loss, never the total, because whatever followed it was never
+        flushed at all.
+        """
+        report: list[dict[str, Any]] = []
+        for seg in self.segments():
+            rows = 0
+            decompressed = 0
+            trailing_partial = 0
+            complete = True
+            error: Optional[str] = None
+            try:
+                with gzip.open(seg, "rb") as fh:
+                    for line in fh:
+                        decompressed += len(line)
+                        if line.endswith(b"\n"):
+                            rows += 1
+                        else:
+                            # No newline: the writer stopped mid-record.
+                            trailing_partial = len(line)
+            except (EOFError, OSError, gzip.BadGzipFile) as exc:
+                complete = False
+                error = f"{type(exc).__name__}: {exc}"
+            report.append(
+                {
+                    "segment": seg.name,
+                    "salvaged": seg.name.startswith("crashed-"),
+                    "compressed_bytes": seg.stat().st_size,
+                    "decompressed_bytes": decompressed,
+                    "readable_rows": rows,
+                    "trailing_partial_bytes": trailing_partial,
+                    "gzip_stream_complete": complete,
+                    "read_error": error,
+                }
+            )
+        return report
+
     def read_all(self) -> Iterator[dict[str, Any]]:
         with self._state_lock:
             open_for_writes = self._accepting and not self._closed
@@ -866,6 +915,13 @@ class DailyHealth:
     #: Segments salvaged from a process that died mid-write. The rows are
     #: real, but the tail of each one is gone by definition.
     salvaged_segments: list[str] = field(default_factory=list)
+    #: LivenessIncidentTracker.manifest(). Load-bearing: the recorder no
+    #: longer exits on unexplained silence, so this report is the only thing
+    #: standing between "recorded a labelled gap" and "quietly short a day".
+    liveness_incidents: Optional[dict[str, Any]] = None
+    #: Per-segment readable prefix and stop reason. Bounds the loss that
+    #: ``salvaged_segments`` only announces.
+    segment_integrity: list[dict[str, Any]] = field(default_factory=list)
     min_coverage: float = 0.99
     max_median_skew_seconds: float = 2.0
 
@@ -888,6 +944,7 @@ class DailyHealth:
                 out.extend(health.problems(self.min_coverage))
         if self.fatal_errors:
             out.extend(f"fatal recorder error: {error}" for error in self.fatal_errors)
+        out.extend(self._liveness_problems())
         if self.salvaged_segments:
             # The rows in a salvaged segment are genuine, so the recovery is
             # worth doing -- but a segment whose writer was killed mid-stream
@@ -897,10 +954,51 @@ class DailyHealth:
             # reader had to notice: `health_ok` stayed true and `problems`
             # said nothing. A day that lost its tail must not report itself
             # as a clean day, whatever the coverage arithmetic works out to.
+            detail = []
+            for entry in self.segment_integrity:
+                if not entry.get("salvaged"):
+                    continue
+                detail.append(
+                    f"{entry['segment']} (kept {entry['readable_rows']} rows / "
+                    f"{entry['decompressed_bytes']} bytes, discarded "
+                    f"{entry['trailing_partial_bytes']} trailing bytes, "
+                    f"gzip_complete={entry['gzip_stream_complete']})"
+                )
             out.append(
                 "capture truncated: "
-                + ", ".join(sorted(self.salvaged_segments))
-                + " were salvaged from a killed writer and end at an unknown point"
+                + ", ".join(detail or sorted(self.salvaged_segments))
+                + " -- salvaged from a killed writer; the readable prefix is bounded "
+                "above, the loss beyond it is not knowable from the file"
+            )
+        return out
+
+    def _liveness_problems(self) -> list[str]:
+        """A day that lost market data may not report itself as a clean day.
+
+        This is the counterweight to the recorder no longer exiting on
+        unexplained silence. Staying alive and recording through a gap is
+        only the better outcome while the gap is impossible to overlook, so
+        the incidents that mean lost coverage fail the day here rather than
+        sitting in the manifest as an advisory number.
+        """
+        incidents = self.liveness_incidents
+        if not incidents:
+            return []
+        out: list[str] = []
+        by_kind = incidents.get("incident_by_kind") or {}
+        for kind in ("FEED_OUTAGE", "GAP_SUSPECTED"):
+            count = by_kind.get(kind, 0)
+            if count:
+                seconds = (incidents.get("total_seconds_by_kind") or {}).get(kind, 0.0)
+                out.append(
+                    f"{count} {kind} incident(s) totalling {seconds:.0f}s of lost coverage"
+                )
+        if incidents.get("open_incident_count"):
+            open_incident = incidents.get("open_incident") or {}
+            out.append(
+                "market data never recovered before the session ended: "
+                f"{open_incident.get('kind')} {open_incident.get('incident_id')} "
+                f"open for {float(open_incident.get('duration_seconds') or 0.0):.0f}s"
             )
         return out
 
@@ -921,6 +1019,8 @@ class DailyHealth:
             "required_streams": list(self.required_streams),
             "fatal_errors": self.fatal_errors or [],
             "salvaged_segments": sorted(self.salvaged_segments),
+            "segment_integrity": self.segment_integrity,
+            "liveness_incidents": self.liveness_incidents,
             "min_coverage": self.min_coverage,
             "max_median_skew_seconds": self.max_median_skew_seconds,
             "problems": self.problems(),
@@ -1000,6 +1100,7 @@ def compute_health(
             for path in (getattr(log, "segments", None) or (lambda: []))()
             if path.name.startswith("crashed-")
         ],
+        segment_integrity=(getattr(log, "segment_integrity", None) or (lambda: []))(),
     )
 
 
@@ -1151,6 +1252,7 @@ def finalize_day(
         required_streams=MARKET_STREAMS,
     )
     health.file_hashes = hashes
+    health.liveness_incidents = (liveness or {}).get("incidents")
     health_path = log.dir / "health.json"
     durable_atomic_write(
         health_path,
@@ -1205,6 +1307,135 @@ class SubscriptionLimiter:
 
 class ReconnectBudgetExhausted(RuntimeError):
     """Too many reconnects; the fault is not transient."""
+
+
+class SlowRecoveryReconnect(ConnectionError):
+    """A deliberate, rate-limited recovery attempt -- not a crash loop.
+
+    Deliberately outside :class:`ReconnectBudget`. That budget exists to stop
+    a recorder from thrashing on an *error*, and the whole point of this path
+    is that it is paced by its own backoff instead. Counted separately so the
+    manifest still shows how often the day tried and failed.
+    """
+
+
+class RecoveryPlan(Enum):
+    """The smallest repair that could fix what is actually broken."""
+
+    NONE = "none"
+    #: Re-request only the bar stream. The socket and both tick-by-tick
+    #: subscriptions are left untouched, so this costs no quote data.
+    BARS_ONLY = "bars_only"
+    FULL_RECONNECT = "full_reconnect"
+
+
+class RecoveryScheduler:
+    """Decide *which* repair to attempt and *how often*, never whether to quit.
+
+    Two rules, and the second one is the reason the first can be generous.
+
+    REPAIR THE SMALLEST BROKEN THING
+        If the bar cadence stopped while quotes are still arriving, the socket
+        and the tick-by-tick subscriptions are demonstrably alive. Reconnecting
+        to fix the bar stream would tear down two working streams to repair one
+        -- at roughly 214 BidAsk/s a full reconnect punches a real hole in the
+        data it is supposed to be protecting. ``cancelRealTimeBars`` plus a
+        fresh ``reqRealTimeBars`` fixes exactly the broken stream and costs
+        nothing, so it can run often. A full reconnect is reserved for the case
+        where nothing at all is arriving and there is therefore nothing to lose.
+
+    RETRY RATE FOLLOWS THE COST OF RETRYING
+        Not the severity. When every stream is silent a reconnect is free, so
+        it happens on a short cadence that then backs off -- after an hour of
+        nothing, this attempt is unlikely to be the one that works, and the
+        audit log should not fill with identical failures. The backoff resets
+        on any sign of life, including an IB status message, so a feed that
+        recovers is not left waiting out a long timer.
+
+    The recorder never exits on unexplained silence. For a process whose only
+    product is data, ending the session converts "a labelled gap" into "no data
+    for the rest of the day", and the gap is labelled: the incident stays open,
+    ``health_ok`` goes false, and the manifest counts every attempt.
+    """
+
+    def __init__(
+        self,
+        *,
+        fast_attempts: int = 2,
+        bars_only_seconds: float = 120.0,
+        slow_base_seconds: float = 300.0,
+        slow_max_seconds: float = 1800.0,
+    ) -> None:
+        if fast_attempts < 0:
+            raise ValueError("fast_attempts must not be negative")
+        if min(bars_only_seconds, slow_base_seconds) <= 0:
+            raise ValueError("recovery intervals must be positive")
+        if slow_max_seconds < slow_base_seconds:
+            raise ValueError("slow_max_seconds must not be below slow_base_seconds")
+        self.fast_attempts = int(fast_attempts)
+        self.bars_only_seconds = float(bars_only_seconds)
+        self.slow_base_seconds = float(slow_base_seconds)
+        self.slow_max_seconds = float(slow_max_seconds)
+        self.fast_used = 0
+        self.bars_only_attempts = 0
+        self.slow_full_attempts = 0
+        self._slow_delay = float(slow_base_seconds)
+        self._next_bars: Optional[float] = None
+        self._next_full: Optional[float] = None
+
+    def note_recovered(self) -> None:
+        """A real bar arrived. Everything goes back to square one."""
+        self.fast_used = 0
+        self._slow_delay = self.slow_base_seconds
+        self._next_bars = None
+        self._next_full = None
+
+    def note_activity(self, now_mono: Optional[float] = None) -> None:
+        """Any inbound evidence of life shortens the wait, without hammering.
+
+        Without this a 30-minute cap could leave a recovered feed unrecorded
+        for half an hour, because nothing else would prompt another attempt.
+        But IB emits several messages around an outage, so this must not
+        simply cancel the pending attempt either -- that would turn the
+        backoff into a hammer exactly when the peer is noisiest. Pulling the
+        next attempt forward to at most one base interval keeps the ceiling
+        at one attempt per base interval however chatty the peer gets.
+        """
+        self._slow_delay = self.slow_base_seconds
+        if now_mono is not None and self._next_full is not None:
+            self._next_full = min(self._next_full, now_mono + self.slow_base_seconds)
+
+    def plan(self, *, evidence_of_life: bool, now_mono: float) -> RecoveryPlan:
+        if self.fast_used < self.fast_attempts:
+            self.fast_used += 1
+            self._next_full = now_mono + self._slow_delay
+            self._next_bars = now_mono + self.bars_only_seconds
+            return RecoveryPlan.FULL_RECONNECT
+
+        if evidence_of_life:
+            if self._next_bars is None or now_mono >= self._next_bars:
+                self._next_bars = now_mono + self.bars_only_seconds
+                self.bars_only_attempts += 1
+                return RecoveryPlan.BARS_ONLY
+            return RecoveryPlan.NONE
+
+        if self._next_full is None or now_mono >= self._next_full:
+            self.slow_full_attempts += 1
+            self._next_full = now_mono + self._slow_delay
+            self._slow_delay = min(self.slow_max_seconds, self._slow_delay * 2)
+            return RecoveryPlan.FULL_RECONNECT
+        return RecoveryPlan.NONE
+
+    def manifest(self) -> dict[str, Any]:
+        return {
+            "fast_attempts_allowed": self.fast_attempts,
+            "bars_only_seconds": self.bars_only_seconds,
+            "slow_base_seconds": self.slow_base_seconds,
+            "slow_max_seconds": self.slow_max_seconds,
+            "bars_only_attempts": self.bars_only_attempts,
+            "slow_full_reconnect_attempts": self.slow_full_attempts,
+            "exits_on_unexplained_silence": False,
+        }
 
 
 class ReconnectBudget:
@@ -1362,6 +1593,10 @@ class RecorderConfig:
     # subscription. Default back to the set the Gateway is known to serve,
     # and let an operator opt in where tick 49 is actually supported.
     market_data_generic_ticks: str = ""
+    recovery_fast_attempts: int = 2
+    recovery_bars_only_seconds: float = 120.0
+    recovery_slow_base_seconds: float = 300.0
+    recovery_slow_max_seconds: float = 1800.0
 
 
 class QuoteRecorder:
@@ -1432,6 +1667,12 @@ class QuoteRecorder:
             bar_timeout_seconds=self.config.bar_heartbeat_timeout_seconds,
         )
         self._liveness_incidents = LivenessIncidentTracker()
+        self.recovery = RecoveryScheduler(
+            fast_attempts=self.config.recovery_fast_attempts,
+            bars_only_seconds=self.config.recovery_bars_only_seconds,
+            slow_base_seconds=self.config.recovery_slow_base_seconds,
+            slow_max_seconds=self.config.recovery_slow_max_seconds,
+        )
         self._sample_lock = threading.Lock()
         self._bidask_prebuffer: deque[tuple[float, RawTick]] = deque()
 
@@ -1708,10 +1949,55 @@ class QuoteRecorder:
         self._wire_bars(bars)
         return probe, (bidask_ticker, alllast_ticker), bars
 
+    def _recover_market_data(self, ib, contract, bars, state):
+        """Attempt the smallest repair that could fix what is broken.
+
+        Returns the bar handle to keep using. Raises
+        :class:`SlowRecoveryReconnect` when a full reconnect is due; the
+        session loop reconnects and does *not* charge it to the reconnect
+        budget, because this path is paced by its own backoff rather than by
+        a crash-loop cap. Nothing here ever ends the session.
+        """
+        now = time.monotonic()
+        last_any = self.liveness.last_market_event_age(now)
+        # Anything arriving inside one heartbeat window proves the socket and
+        # at least one subscription are alive, whatever the bar clock says.
+        evidence_of_life = (
+            last_any is not None and last_any <= self.config.bar_heartbeat_timeout_seconds
+        )
+        plan = self.recovery.plan(evidence_of_life=evidence_of_life, now_mono=now)
+        if plan is RecoveryPlan.NONE:
+            return bars
+        self._append(
+            "SYSTEM", datetime.now(timezone.utc), contract_id=contract.conId,
+            special_conditions=(
+                f"RECOVERY_ATTEMPT:plan={plan.value};evidence_of_life={evidence_of_life};"
+                f"last_event_age={'unknown' if last_any is None else f'{last_any:.1f}s'};"
+                f"reason={state.reason}"
+            ),
+        )
+        if plan is RecoveryPlan.FULL_RECONNECT:
+            raise SlowRecoveryReconnect(f"market data not live: {state.reason}")
+
+        # Quotes are still flowing, so tearing down the socket would destroy
+        # working data to repair one stream. Re-request just the bars.
+        try:
+            ib.cancelRealTimeBars(bars)
+        except Exception as exc:  # an already-dead subscription is fine to lose
+            self._append(
+                "SYSTEM", datetime.now(timezone.utc), contract_id=contract.conId,
+                special_conditions=f"RECOVERY_CANCEL_BARS_FAILED:{type(exc).__name__}:{exc}",
+            )
+        self._limiter.wait(ib.sleep)
+        refreshed = ib.reqRealTimeBars(contract, 5, "TRADES", True)
+        self._wire_bars(refreshed)
+        return refreshed
+
     def _finalize(self, session) -> dict[str, Any]:
         assert self.log is not None
         liveness_manifest = self.liveness.manifest()
         liveness_manifest["incidents"] = self._liveness_incidents.manifest()
+        liveness_manifest["recovery"] = self.recovery.manifest()
         return finalize_day(
             self.log,
             session_open=session.start,
@@ -1827,6 +2113,11 @@ class QuoteRecorder:
                     # connectivity triple directly. Listening beats inferring
                     # the same facts from durations several seconds later.
                     self.liveness.note_status(code, message)
+                    # Any inbound message is evidence the peer is still
+                    # talking, so a long backoff must not outlive it: a farm
+                    # coming back at 14:00 should not wait out a 30-minute
+                    # timer before the next attempt.
+                    self.recovery.note_activity(time.monotonic())
                     if code == REQUEST_VALIDATION_ERROR:
                         # 321 is IB's generic "error validating request", so
                         # it is not proof that the halt tick specifically was
@@ -1926,11 +2217,9 @@ class QuoteRecorder:
                             special_conditions=marker,
                         )
                     if state.action is LivenessAction.RECOVER_SUBSCRIPTION:
-                        # Recovery is a reconnect, which the reconnect budget
-                        # already bounds and escalates. Repeated heartbeat
-                        # loss therefore terminates the session on its own,
-                        # without a second escalation policy here.
-                        raise ConnectionError(f"market data not live: {state.reason}")
+                        bars = self._recover_market_data(ib, contract, bars, state)
+                    elif state.action is LivenessAction.CONTINUE:
+                        self.recovery.note_recovered()
                     mdt = int(probe.marketDataType)
                     if mdt != last_mdt:
                         self._market_data_type = self.DATA_TYPE.get(mdt, f"UNKNOWN:{mdt}")
@@ -1995,6 +2284,20 @@ class QuoteRecorder:
                 if self.log is not None and session is not None:
                     return self._finalize(session)
                 raise
+            except SlowRecoveryReconnect as exc:
+                # Deliberately not charged to ReconnectBudget. That budget
+                # stops a recorder thrashing on an error; this path is already
+                # bounded by its own backoff, and letting it exhaust the budget
+                # would end the session -- which is exactly what the owner
+                # decided must not happen on unexplained market-data silence.
+                self._append(
+                    "SYSTEM", datetime.now(timezone.utc),
+                    special_conditions=f"RECOVERY_RECONNECT:{exc}",
+                )
+                if ib.isConnected():
+                    self._intentional_disconnect = True
+                    ib.disconnect()
+                continue
             except Exception as exc:
                 self._append(
                     "SYSTEM", datetime.now(timezone.utc),

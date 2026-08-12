@@ -303,12 +303,60 @@ def validate(root: Path, freeze: str) -> Optional[Attestation]:
     signoff, evidence = paths_for(root, freeze)
     if not signoff.exists() or not evidence.exists():
         return None
+
+    head = _git(root, "rev-parse", "HEAD")
+    if head.returncode != 0:
+        return None
+    current = head.stdout.strip()
+
+    # Read the three inputs from Git objects, exactly as validate_historical
+    # does, rather than from the worktree. Two reasons, and the second is why
+    # this is a correctness fix and not only a portability one.
+    #
+    # An attestation is a statement about committed history, so a local edit
+    # to the sign-off must not be able to make it valid -- nor invalid. Only
+    # the committed bytes can decide.
+    #
+    # And Git for Windows rewrites LF to CRLF on checkout absent a
+    # .gitattributes, which changed the evidence hash and left
+    # gate_b1_covers_worktree permanently false on the intended deployment OS.
+    # `* -text` fixed the checkout, but reading the object removes the class
+    # of failure rather than one instance of it: no future worktree
+    # transformation of any kind can move these hashes.
+    #
+    # The worktree question this function owns is untouched: whether the
+    # checkout is clean, and whether the commits since the freeze are
+    # metadata-only, are both still decided below.
+    def committed_or_worktree(path: Path) -> Optional[bytes]:
+        """Committed bytes win; a not-yet-committed file falls back to disk.
+
+        The fallback is required, not a concession: ``finalize_gate_b1``
+        writes the sign-off and evidence and regenerates STATE in one go, so
+        at the freeze commit itself they legitimately exist only in the
+        worktree. The narrower rule below still applies -- once HEAD has
+        moved past the freeze, both files *must* appear in the committed
+        diff, so the fallback cannot be used to smuggle an attestation into
+        a later tree. And it does not reopen the line-ending problem, which
+        is created by checkout of committed content.
+        """
+        blob = _git_blob(root, current, path.relative_to(root).as_posix())
+        if blob is not None:
+            return blob
+        try:
+            return path.read_bytes()
+        except OSError:
+            return None
+
+    signoff_blob = committed_or_worktree(signoff)
+    evidence_bytes = committed_or_worktree(evidence)
+    risk_blob = committed_or_worktree(root / "config" / "risk.example.yml")
+    if signoff_blob is None or evidence_bytes is None or risk_blob is None:
+        return None
     try:
-        text = signoff.read_text(encoding="utf-8")
-        evidence_bytes = evidence.read_bytes()
+        text = signoff_blob.decode("utf-8")
         data = json.loads(evidence_bytes.decode("utf-8"))
-        risk_text = (root / "config" / "risk.example.yml").read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        risk_text = risk_blob.decode("utf-8")
+    except (UnicodeDecodeError, json.JSONDecodeError):
         return None
     if not _evidence_data_is_valid(data, freeze):
         return None
@@ -316,10 +364,6 @@ def validate(root: Path, freeze: str) -> Optional[Attestation]:
         return None
     evidence_hash = hashlib.sha256(evidence_bytes).hexdigest()
 
-    head = _git(root, "rev-parse", "HEAD")
-    if head.returncode != 0:
-        return None
-    current = head.stdout.strip()
     allowed = allowed_attestation_paths(root, freeze)
 
     if current != freeze:

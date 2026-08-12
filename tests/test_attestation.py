@@ -318,3 +318,66 @@ def test_self_consistent_but_semantically_wrong_storage_packet_is_rejected(tmp_p
     evidence_sha = hashlib.sha256(evidence.read_bytes()).hexdigest()
     _write_signoff(tmp_path, freeze, evidence_sha)
     assert attestation.derive_signed_off_commit(tmp_path) is None
+
+
+def test_a_crlf_checkout_of_committed_evidence_does_not_break_coverage(tmp_path: Path):
+    """The failure that left gate_b1_covers_worktree false on Windows.
+
+    Git for Windows rewrites LF to CRLF on checkout, which changed the bytes
+    ``validate`` hashed and so denied worktree coverage at the exact freeze
+    commit. `.gitattributes` removed the cause; reading the committed object
+    removes the whole class, so no worktree transformation of any kind can
+    move these hashes. Simulated here by rewriting the checked-out files
+    after the commit, which is precisely what checkout conversion does.
+    """
+    freeze = _init_repo(tmp_path)
+    evidence, evidence_sha = _write_evidence(tmp_path, freeze)
+    signoff = _write_signoff(tmp_path, freeze, evidence_sha)
+    provenance.write_state(tmp_path)
+    _git(
+        tmp_path,
+        "add",
+        "STATE.json",
+        signoff.relative_to(tmp_path).as_posix(),
+        evidence.relative_to(tmp_path).as_posix(),
+    )
+    _git(tmp_path, "commit", "-m", "attest B1")
+    assert attestation.validate(tmp_path, freeze) is not None
+
+    # autocrlf is what a Windows checkout actually has; with it set, Git
+    # compares normalized content, so these files stay "clean" while their
+    # on-disk bytes differ from the blob -- exactly the real situation.
+    _git(tmp_path, "config", "core.autocrlf", "true")
+    for path in (signoff, evidence):
+        path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
+
+    assert attestation.validate(tmp_path, freeze) is not None
+
+
+def test_a_locally_edited_signoff_cannot_manufacture_coverage(tmp_path: Path):
+    """An attestation is a claim about committed history, not about a disk.
+
+    The same object read that survives line-ending conversion also closes
+    the door the other way: once the sign-off is committed, editing it in
+    the worktree changes nothing, because the committed bytes decide.
+    """
+    freeze = _init_repo(tmp_path)
+    evidence, evidence_sha = _write_evidence(tmp_path, freeze)
+    signoff = _write_signoff(tmp_path, freeze, evidence_sha)
+    provenance.write_state(tmp_path)
+    _git(
+        tmp_path,
+        "add",
+        "STATE.json",
+        signoff.relative_to(tmp_path).as_posix(),
+        evidence.relative_to(tmp_path).as_posix(),
+    )
+    _git(tmp_path, "commit", "-m", "attest B1")
+
+    signoff.write_text("owner accepts everything, forever\n", encoding="utf-8")
+
+    # Unchanged, because the committed bytes are what were validated. (The
+    # separate discovery scan in derive_signed_off_commit still reads the
+    # worktree, so a clobbered file makes it find nothing -- a strictly
+    # conservative direction, and a different question from this one.)
+    assert attestation.validate(tmp_path, freeze) is not None
