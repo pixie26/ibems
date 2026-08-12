@@ -167,5 +167,11 @@ id `9128253449`，zip SHA-256
 的授权边界清单不由本次运行自动划掉。真正未被这次运行触及的是：真实生产卷的几何与驱动栈、
 以及订单 Journal 进入真实 broker 路径后应以 Journal fail-closed 为被测对象这一条。
 
+**更新（2026-08-12）：owner 已回答该判断 —— 算。** 因此授权边界清单中的 NTFS disk-full 与
+fence/witness publication 中途强杀两项已解除，记录见
+[`RECORDER_STORAGE_AND_WINDOWS_POLICY_ZH.md`](RECORDER_STORAGE_AND_WINDOWS_POLICY_ZH.md)
+Amendment 1 与 [`GATE_B2_STATUS_20260810_ZH.md`](GATE_B2_STATUS_20260810_ZH.md) §3.1。上一段列出的
+两项未触及事项不受该接受影响，仍然成立；`order_authorization` 仍为 `NONE`。
+
 第 7 项维持推到 B3 前：publication 强杀与 ownership 已随本次运行在真实 NTFS 上通过，
 WAL/witness 在 Windows 上是一行参数的待批准扩展，而 flush stall 无解。

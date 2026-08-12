@@ -150,12 +150,31 @@ Windows 单元、子进程和完整套件通过，只证明当前 API 调用形�
 
 任何 order-capable Windows deployment 前仍必须在生产等价 OS/volume 上完成并封存：
 
-- NTFS disk-full——**已在隔离 `windows-2025` runner 上直接观测通过**（run 31562522619，192MB VHD 挂为 `R:`，真实 ENOSPC → fence RAISED → exit 10）。该条不由本次运行自动划掉：托管 runner 的 VHD 是否算生产等价卷，属 owner 风险接受判断；
+- ~~NTFS disk-full~~ —— **已解除**（见下方 amendment 1）。原文保留：已在隔离 `windows-2025` runner 上直接观测通过（run 31562522619，192MB VHD 挂为 `R:`，真实 ENOSPC → fence RAISED → exit 10）；
 - 写入/flush stall；
-- fence/witness publication 中途强杀——**同一次运行在真实 NTFS 上通过**（publication writer 中途强杀后目标仍是完整 JSON generation，两进程单一 owner，holder 强杀后 successor 取锁）；
+- ~~fence/witness publication 中途强杀~~ —— **已解除**（见下方 amendment 1）。原文保留：同一次运行在真实 NTFS 上通过（publication writer 中途强杀后目标仍是完整 JSON generation，两进程单一 owner，holder 强杀后 successor 取锁）；
 - journal WAL damage/rollback 与 witness crossing；
 - execution service 强杀、ownership 继承与 startup refusal；
 - volume failure-domain 判定。
+
+### Amendment 1（2026-08-12）：owner 接受托管 runner VHD 为生产等价卷
+
+上面两条此前不能由 run 31562522619 自动划掉，因为"托管 runner 上的 192MB VHD 是否算生产等价
+OS/volume"是风险接受判断而不是测量结果。**owner 于 2026-08-12 答：算。**因此 NTFS disk-full 与
+fence/witness publication 中途强杀两项解除，证据即该次运行。
+
+条目按 amendment 划线保留而不删除，理由是这份清单本身是 order-capable 部署的前置证据台账：把已解除
+的条目连同解除依据一起留在原位，比让台账显得"从来只有四项"更可复查。
+
+本 amendment 的边界：真实生产卷的几何与驱动栈仍与 VHD 不同，本次接受只覆盖上述两项已实测的行为，
+不外推到清单其余各项；`order_authorization` 不受影响，仍为 `NONE`；这不构成任何 Windows
+order-capable 授权。判断记录见
+[`GATE_B2_STATUS_20260810_ZH.md`](GATE_B2_STATUS_20260810_ZH.md) §3.1。
+
+剩余四项中，**journal WAL damage/rollback 与 witness crossing** 是唯一还能低成本推进的一项：
+`run_storage_fault_drill.py --drill wal_corruption` 是纯 Python，同一个隔离 VHD 卷即可承载，只是
+`run_windows_ntfs_vhd_disk_full.ps1` 目前只传 `--drill disk_full`。flush stall 已证实在托管 runner 上无解
+（Windows 无 dm-delay 等价物），service 强杀与 volume failure-domain 尚无脚本。
 
 其中 flush stall、fence/witness publication、journal WAL damage/rollback、service 强杀和 volume failure-domain 都属于订单持久化故障域；相关 order Journal 代码与授权未进入真实 broker 路径前，不在 B2 重复做高风险本机实验。B2 当前只保留低风险的 Recorder gzip 尾段完整性小项。
 

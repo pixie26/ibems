@@ -36,7 +36,7 @@
 | Gateway normal restart | `PENDING DOC REVIEW` | socket disconnect；重启期两次 10 秒 timeout 和 10141；同 clientId 第三次恢复；前后静态 `0/0/0` hash 相同 | `OBSERVED - EMPTY STATE ONLY` | 2026-08-10 gateway-restart v3 report |
 | Gateway Task Manager End task | `PENDING DOC REVIEW` | socket disconnect；第一次恢复 10 秒 timeout 和 10141；第二次连接及完整 snapshot 成功；前后静态 hash 相同；应用表现出保存/退出过程 | `OBSERVED - NOT CLAIMED AS HARD KILL` | 2026-08-10 gateway-hard-kill v2 report |
 | Gateway `TerminateProcess` | Windows `Stop-Process -Force` 对精确 PID 使用强制终止语义 | socket disconnect；前两次恢复各 10 秒 timeout，含 10141；第三次连接及完整 snapshot 成功；前后静态 hash 相同 | `OBSERVED - EMPTY STATE ONLY` | 2026-08-10 gateway-terminateprocess report |
-| `1100 / 1101 / 1102` | 1100=Gateway/TWS 丢失 IB server 连接；1101/1102=恢复且分别表示 market data lost/maintained | 空状态 probe 与持三路订阅的 production `run()` 都收到 1100→1102；后者无重订且三路自动恢复。两轮均没有 1101 | `PARTIAL - 1100/1102 OBSERVED TWICE` | 1101 仍未直接观察，不得由 1102 推断。production 轮已覆盖“有订阅时 1102 保持订阅”，但没有进入“1101 requests lost”分支；不为取码反复断网 |
+| `1100 / 1101 / 1102` | 1100=Gateway/TWS 丢失 IB server 连接；1101/1102=恢复且分别表示 market data lost/maintained | 空状态 probe 与持三路订阅的 production `run()` 都收到 1100→1102；后者无重订且三路自动恢复。两轮均没有 1101 | `PARTIAL - 1100/1102 OBSERVED TWICE; 1101 NOT_RUN_ACCEPTED_NON_BLOCKER` | 1101 仍未直接观察，不得由 1102 推断。production 轮已覆盖“有订阅时 1102 保持订阅”，但没有进入“1101 requests lost”分支。**owner 于 2026-08-12 决定不再专门追 1101**（45 秒阻断只能产生 1102，取得该码需要长得多的断开，收益仅是把一条已有实现和单元测试的分支从未观察改为已观察）：代码路径保留，碰上真实 1101 时被动采集，任何未来断网实验都不以取码为目的。记录见 [`GATE_B2_STATUS_20260810_ZH.md`](GATE_B2_STATUS_20260810_ZH.md) §3.2 |
 | Order submit / ack / modify / cancel / fill / commission | `PENDING DOC REVIEW` | 零订单；代码路径未运行 | `NOT TESTED` | 不属于当前只读轮次 |
 
 ## 当前判定

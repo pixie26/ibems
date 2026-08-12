@@ -14,7 +14,16 @@
   直接观察 1100→1102、不重订阅和三路自动恢复；1101 仍未观察。该进程约 13:00 ET 才启动，属于部分日
   长跑，不是 Full-RTH。
 
-`STATE.json` 是机器可读权威状态；当前为 `gate_b2=READ_ONLY_IN_PROGRESS`、`order_authorization=NONE`。该文件是生成文件，不得手工修改。本摘要和 [`GATE_B2_READONLY_20260809.md`](GATE_B2_READONLY_20260809.md) 记录当前 B2 实验状态；最终 B2 freeze 时仍需统一机器状态、源码、文档和证据。
+- **当前 `main` 从未接触过 Gateway。** 2026-08-12 的三条分支已合并（recorder/attestation 加固、Windows
+  NTFS 实测证据、`AGENTS.md` 高风险定义细化），但**迄今每一次真实 Gateway 观测，用的都是此后已经改掉
+  的代码**：断网那轮的 PID 18488 加载的是旧 incident 实现，而 tick 49 默认值、恢复策略和 health 失败条件
+  都是在那之后加入的。因此下一次真实运行的第一目的是验证当前代码，不是采新证据。
+
+`STATE.json` 是机器可读权威状态；当前为 `gate_b2=READ_ONLY_IN_PROGRESS`、`order_authorization=NONE`、
+`gate_b1_covers_worktree=false`——即当前这棵树不在任何 attestation 覆盖范围内，B2 全部证据都是在未覆盖
+的树上采集的，只读阶段可接受，但 B2 收口前必须有一次覆盖当前树的新 freeze。该文件是生成文件，不得手工
+修改。本摘要和 [`GATE_B2_READONLY_20260809.md`](GATE_B2_READONLY_20260809.md) 记录当前 B2 实验状态；最终
+B2 freeze 时仍需统一机器状态、源码、文档和证据。
 
 ## 2. 已完成、部分完成和未完成
 
@@ -39,13 +48,49 @@
 | SPY RTH BidAsk / AllLast / 5s bars / Recorder | 已完成 | preflight 120.109 秒 `25665/3168/25`；Recorder 120.360 秒落盘 `15590/2843/25`，均为 LIVE | bounded 两分钟证据；不是 Full-RTH 全日 health |
 | RTH handler→raw readback 一致性 | 已完成 | 2026-08-11 `8972/1707/25` handler counts 与 raw readback 逐项相等 | 直接关闭该窗口 handler 后写路径丢失；旧顺序窗口约 40% 差异不是有效测量，不再安排同步 A/B |
 | Liveness incident 去重 | 代码/测试完成 | poll 级重复 marker 改为 START/UPDATE/60s CHECKPOINT/END；恢复 END 必须晚于 incident 后首个 BAR_5S | 旧真实 run 有 380 条重复 marker；新实现尚未在真实 Gateway fault 上复测 |
+| 停牌态 generic tick 49 | 已证伪，不可得 | Gateway 对 STK 返回 error 321，整个 `reqMktData` 拿不到 LIVE 回调、三路归零 | 默认已改回不请求（`market_data_generic_ticks=""`）；抑制器因此无输入，manifest 用 `halt_state_available` 明示，读者不得把"无 halt marker"读成"未停牌" |
+| 未解释静默的恢复策略 | 代码/测试完成 | 报价仍在流则只重订 bar；三路全静才完整重连，5→30 分钟退避；不计入 `ReconnectBudget`，停止条件是收盘，不因静默退出 | 旧路径下一次 5 分钟停牌即可耗尽爆发闸提前终止 session；新策略**尚未在真实 Gateway 上跑过** |
+| 丢覆盖时的 health 真实性 | 代码/测试完成 | `FEED_OUTAGE`/`GAP_SUSPECTED` 及收盘时未闭合的 incident 均使 `health_ok=false`；`EXPECTED_SILENCE` 单独不失败 | 这是"不退出"的配套约束：进程不再用退出报警，改由 health 报警 |
+| Parquet 内容保真 | 已完成（离线） | 分级价格、超 2^53 纳秒墙钟、带偏移与微秒的 broker timestamp、`special_conditions` 反解、跨段 event_id 顺序、空字段保持 null，逐值相等 | 此前只验行数与 schema，二者在四舍五入/丢时区/乱序下均会通过；本项用合成但真实形态的 tick，不替代真实 tick 复核 |
+| 强杀后重启续跑 | 已完成（离线） | 强杀 → 后继取新 run_id 续录 → `finalize_day` 折叠为单文件，4 行 / 2 个 run_id，且该日仍判 `health_ok=false` | 端到端覆盖了此前只测到"前缀可读"的缝 |
+| salvaged 段损失量化 | 已完成 | `segment_integrity()` 逐段报告压缩/解压字节、可读行数、丢弃的尾部半行字节、gzip footer 是否存在 | 被 SIGKILL 截断的流说不出丢了多少事件；本项只给出可读前缀的上界，不声称总损失 |
+| attestation 读取来源 | 已完成 | `validate()` 与 `validate_historical()` 统一从 Git 对象取 sign-off/evidence/risk config | 保留一条窄回退：未提交文件读磁盘，供 `finalize_gate_b1` 一次性写入+生成的流程使用；HEAD 越过 freeze 后两文件仍必须出现在 committed diff |
+| Windows NTFS disk-full（隔离 runner） | 已完成 | run 31562522619，192MB VHD 挂为 `R:`，真实 ENOSPC → fence RAISED → exit 10；ballast 180,879,360 bytes（低于 Linux 的 193,200,128，与 MFT 保留区一致） | 本平台第一次在真实 `ntfs.sys` 上直接观测 disk-full；owner 已接受托管 runner VHD 为生产等价卷（见 §3.1） |
+| Windows publication 强杀 / ownership | 已完成 | 同一次运行 safe drill 4/4：durable replace 回读、两进程单一 owner、holder 强杀后 successor 取锁、publication 中途强杀后仍为完整 JSON generation | 同上 |
+| Windows flush / fsync stall | 已证伪可行性 | 云 Linux VM 内核无 device-mapper；FUSE 回退下 SQLite WAL 的 `-shm` mmap 直接使进程死于 signal 7，未走到超时判定 | Windows 无 dm-delay 等价物；托管 runner 上无法装过滤驱动。留 B3，不再尝试 |
 | Windows Gateway 存活检测 | 已修复并实测 | CIM Access Denied 时继续用 `Get-Process`、`netstat` listener 和只读 API；现场返回 `RUNNING_API_VERIFIED`、server version 178 | 危险程序级动作仍额外要求 `path_status=MATCH`；查询不完整只能是 `INDETERMINATE` |
 | Windows provenance 重新生成 | 已修复 | `STATE.json` 用 UTF-8 bytes + LF 写入；实测 `CR=0` 且 `provenance --check` 通过 | 不改变 B1 historical freeze，也不为当前 B2 worktree 提供新 attestation |
 | 非空动态 reconciliation | 未完成 | 当前没有仓位、挂单或成交事实 | 需要另行授权 paper-order 子阶段 |
 | `orderId / permId / clientId / orderRef` | 未完成 | 尚未产生真实订单身份事实 | 需要另行授权 paper-order 子阶段 |
 | submit / ack / modify / cancel / fill / commission / late callback | 未完成 | 订单路径没有运行 | 不属于当前只读轮次 |
 
-## 3. 只读实测的剩余边界（2026-08-12 复核）
+## 3. Owner 决定记录（2026-08-12）
+
+以下两条是 owner 的明确判断，不是工程推导，也不由任何测试结果自动产生。记录在此以免后续被当作"尚未决定"重新翻出来。
+
+### 3.1 托管 runner 上的隔离 VHD 计为生产等价卷 —— 已接受
+
+[`OFFHOST_FAULT_DRILL_FEASIBILITY_20260812_ZH.md`](OFFHOST_FAULT_DRILL_FEASIBILITY_20260812_ZH.md)
+把"托管 runner 的 192MB VHD 是否算生产等价 OS/volume"留为 owner 风险接受判断。**owner 于
+2026-08-12 答：算。**
+
+影响：`RECORDER_STORAGE_AND_WINDOWS_POLICY_ZH.md`「仍未解除的授权边界」清单中的 **NTFS disk-full**
+与 **fence/witness publication 中途强杀** 两项，由 run 31562522619 的证据配合本次接受而解除。清单条目
+按 amendment 方式标注，不删除原文。
+
+未被本决定触及的：真实生产卷的几何与驱动栈仍与 VHD 不同；`order_authorization` 不受影响，仍为 `NONE`；
+这不构成任何 Windows order-capable 授权。
+
+### 3.2 1101 不再专门追 —— 已确认
+
+45 秒 outbound block 只能产生 1100→1102。要触发 1101（requests lost，需重订阅）需要长得多的断开，
+而收益仅是把一条已有实现和单元测试的分支从"未观察"变为"已观察"。**owner 于 2026-08-12 答：不追。**
+
+影响：1101→重订阅在 [`DOCUMENTED_VS_OBSERVED.md`](DOCUMENTED_VS_OBSERVED.md) 中**永久保持"未直接观察"**，
+代码路径保留，碰上真实 1101 时被动采集。不得由 1102 反推 1101，也不得因未观察而删除该分支。
+任何未来的断网实验都不以取得 1101 为目的。
+
+## 4. 只读实测的剩余边界（2026-08-12 复核）
 
 原最高优先级“持三路订阅受控断网 + production `run()`”已经执行，详细见
 [`GATE_B2_CONTROLLED_DISCONNECT_20260812_ZH.md`](GATE_B2_CONTROLLED_DISCONNECT_20260812_ZH.md)。本轮取得
@@ -64,7 +109,7 @@ PID 18488 加载的是旧代码，因此必须把“真实旧问题”和“新�
 现在仍可开展当前部分日运行的最终封存、官方文档复核、证据索引整理、代码审查和 freeze 准备。不得为
 碰取 1101 重复断网；任何新的 fault injection 仍需 operator 对该次精确目标和窗口重新授权。
 
-## 4. 已封存的本地证据索引
+## 5. 已封存的本地证据索引
 
 | 场景 | 报告 / 证据 | SHA-256 |
 |---|---|---|
@@ -91,20 +136,28 @@ PID 18488 加载的是旧代码，因此必须把“真实旧问题”和“新�
 这里的“封存”只表示对应证据文件及 digest 已保存，**不表示 B2 已形成最终 Git exact-freeze**；新的
 source、tests、docs 与后续真实 Gateway 证据仍需在最终 freeze 中统一绑定。
 
-## 5. 后续计划与进入下一阶段的条件
+## 6. 后续计划与进入下一阶段的条件
 
 1. SPY overnight 行情/Recorder 已完成；详细过程见 [`GATE_B2_OVERNIGHT_20260810.md`](GATE_B2_OVERNIGHT_20260810.md)。
 2. 正式 RTH 三路行情与 bounded Recorder 已完成；详细过程见 [`GATE_B2_RTH_20260810.md`](GATE_B2_RTH_20260810.md)。
 3. 当前部分日 Recorder 自然结束后，核对并封存最终 writer accounting、health、manifest 和 digest；不能
    把它升级为 Full-RTH。
-4. 用加载新 incident 代码的 Recorder 运行一次非破坏性长窗口；若未来再次做 fault injection，必须重新
-   获得精确授权。1101 保持“未观察”，不为取码反复断网。
-5. 另一天从开盘前运行一次 Full-RTH 全日 health，同时闭环 `finalize_day`、全日 bar cadence 和长期资源行为。
-6. 完成 Recorder 强杀后的 gzip 段级完整性/不完整尾段处置，以及 attestation 统一读取 Git 对象。
+4. **先做一次 10–20 分钟只读冒烟跑**，确认合并后的 `main` 在真实 Gateway 上起得来：默认不请求 tick 49
+   后不再出 321 且拿得到 LIVE 回调、`halt_state_available=false`、清淡 tape 下 `liveness_events` 为空、
+   incident marker 不再是每 0.25 秒一条。**这一步的目的不是采证据，是在投入一整个交易日之前排除
+   "新代码根本起不来"。**
+5. 再做一次受控断网，跑在合并后的 `main` 上。这是当前唯一能验证新 incident 生命周期与新恢复策略的
+   手段——`RecoveryScheduler` 只在 `QuoteRecorder.run()` 的真实断流里才会被执行到，bounded probe 碰不到它。
+   任何 fault injection 仍需 operator 对该次精确目标和窗口重新授权。1101 保持“未观察”，不为取码反复断网
+   （owner 决定，见 §3.2）。
+6. 另一天从开盘前运行一次 Full-RTH 全日 health，同时闭环 `finalize_day`、全日 bar cadence 和长期资源行为。
+   容量与队列水位按 soak 实测外推已基本不构成风险（7.19 gzip bytes/event × 约 562 万条 ≈ 40MB/天；
+   soak 在 10,000 events/s 下 queue high-water 仅 2,329/100,000，而 RTH 实测峰值约 240 events/s），
+   但仍应在开跑前用一个真实 RTH segment 复核每行字节数，不用 soak 的合成行代替。
 7. 逐项完成官方 IB 文档复核，整理 B2 source、tests、docs 和 evidence，形成新的可复查 freeze；不得借用 B1 exact-freeze 为新代码背书。
 8. 只读证据完成并封存后，由 owner **单独决定**是否授权“paper account、1 股 SPY、机械订单生命周期”的 paper-order protocol。只有进入该子阶段后，才验证非空 reconciliation、订单身份、跨 client 订单可见性、submit ambiguity、modify/cancel/fill、Gateway restart 和 late/duplicate/out-of-order callback；live order 继续禁止。
 
-## 6. 文档导航
+## 7. 文档导航
 
 - 本文：当前状态、边界、证据索引和下一步。
 - [`GATE_B2_OVERNIGHT_20260810.md`](GATE_B2_OVERNIGHT_20260810.md)：正确 overnight routing、三路行情及 bounded Recorder 写盘证据。
