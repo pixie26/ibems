@@ -15,10 +15,12 @@ Priority is fixed: **capital and position safety > state correctness > auditabil
 
 ## High-risk operations
 
-- **Do not execute high-risk operations by default.** This includes Paper/Live broker writes, real account or capital changes, network/process fault injection, disk/partition/volume/VHD/VHDX/format/raw-device work, bulk deletion or overwrite, permission or credential changes, deployment, release, push, and any action that may destroy evidence or widen impact.
+- Classify an operation as high-risk when a credible mistake could create financial exposure, affect a live/shared/production system, irreversibly lose data or evidence, expose secrets, rewrite shared history, or cause broad operational impact.
+- **Do not execute high-risk operations by default.** Examples include Paper/Live broker writes, real account or capital changes, production deployment or release, fault injection outside a disposable environment, destructive disk/partition/volume/VHD/VHDX/format/raw-device work, deletion or overwrite of non-rebuildable data, broad permission or credential changes, force-push/history rewrite, and changes to protected branches or release tags.
 - Before execution, stop and give the owner the exact command or action, resolved target, necessity, reversibility, isolation and rollback plan, worst credible outcome, and safer alternatives. Prefer mocks, simulation, temporary directories, disposable VMs, or isolated runners.
 - Proceed only after the owner explicitly approves that specific operation with those risks disclosed. Generic sandbox/admin approval, prior approval, vague consent, green tests, or Gate PASS is not consent. Reconfirm if the target, command, or risk changes.
 - If approval, target resolution, isolation, or rollback is inadequate, do not execute. Limit work to read-only diagnosis and a proposed procedure. Never bypass a safety gate, reduce protection, or widen permissions to finish a task.
+- Routine, reversible development actions are not high-risk: read-only inspection, workspace edits, non-destructive local tests, ordinary commits, normal non-force pushes to an authorized task/feature branch, and draft PR creation. They still require normal task authorization, scope control, and preservation of unrelated work.
 
 ## Safety invariants
 
