@@ -117,15 +117,17 @@ Windows 不再调用 `os.open(directory, O_RDONLY)`，也不会在 replace 已�
 
 真实 disk-full 已提供隔离 VHD runner：`scripts/run_windows_ntfs_vhd_disk_full.ps1` 只在 `artifacts/` 新建 128–512MB VHD、格式化该临时盘、运行 execution-host ENOSPC drill，最后卸载删除；`.github/workflows/windows-ntfs-fault.yml` 可在独立 Windows runner 上封存结果。本机尝试因当前会话没有可用 Windows 磁盘管理提权而未创建 VHD，主工作盘没有被写满。该实验不阻塞 B2：Recorder 已通过 `dropped_count` / `writer_error` 暴露失败，当前后果是研究数据不完整而非无审计继续下单。VHD workflow 保留为手动、隔离 runner 项，绝不在主盘执行；有真实 order Journal 路径后，应以 Journal fail-closed 为主要被测对象。
 
+修订 2026-08-12：`run_windows_ntfs_vhd_disk_full.ps1` 原先硬编码 `.venv312\python.exe`，而 workflow 用 `uv sync` 生成的是 `.venv\Scripts\python.exe`；该行在 runner 上必然失败，且失败点在 VHD 已创建挂载之后。现改为可传入 `-PythonExe`、否则按候选顺序探测，并把解析移到任何磁盘操作之前。哪些故障演练能在非 owner 本机的环境完成、各自能证明到什么程度，见 [`OFFHOST_FAULT_DRILL_FEASIBILITY_20260812_ZH.md`](OFFHOST_FAULT_DRILL_FEASIBILITY_20260812_ZH.md)——其中云 Linux VM 上的 NTFS 结果走的是 ntfs-3g/FUSE，只复刻磁盘格式而非 `ntfs.sys` 语义，不注销本节的 Windows 欠账。修复后经 owner 批准在隔离 `windows-2025` runner 上实跑（run 31562522619，`45c20e5`），safe drill 4/4 PASS 且 VHD disk-full 以 exit 10 + fence RAISED 通过——这是本平台第一次在真实 Windows NTFS 驱动上直接观测到 disk-full 行为，此前该段记载的"本机未创建 VHD"仍然属实，两者不冲突。
+
 ## 仍未解除的授权边界
 
 Windows 单元、子进程和完整套件通过，只证明当前 API 调用形状和互斥行为可用；它不等于真实 NTFS 故障语义已经闭环。以下项目是 B3/order-capable Windows deployment 的前置证据，不是 B2 只读 Gateway/Recorder 的 blocker：
 
 任何 order-capable Windows deployment 前仍必须在生产等价 OS/volume 上完成并封存：
 
-- NTFS disk-full；
+- NTFS disk-full——**已在隔离 `windows-2025` runner 上直接观测通过**（run 31562522619，192MB VHD 挂为 `R:`，真实 ENOSPC → fence RAISED → exit 10）。该条不由本次运行自动划掉：托管 runner 的 VHD 是否算生产等价卷，属 owner 风险接受判断；
 - 写入/flush stall；
-- fence/witness publication 中途强杀；
+- fence/witness publication 中途强杀——**同一次运行在真实 NTFS 上通过**（publication writer 中途强杀后目标仍是完整 JSON generation，两进程单一 owner，holder 强杀后 successor 取锁）；
 - journal WAL damage/rollback 与 witness crossing；
 - execution service 强杀、ownership 继承与 startup refusal；
 - volume failure-domain 判定。
