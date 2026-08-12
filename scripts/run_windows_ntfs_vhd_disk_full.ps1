@@ -1,6 +1,7 @@
 param(
     [string]$DriveLetter = "R",
-    [int]$SizeMB = 192
+    [int]$SizeMB = 192,
+    [string]$PythonExe = ''
 )
 
 $ErrorActionPreference = "Stop"
@@ -25,6 +26,28 @@ if ($SizeMB -lt 128 -or $SizeMB -gt 512) {
 }
 if (Test-Path $vhdPath) {
     throw "Refusing to overwrite existing VHD: $vhdPath"
+}
+
+# Resolve the interpreter before any disk work: a missing interpreter must not
+# leave an attached VHD behind. `.venv312` is the local Windows convention;
+# `.venv` is what `uv sync` produces on an isolated runner.
+if (-not $PythonExe) {
+    $pythonCandidates = @(
+        (Join-Path $repoRoot ".venv312\python.exe"),
+        (Join-Path $repoRoot ".venv312\Scripts\python.exe"),
+        (Join-Path $repoRoot ".venv\Scripts\python.exe"),
+        (Join-Path $repoRoot ".venv\python.exe")
+    )
+    $repoPython = $pythonCandidates |
+        Where-Object { Test-Path -LiteralPath $_ } |
+        Select-Object -First 1
+    if (-not $repoPython) {
+        throw "No project interpreter found. Run 'uv sync --locked --extra dev' or pass -PythonExe."
+    }
+    $PythonExe = (Resolve-Path -LiteralPath $repoPython).Path
+}
+elseif (-not (Test-Path -LiteralPath $PythonExe)) {
+    throw "PythonExe does not exist: $PythonExe"
 }
 
 $create = @"
@@ -60,8 +83,7 @@ try {
     if (-not (Test-Path "${DriveLetter}:\")) {
         throw "diskpart failed to provision the isolated NTFS VHD"
     }
-    $python = Join-Path $repoRoot ".venv312\python.exe"
-    & $python (Join-Path $repoRoot "scripts\run_storage_fault_drill.py") `
+    & $PythonExe (Join-Path $repoRoot "scripts\run_storage_fault_drill.py") `
         --journal-volume "${DriveLetter}:\" `
         --fence-dir $fenceDir `
         --output-root "artifacts/windows_ntfs_vhd/evidence" `
