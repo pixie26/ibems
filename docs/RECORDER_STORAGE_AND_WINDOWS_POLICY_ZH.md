@@ -153,7 +153,11 @@ Windows 单元、子进程和完整套件通过，只证明当前 API 调用形�
 - ~~NTFS disk-full~~ —— **已解除**（见下方 amendment 1）。原文保留：已在隔离 `windows-2025` runner 上直接观测通过（run 31562522619，192MB VHD 挂为 `R:`，真实 ENOSPC → fence RAISED → exit 10）；
 - 写入/flush stall；
 - ~~fence/witness publication 中途强杀~~ —— **已解除**（见下方 amendment 1）。原文保留：同一次运行在真实 NTFS 上通过（publication writer 中途强杀后目标仍是完整 JSON generation，两进程单一 owner，holder 强杀后 successor 取锁）；
-- journal WAL damage/rollback 与 witness crossing；
+- journal WAL damage/rollback 与 witness crossing —— **证据已取得，待 owner 确认是否适用 §3.1 的接受**
+  （run 31574366903：真实 NTFS 上 WAL recovery 静默丢弃 26 条已提交事件、全部在 witness seq 1938 之上因而
+  正确启动；强制截到 witness 之下则 exit 15 + fence RAISED）。**本条目未自行划掉**：Amendment 1 明确写了
+  该次接受"只覆盖上述两项已实测的行为，不外推到清单其余各项"，所以把新证据外推为解除，等于绕过自己
+  记下的约束。owner 只需回答"§3.1 的接受是否覆盖同一环境下这一项"；
 - execution service 强杀、ownership 继承与 startup refusal；
 - volume failure-domain 判定。
 
@@ -171,10 +175,25 @@ fence/witness publication 中途强杀两项解除，证据即该次运行。
 order-capable 授权。判断记录见
 [`GATE_B2_STATUS_20260810_ZH.md`](GATE_B2_STATUS_20260810_ZH.md) §3.1。
 
-剩余四项中，**journal WAL damage/rollback 与 witness crossing** 是唯一还能低成本推进的一项：
-`run_storage_fault_drill.py --drill wal_corruption` 是纯 Python，同一个隔离 VHD 卷即可承载，只是
-`run_windows_ntfs_vhd_disk_full.ps1` 目前只传 `--drill disk_full`。flush stall 已证实在托管 runner 上无解
-（Windows 无 dm-delay 等价物），service 强杀与 volume failure-domain 尚无脚本。
+### Amendment 2（2026-08-12）：WAL/witness 已在同一环境取得证据
+
+Amendment 1 当时指出，剩余四项里 **journal WAL damage/rollback 与 witness crossing** 是唯一还能低成本
+推进的一项。该扩展已实施：`run_windows_ntfs_vhd_disk_full.ps1` 现接受 `-Drills`，默认在同一个一次性
+VHD 上先跑 `wal_corruption` 再跑 `disk_full`（`disk_full` 会吃掉整个卷、只在 `finally` 归还，所以必须
+最后跑），且任一 drill 失败不再中断其余 drill——否则一个平台问题会连带把另一个 drill 的结果一起吞掉。
+
+run 31574366903 的直接观测:真实 `ntfs.sys` 上 WAL recovery **静默丢弃 26 条已提交事件**（3653 → 3627），
+全部位于 witness `seq=1938` 之上，因此引擎启动是正确的；强制从 seq 1938 截断后 exit `15`、fence
+`RAISED`。这是本平台第一次在 Windows 内核文件系统上直接看到"`commit()` 已确认 durable 的事务被无声
+丢弃、数据库仍然自洽只是变短"，也第一次在该平台上看到 witness 把它变成可判定。详见
+[`OFFHOST_FAULT_DRILL_FEASIBILITY_20260812_ZH.md`](OFFHOST_FAULT_DRILL_FEASIBILITY_20260812_ZH.md)。
+
+**该条目仍未从清单划掉。** Amendment 1 写明那次接受"只覆盖上述两项已实测的行为，不外推到清单其余
+各项"；把本轮新证据自行外推为解除，等于绕过自己刚记下的约束。需要 owner 明确回答一句：§3.1 对
+"托管 runner VHD = 生产等价卷"的接受，是否覆盖同一环境下的这一项。
+
+剩余项中 flush stall 已证实在托管 runner 上无解（Windows 无 dm-delay 等价物，过滤驱动装不了），
+service 强杀与 volume failure-domain 判定尚无脚本。
 
 其中 flush stall、fence/witness publication、journal WAL damage/rollback、service 强杀和 volume failure-domain 都属于订单持久化故障域；相关 order Journal 代码与授权未进入真实 broker 路径前，不在 B2 重复做高风险本机实验。B2 当前只保留低风险的 Recorder gzip 尾段完整性小项。
 

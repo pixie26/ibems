@@ -142,15 +142,53 @@ id `9128253449`，zip SHA-256
 `finally` 分支完成 detach 与删除；runner 清理阶段终止了一个 `vdsldr`（虚拟磁盘服务
 加载器）孤儿进程，属 `diskpart` 常规残留，不影响卷状态。
 
+### 实测第二轮：run 31574366903 — WAL/witness 也在真实 NTFS 上通过
+
+上一节把 WAL damage/rollback + witness crossing 记为"一行参数的待批准扩展，不是能力缺口"。该扩展
+已实施并执行：`run_windows_ntfs_vhd_disk_full.ps1` 现接受 `-Drills`，默认
+`@("wal_corruption", "disk_full")`，在同一个一次性 VHD 上依次跑。2026-08-12T07:31:59Z，
+`windows-2025`，ref = `main` @ `5dac3cd`。
+
+`wal_corruption` —— **这是本平台第一次在真实 `ntfs.sys` 上直接观测到"SQLite 静默丢弃已提交事务"**：
+
+| 观测 | 值 |
+|---|---|
+| WAL 大小 | 4,157,112 bytes |
+| 破坏前事件数 | 3,653 |
+| 破坏后事件数 | 3,627 |
+| **WAL recovery 静默丢弃** | **26 条已提交事件** |
+| witness seq | 1,938 |
+| 丢失是否越过 witness | 否——26 条全部在 1938 之上 |
+| 引擎行为 | 正常启动（正确：没有丢失任何 send 或 HALT） |
+| 强制越过 witness（自 seq 1938 截断） | exit `15`，fence `RAISED` |
+| fence reason | "the journal ends at seq 1937 but a broker write was authorised by seq 1938. 1 committed event(s) are missing" |
+| fence `journal_path` | `R:\drill-wal_corruption\journal.db` |
+
+两半都被观测到，这才是这个 drill 的价值所在：**26 条 `commit()` 已确认 durable 的事务被 NTFS 上的
+SQLite 无声丢掉，数据库自身完好无损、只是变短**——正是"没有任何东西能从 SQLite 内部告诉你少了行"
+的那个失败。而 witness 让"丢的这些要不要紧"变成可判定：都在 witness 之上 ⇒ 启动正确；强制截到
+witness 之下 ⇒ 立即 exit 15 + fence。
+
+`disk_full`（同一 VHD，紧随其后）：ballast 167,247,872 bytes，exit `10`，fence `RAISED`，reason 同为真实
+`journal write failed: database or disk is full`，`timed_out: false`。
+
+一个顺带的观测印证了排序决定：本轮 ballast 比上一轮少约 13.6MB（167,247,872 vs 180,879,360），
+差值来自先跑的 `wal_corruption` 在卷上留下的 journal、4.1MB WAL 和两份对照副本。这正是把
+`disk_full` 放在最后的理由——它会吃掉整个卷，只在 `finally` 里归还。反过来排会让 `wal_corruption`
+在一个刚被填满过的卷上开跑。
+
+证据封存：artifact `windows-ntfs-fault-5dac3cdc2bb5684bd77103009877b6d4ec736014`，id `9132580047`，
+zip SHA-256 `845b2994576f8b42d35afa34c6ec2e2476412ea553d908733ef91a485d9eeadb`，17 个文件，留存 90 天。
+两份 manifest 分别在 `evidence/20260812T073224Z/` 与 `evidence/20260812T073257Z/`。VHD 由 `finally`
+detach 并删除；runner 清理阶段再次终止了一个 `vdsldr` 孤儿进程，与上一轮相同，属 `diskpart` 常规残留。
+
 ## 仍然不能在任何非本机环境闭环的项
 
 - **Windows flush / fsync stall。** Windows 没有 dm-delay 等价物；在托管 runner 上要么引入
   WinFsp/Dokan 文件系统 shim（新依赖、且与 Linux 侧同样的 mmap 疑虑），要么装过滤驱动
   （托管 runner 不可行）。目前无解，应继续留在 B3。
-- **Windows 上的 WAL damage/rollback + witness crossing。** 机制上没有障碍——
-  `run_storage_fault_drill.py --drill wal_corruption` 是纯 Python，同一个 VHD 卷即可承载——
-  但当前 `run_windows_ntfs_vhd_disk_full.ps1` 只传 `--drill disk_full`。这是一个待批准的扩展，
-  不是能力缺口。
+- ~~**Windows 上的 WAL damage/rollback + witness crossing。**~~ **已完成**，见上方 run 31574366903。
+  原判断（"机制上没有障碍，是一个待批准的扩展而不是能力缺口"）成立。
 - **execution service 强杀、ownership 继承与 startup refusal、volume failure-domain 判定。**
   需要真实 Windows 服务安装，托管 runner 上可做但尚无脚本。
 - **生产等价卷。** VHD 之于真实生产卷，仍是近似；这一条只能由 owner 的部署环境回答。

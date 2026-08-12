@@ -57,6 +57,7 @@ B2 freeze 时仍需统一机器状态、源码、文档和证据。
 | attestation 读取来源 | 已完成 | `validate()` 与 `validate_historical()` 统一从 Git 对象取 sign-off/evidence/risk config | 保留一条窄回退：未提交文件读磁盘，供 `finalize_gate_b1` 一次性写入+生成的流程使用；HEAD 越过 freeze 后两文件仍必须出现在 committed diff |
 | Windows NTFS disk-full（隔离 runner） | 已完成 | run 31562522619，192MB VHD 挂为 `R:`，真实 ENOSPC → fence RAISED → exit 10；ballast 180,879,360 bytes（低于 Linux 的 193,200,128，与 MFT 保留区一致） | 本平台第一次在真实 `ntfs.sys` 上直接观测 disk-full；owner 已接受托管 runner VHD 为生产等价卷（见 §3.1） |
 | Windows publication 强杀 / ownership | 已完成 | 同一次运行 safe drill 4/4：durable replace 回读、两进程单一 owner、holder 强杀后 successor 取锁、publication 中途强杀后仍为完整 JSON generation | 同上 |
+| Windows WAL damage/rollback + witness crossing | 已完成 | run 31574366903，同一隔离 VHD：真实 `ntfs.sys` 上 WAL recovery 静默丢弃 26 条已提交事件（3653→3627），全部在 witness `seq=1938` 之上故引擎正确启动；强制截到 witness 之下则 exit `15` + fence RAISED | 第一次在 Windows 内核文件系统上直接观测到"已 commit 的事务被无声丢弃、DB 仍自洽只是变短"；**清单条目未自行划掉**，需 owner 确认 §3.1 的接受是否覆盖该项 |
 | Windows flush / fsync stall | 已证伪可行性 | 云 Linux VM 内核无 device-mapper；FUSE 回退下 SQLite WAL 的 `-shm` mmap 直接使进程死于 signal 7，未走到超时判定 | Windows 无 dm-delay 等价物；托管 runner 上无法装过滤驱动。留 B3，不再尝试 |
 | Windows Gateway 存活检测 | 已修复并实测 | CIM Access Denied 时继续用 `Get-Process`、`netstat` listener 和只读 API；现场返回 `RUNNING_API_VERIFIED`、server version 178 | 危险程序级动作仍额外要求 `path_status=MATCH`；查询不完整只能是 `INDETERMINATE` |
 | Windows provenance 重新生成 | 已修复 | `STATE.json` 用 UTF-8 bytes + LF 写入；实测 `CR=0` 且 `provenance --check` 通过 | 不改变 B1 historical freeze，也不为当前 B2 worktree 提供新 attestation |
