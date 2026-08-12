@@ -7,7 +7,8 @@
 强杀）是否可以在**不使用 owner 本机磁盘**的前提下完成，以及在哪种环境下完成到什么程度。
 
 结论先行：**能搬走的比想象中多，但"搬到 Linux 云 VM"和"搬到隔离 Windows runner"是两件不同的事，
-只有后者能减少 Windows 授权边界上的欠账。**
+只有后者能减少 Windows 授权边界上的欠账。** 第 6 项已在隔离 Windows runner 上实测通过
+（run 31562522619，见下）；第 7 项只有一部分能搬走，flush stall 哪里都做不了。
 
 ## 三类环境的能力差异
 
@@ -107,6 +108,40 @@ detach + 删除。
 `diskpart` 之前抛错且不产生任何 VHD 或 diskpart 脚本；带 `-PythonExe` 时正常推进到
 `diskpart` 步骤（此处因 Linux 无 `diskpart.exe` 而停止，属预期）。
 
+### 实测：run 31562522619 — 两项均 PASS
+
+修复后经 owner 明确批准，于 2026-08-12T04:12Z 在 `windows-2025` 托管 runner 上
+`workflow_dispatch` 执行，ref = `claude/ntfs-vhd-disk-full-test-a0ybm8` @ `45c20e5`。
+**这是本平台第一次在真实 Windows NTFS 驱动上直接观察到 disk-full 行为。**
+
+`run_windows_ntfs_safe_drill.py`（`filesystem: "NTFS"`，`passed: true`）：
+
+| 检查 | 结果 |
+|---|---|
+| `ntfs_durable_replace_readback` | PASS |
+| `two_process_single_owner` | PASS |
+| `force_kill_releases_kernel_lock` | PASS |
+| `publication_force_kill_leaves_complete_generation` | PASS |
+
+`run_windows_ntfs_vhd_disk_full.ps1`（192MB fixed VHD，`diskpart` 格式化并挂为 `R:`）：
+
+- ballast 写满 180,879,360 bytes；
+- host 子进程退出码 `10`，与期望一致，`timed_out: false`；
+- fence `RAISED`，`journal_path` 为 `R:\drill-disk_full\journal.db`，reason 同为真实
+  SQLite 错误 `journal write failed: database or disk is full`；
+- witness `seq=12`（`SEND_ATTEMPT_STARTED`），
+  `digest=996b57cb33b336aa…`；
+- host 记为 `runnervm7vqe0`，作业结束后 runner 销毁。
+
+Windows 上观察到的 ballast 字节数低于 Linux（180.9MB vs 193.2MB），与 NTFS 的 MFT 保留
+区一致；两侧都在真实 ENOSPC 处停下并 fence，行为判定相同。
+
+证据封存：artifact `windows-ntfs-fault-45c20e5defc15cd265fbfe2db92609dde51b2fec`，
+id `9128253449`，zip SHA-256
+`a5f2b341ac633b78e61ce4e4524ef5273bfb58af804da2584c7c98389a33eb2f`，留存 90 天。
+`finally` 分支完成 detach 与删除；runner 清理阶段终止了一个 `vdsldr`（虚拟磁盘服务
+加载器）孤儿进程，属 `diskpart` 常规残留，不影响卷状态。
+
 ## 仍然不能在任何非本机环境闭环的项
 
 - **Windows flush / fsync stall。** Windows 没有 dm-delay 等价物；在托管 runner 上要么引入
@@ -122,6 +157,15 @@ detach + 删除。
 
 ## 对当前 Gate 的影响
 
-无。上述任何结果都不改变 `order_authorization = NONE`，也不构成 Windows order-capable 授权。
-第 6 项按既有判断继续 **不 block B2**；第 7 项继续推到 B3 前。本文只把"哪些必须在本机做"
-这一约束缩小到真正必须在本机做的那几项。
+`order_authorization` 仍为 `NONE`，上述结果都不构成 Windows order-capable 授权。绿色演练是证据，
+不是 Gate。
+
+第 6 项的性质变了：它此前是"未观测"，现在是"已在隔离 Windows runner 上直接观测并封存"。
+但**是否把托管 runner 上的 192MB VHD 认作"生产等价 OS/volume"，是 owner 的风险接受判断，
+不是本文能替代的结论**——因此
+[`RECORDER_STORAGE_AND_WINDOWS_POLICY_ZH.md`](RECORDER_STORAGE_AND_WINDOWS_POLICY_ZH.md)
+的授权边界清单不由本次运行自动划掉。真正未被这次运行触及的是：真实生产卷的几何与驱动栈、
+以及订单 Journal 进入真实 broker 路径后应以 Journal fail-closed 为被测对象这一条。
+
+第 7 项维持推到 B3 前：publication 强杀与 ownership 已随本次运行在真实 NTFS 上通过，
+WAL/witness 在 Windows 上是一行参数的待批准扩展，而 flush stall 无解。
