@@ -211,5 +211,6 @@ fence/witness publication 中途强杀两项已解除，记录见
 Amendment 1 与 [`GATE_B2_STATUS_20260810_ZH.md`](GATE_B2_STATUS_20260810_ZH.md) §3.1。上一段列出的
 两项未触及事项不受该接受影响，仍然成立；`order_authorization` 仍为 `NONE`。
 
-第 7 项维持推到 B3 前：publication 强杀与 ownership 已随本次运行在真实 NTFS 上通过，
-WAL/witness 在 Windows 上是一行参数的待批准扩展，而 flush stall 无解。
+第 7 项维持推到 B3 前，但范围已收窄：publication 强杀、ownership 与 WAL/witness crossing 均已在
+真实 NTFS 上通过并解除（分别见 Amendment 1、Amendment 2），只剩 flush stall（已证实无解）、
+execution service 强杀与 volume failure-domain 判定尚未闭环。

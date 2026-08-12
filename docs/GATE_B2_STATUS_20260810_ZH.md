@@ -57,7 +57,7 @@ B2 freeze 时仍需统一机器状态、源码、文档和证据。
 | attestation 读取来源 | 已完成 | `validate()` 与 `validate_historical()` 统一从 Git 对象取 sign-off/evidence/risk config | 保留一条窄回退：未提交文件读磁盘，供 `finalize_gate_b1` 一次性写入+生成的流程使用；HEAD 越过 freeze 后两文件仍必须出现在 committed diff |
 | Windows NTFS disk-full（隔离 runner） | 已完成 | run 31562522619，192MB VHD 挂为 `R:`，真实 ENOSPC → fence RAISED → exit 10；ballast 180,879,360 bytes（低于 Linux 的 193,200,128，与 MFT 保留区一致） | 本平台第一次在真实 `ntfs.sys` 上直接观测 disk-full；owner 已接受托管 runner VHD 为生产等价卷（见 §3.1） |
 | Windows publication 强杀 / ownership | 已完成 | 同一次运行 safe drill 4/4：durable replace 回读、两进程单一 owner、holder 强杀后 successor 取锁、publication 中途强杀后仍为完整 JSON generation | 同上 |
-| Windows WAL damage/rollback + witness crossing | 已完成 | run 31574366903，同一隔离 VHD：真实 `ntfs.sys` 上 WAL recovery 静默丢弃 26 条已提交事件（3653→3627），全部在 witness `seq=1938` 之上故引擎正确启动；强制截到 witness 之下则 exit `15` + fence RAISED | 第一次在 Windows 内核文件系统上直接观测到"已 commit 的事务被无声丢弃、DB 仍自洽只是变短"；**清单条目未自行划掉**，需 owner 确认 §3.1 的接受是否覆盖该项 |
+| Windows WAL damage/rollback + witness crossing | 已完成 | run 31574366903，同一隔离 VHD：真实 `ntfs.sys` 上 WAL recovery 静默丢弃 26 条已提交事件（3653→3627），全部在 witness `seq=1938` 之上故引擎正确启动；强制截到 witness 之下则 exit `15` + fence RAISED | 第一次在 Windows 内核文件系统上直接观测到"已 commit 的事务被无声丢弃、DB 仍自洽只是变短"；owner 已确认 §3.1 的接受覆盖该项（见 §3.2），清单条目已解除 |
 | Windows flush / fsync stall | 已证伪可行性 | 云 Linux VM 内核无 device-mapper；FUSE 回退下 SQLite WAL 的 `-shm` mmap 直接使进程死于 signal 7，未走到超时判定 | Windows 无 dm-delay 等价物；托管 runner 上无法装过滤驱动。留 B3，不再尝试 |
 | Windows Gateway 存活检测 | 已修复并实测 | CIM Access Denied 时继续用 `Get-Process`、`netstat` listener 和只读 API；现场返回 `RUNNING_API_VERIFIED`、server version 178 | 危险程序级动作仍额外要求 `path_status=MATCH`；查询不完整只能是 `INDETERMINATE` |
 | Windows provenance 重新生成 | 已修复 | `STATE.json` 用 UTF-8 bytes + LF 写入；实测 `CR=0` 且 `provenance --check` 通过 | 不改变 B1 historical freeze，也不为当前 B2 worktree 提供新 attestation |
@@ -82,7 +82,17 @@ B2 freeze 时仍需统一机器状态、源码、文档和证据。
 未被本决定触及的：真实生产卷的几何与驱动栈仍与 VHD 不同；`order_authorization` 不受影响，仍为 `NONE`；
 这不构成任何 Windows order-capable 授权。
 
-### 3.2 1101 不再专门追 —— 已确认
+### 3.2 §3.1 的接受覆盖 WAL/witness crossing —— 已确认
+
+`RECORDER_STORAGE_AND_WINDOWS_POLICY_ZH.md` Amendment 1 当时明确写"本次接受只覆盖 NTFS disk-full 与
+publication 强杀两项已实测的行为，不外推到清单其余各项"，因此 run 31574366903 取得的 WAL/witness
+crossing 证据（见上表）未被自动划掉，留待 owner 单独确认。**owner 于 2026-08-12 答：覆盖。**
+
+影响：`RECORDER_STORAGE_AND_WINDOWS_POLICY_ZH.md`「仍未解除的授权边界」清单中的 **journal WAL
+damage/rollback 与 witness crossing** 一项由此解除，标注为 Amendment 2。清单剩余三项（写入/flush
+stall、execution service 强杀、volume failure-domain 判定）不受影响。
+
+### 3.3 1101 不再专门追 —— 已确认
 
 45 秒 outbound block 只能产生 1100→1102。要触发 1101（requests lost，需重订阅）需要长得多的断开，
 而收益仅是把一条已有实现和单元测试的分支从"未观察"变为"已观察"。**owner 于 2026-08-12 答：不追。**
@@ -150,7 +160,7 @@ source、tests、docs 与后续真实 Gateway 证据仍需在最终 freeze 中�
 5. 再做一次受控断网，跑在合并后的 `main` 上。这是当前唯一能验证新 incident 生命周期与新恢复策略的
    手段——`RecoveryScheduler` 只在 `QuoteRecorder.run()` 的真实断流里才会被执行到，bounded probe 碰不到它。
    任何 fault injection 仍需 operator 对该次精确目标和窗口重新授权。1101 保持“未观察”，不为取码反复断网
-   （owner 决定，见 §3.2）。
+   （owner 决定，见 §3.3）。
 6. 另一天从开盘前运行一次 Full-RTH 全日 health，同时闭环 `finalize_day`、全日 bar cadence 和长期资源行为。
    容量与队列水位按 soak 实测外推已基本不构成风险（7.19 gzip bytes/event × 约 562 万条 ≈ 40MB/天；
    soak 在 10,000 events/s 下 queue high-water 仅 2,329/100,000，而 RTH 实测峰值约 240 events/s），
