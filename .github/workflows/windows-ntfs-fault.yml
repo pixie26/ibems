@@ -27,7 +27,10 @@ jobs:
           uv run python scripts/run_windows_ntfs_safe_drill.py
           --root artifacts/windows_ntfs_safe
 
-      - name: Isolated VHD real disk-full drill
+      # wal_corruption then disk_full, on one disposable VHD. disk_full is last
+      # because it consumes the whole volume and only returns the space in a
+      # `finally`. fsync_stall is excluded: Windows has no dm-delay equivalent.
+      - name: Isolated VHD real NTFS fault drills
         shell: powershell
         run: scripts/run_windows_ntfs_vhd_disk_full.ps1
 

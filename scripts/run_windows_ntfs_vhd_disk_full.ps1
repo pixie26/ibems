@@ -1,7 +1,15 @@
 param(
     [string]$DriveLetter = "R",
     [int]$SizeMB = 192,
-    [string]$PythonExe = ''
+    [string]$PythonExe = '',
+    # wal_corruption runs first on purpose. disk_full consumes the entire
+    # volume and only returns the space in a `finally`, so putting it last
+    # means no drill ever starts on a volume another drill has filled. Both
+    # are pure Python and need no kernel facility Windows lacks; fsync_stall
+    # is deliberately absent because Windows has no dm-delay equivalent and a
+    # FUSE shim cannot back SQLite's -shm mmap (see
+    # docs/OFFHOST_FAULT_DRILL_FEASIBILITY_20260812_ZH.md).
+    [string[]]$Drills = @("wal_corruption", "disk_full")
 )
 
 $ErrorActionPreference = "Stop"
@@ -26,6 +34,15 @@ if ($SizeMB -lt 128 -or $SizeMB -gt 512) {
 }
 if (Test-Path $vhdPath) {
     throw "Refusing to overwrite existing VHD: $vhdPath"
+}
+if (-not $Drills -or $Drills.Count -eq 0) {
+    throw "Drills must name at least one drill"
+}
+$supportedDrills = @("disk_full", "wal_corruption")
+foreach ($drill in $Drills) {
+    if ($supportedDrills -notcontains $drill) {
+        throw "Unsupported drill '$drill'. Supported on this runner: $($supportedDrills -join ', ')"
+    }
 }
 
 # Resolve the interpreter before any disk work: a missing interpreter must not
@@ -83,13 +100,31 @@ try {
     if (-not (Test-Path "${DriveLetter}:\")) {
         throw "diskpart failed to provision the isolated NTFS VHD"
     }
-    & $PythonExe (Join-Path $repoRoot "scripts\run_storage_fault_drill.py") `
-        --journal-volume "${DriveLetter}:\" `
-        --fence-dir $fenceDir `
-        --output-root "artifacts/windows_ntfs_vhd/evidence" `
-        --drill disk_full
-    if ($LASTEXITCODE -ne 0) {
-        throw "real NTFS disk-full drill failed with exit code $LASTEXITCODE"
+    # One invocation per drill rather than `--drill all`: `all` would pull in
+    # fsync_stall, which cannot run here, and a separate evidence bundle per
+    # drill keeps a failure in one from being read as a verdict on the other.
+    #
+    # Every requested drill runs even if an earlier one fails, then the whole
+    # run fails at the end. Aborting on the first failure would let a
+    # platform-specific problem in one drill silently withhold the other
+    # drill's result, which is the opposite of what this evidence is for. The
+    # drills already isolate themselves: separate work directory, fence and
+    # witness per drill.
+    $failures = @()
+    foreach ($drill in $Drills) {
+        Write-Host "=== real NTFS drill: $drill ==="
+        & $PythonExe (Join-Path $repoRoot "scripts\run_storage_fault_drill.py") `
+            --journal-volume "${DriveLetter}:\" `
+            --fence-dir $fenceDir `
+            --output-root "artifacts/windows_ntfs_vhd/evidence" `
+            --drill $drill
+        if ($LASTEXITCODE -ne 0) {
+            $failures += "$drill (exit $LASTEXITCODE)"
+            Write-Warning "real NTFS $drill drill failed with exit code $LASTEXITCODE"
+        }
+    }
+    if ($failures.Count -gt 0) {
+        throw "real NTFS drills failed: $($failures -join ', ')"
     }
 }
 finally {
