@@ -1,6 +1,6 @@
 # Gate B2 当前状态摘要（2026-08-10）
 
-初始截止时间：`2026-08-10 23:08 HKT`；本摘要更新至 `2026-08-12`。
+初始截止时间：`2026-08-10 23:08 HKT`；本摘要更新至 `2026-08-13`。
 
 ## 1. 当前正式结论
 
@@ -14,10 +14,12 @@
   直接观察 1100→1102、不重订阅和三路自动恢复；1101 仍未观察。该进程约 13:00 ET 才启动，属于部分日
   长跑，不是 Full-RTH。
 
-- **当前 `main` 从未接触过 Gateway。** 2026-08-12 的三条分支已合并（recorder/attestation 加固、Windows
-  NTFS 实测证据、`AGENTS.md` 高风险定义细化），但**迄今每一次真实 Gateway 观测，用的都是此后已经改掉
-  的代码**：断网那轮的 PID 18488 加载的是旧 incident 实现，而 tick 49 默认值、恢复策略和 health 失败条件
-  都是在那之后加入的。因此下一次真实运行的第一目的是验证当前代码，不是采新证据。
+- **2026-08-13 Amendment：原“当前 `main` 从未接触过 Gateway”的状态已失效。** commit `83e9573` 已于
+  2026-08-12 运行一次 Full-RTH 尝试：约 66 分钟后出现三路静默，`RecoveryScheduler` 在 durable event
+  明确记录 `evidence_of_life=True` 时仍错误选择 full reconnect，随后新行情请求收到 `10197`，最终 health
+  FAIL、覆盖约 17%。事故后独立 120 秒 probe 又取得三路 LIVE，说明不是持久 entitlement/route 失败。
+  详细事实、owner“没有主动登录真实账户”的明确陈述、API log 边界及整改条件见
+  [`INCIDENT_FULL_RTH_20260812_ZH.md`](INCIDENT_FULL_RTH_20260812_ZH.md)。Full-RTH 仍未完成。
 
 `STATE.json` 是机器可读权威状态；当前为 `gate_b2=READ_ONLY_IN_PROGRESS`、`order_authorization=NONE`、
 `gate_b1_covers_worktree=false`——即当前这棵树不在任何 attestation 覆盖范围内，B2 全部证据都是在未覆盖
@@ -46,10 +48,11 @@ B2 freeze 时仍需统一机器状态、源码、文档和证据。
 | 持三路订阅受控断网 + production `run()` | 部分完成 | 真实 1100→1102；connection epoch 保持 1；未重订；1102 后 BidAsk/AllLast/BAR_5S 分别约 0.264/0.267/0.896 秒恢复本地接收 | 未观察 1101；新 incident 去重代码是在本轮后加入，尚未真实复测 |
 | SPY overnight 三路行情 / Recorder | 已完成 | 正确 `OVERNIGHT` route：preflight `1620/13/25`；落盘 Recorder `923/16/25`，两轮均 PASS | 只证明 overnight；不是 RTH 或 Full-RTH health report |
 | SPY RTH BidAsk / AllLast / 5s bars / Recorder | 已完成 | preflight 120.109 秒 `25665/3168/25`；Recorder 120.360 秒落盘 `15590/2843/25`，均为 LIVE | bounded 两分钟证据；不是 Full-RTH 全日 health |
+| SPY Full-RTH 全日 health | **失败，未完成** | commit `83e9573` 从开盘起取得约 66 分钟三路 LIVE；随后 `evidence_of_life=True` 时错误 full reconnect，新请求收到 `10197`，health FAIL、覆盖约 17% | 失败证据保留；不得把前缀非零升级为 Full-RTH PASS；见事故报告 |
 | RTH handler→raw readback 一致性 | 已完成 | 2026-08-11 `8972/1707/25` handler counts 与 raw readback 逐项相等 | 直接关闭该窗口 handler 后写路径丢失；旧顺序窗口约 40% 差异不是有效测量，不再安排同步 A/B |
 | Liveness incident 去重 | 代码/测试完成 | poll 级重复 marker 改为 START/UPDATE/60s CHECKPOINT/END；恢复 END 必须晚于 incident 后首个 BAR_5S | 旧真实 run 有 380 条重复 marker；新实现尚未在真实 Gateway fault 上复测 |
 | 停牌态 generic tick 49 | 已证伪，不可得 | Gateway 对 STK 返回 error 321，整个 `reqMktData` 拿不到 LIVE 回调、三路归零 | 默认已改回不请求（`market_data_generic_ticks=""`）；抑制器因此无输入，manifest 用 `halt_state_available` 明示，读者不得把"无 halt marker"读成"未停牌" |
-| 未解释静默的恢复策略 | 代码/测试完成 | 报价仍在流则只重订 bar；三路全静才完整重连，5→30 分钟退避；不计入 `ReconnectBudget`，停止条件是收盘，不因静默退出 | 旧路径下一次 5 分钟停牌即可耗尽爆发闸提前终止 session；新策略**尚未在真实 Gateway 上跑过** |
+| 未解释静默的恢复策略 | **发现生产默认组合缺陷，待修复** | 设计要求有生命迹象时只做最小修复，但 `plan()` 先消耗 fast full-reconnect；真实 run 已记录 `evidence_of_life=True` 仍 full reconnect | 测试使用 `fast_attempts=0` 隐藏了默认值缺陷；修复和真实 smoke 前不得再次投入 Full-RTH |
 | 丢覆盖时的 health 真实性 | 代码/测试完成 | `FEED_OUTAGE`/`GAP_SUSPECTED` 及收盘时未闭合的 incident 均使 `health_ok=false`；`EXPECTED_SILENCE` 单独不失败 | 这是"不退出"的配套约束：进程不再用退出报警，改由 health 报警 |
 | Parquet 内容保真 | 已完成（离线） | 分级价格、超 2^53 纳秒墙钟、带偏移与微秒的 broker timestamp、`special_conditions` 反解、跨段 event_id 顺序、空字段保持 null，逐值相等 | 此前只验行数与 schema，二者在四舍五入/丢时区/乱序下均会通过；本项用合成但真实形态的 tick，不替代真实 tick 复核 |
 | 强杀后重启续跑 | 已完成（离线） | 强杀 → 后继取新 run_id 续录 → `finalize_day` 折叠为单文件，4 行 / 2 个 run_id，且该日仍判 `health_ok=false` | 端到端覆盖了此前只测到"前缀可读"的缝 |
@@ -110,9 +113,9 @@ stall、execution service 强杀、volume failure-domain 判定）不受影响�
 PID 18488 加载的是旧代码，因此必须把“真实旧问题”和“新代码离线修正”分开。
 
 1. `completed orders` 被 Gateway Read-Only policy 阻断；继续需要降低保护，不接受。
-2. overnight 与 RTH bounded 行情均已完成；当前约 13:00 ET 起跑的长跑是部分日，仍未运行 Full-RTH
-   全日 health。该全日轮次还需
-   同时验证开盘 cross、午盘、收盘 cross 的 bar cadence 与长期资源/队列水位。
+2. overnight 与 RTH bounded 行情均已完成。2026-08-12 Full-RTH 尝试只取得约 17% 覆盖后失败；它验证了
+   开盘至约 10:36 ET 的写盘前缀，但没有覆盖午盘、收盘 cross 或 `finalize_day` 的正常全日路径。必须先修复
+   recovery 默认组合，再做短时真实 smoke，之后另日重跑。
 3. 不应反复断网碰运气；持订阅实验也不得预设必得 1101。官方语义只支持按实际结果区分
    1101（requests lost，需要重订阅）与 1102（requests recovered），不得互相推断。
 4. 非空 broker facts、订单身份、cross-client order visibility 和订单 callback 必须先获得 paper-order 独立授权。
@@ -140,10 +143,12 @@ PID 18488 加载的是旧代码，因此必须把“真实旧问题”和“新�
 | SPY RTH bounded Recorder | `artifacts/ib_preflight/20260810_b2_rth_recorder_v1/report.json` | `86de43714c1d9fa1f515d01ddc126589b11e1634ff23f1ef57ca439cfa9a543d` |
 | SPY RTH handler-count Recorder | `artifacts/ib_preflight/20260811_b2_rth_recorder_handler_counts_v1/report.json` | `0cb4c95b86d39e054b3c384bf8a225958609cf4c5dff167b49177ed9c4e02edc` |
 | generic tick 49 error 321 失败轮 | `artifacts/ib_preflight/20260812_controlled_disconnect_real_run/` | 已完成失败 manifest；尚未纳入最终 evidence snapshot |
-| 持订阅断网 + 部分日 production run | `artifacts/ib_preflight/20260812_controlled_disconnect_real_run_retry_empty_generic_ticks/` | 仍在写入，**不得提前给最终 digest/PASS** |
+| 持订阅断网 + 部分日 production run | `artifacts/ib_preflight/20260812_controlled_disconnect_real_run_retry_empty_generic_ticks/raw/2026-08-11/health.json` | 已 finalize；partial-day health FAIL；`eba079cd70cdbedd7ebf49223eb5d19d9316ea47104b4014173dd962385534d5` |
+| Full-RTH 失败轮 health | `artifacts/ib_preflight/20260812_full_rth_main_83e9573_v3/raw/2026-08-12/health.json` | `4ac241bebc39f5cabc8dee16024f3ce761ea32b1708f86d0b5e29fdf6a7146c9` |
+| 事故后 120 秒 LIVE probe | `artifacts/ib_preflight/20260813_current_live_diagnosis_v1/report.json` | `f13956a327971319f0c8f200c1e84e2bea0dc0bb82e3f422a22fcd7e5e89cc9b` |
 
 表中 2026-08-11 及以前的项目是已有本地 evidence bundle；网络中断目录的 `SHA256SUMS` 已复核。
-最后两个 2026-08-12 artifact 另行标为“失败轮已完成但未纳入 snapshot”和“仍在写入”，不属于已封存证据。
+2026-08-12/13 artifact 的状态按表内逐项标注；失败轮必须保留，但不属于 PASS 证据。
 这里的“封存”只表示对应证据文件及 digest 已保存，**不表示 B2 已形成最终 Git exact-freeze**；新的
 source、tests、docs 与后续真实 Gateway 证据仍需在最终 freeze 中统一绑定。
 
@@ -151,17 +156,16 @@ source、tests、docs 与后续真实 Gateway 证据仍需在最终 freeze 中�
 
 1. SPY overnight 行情/Recorder 已完成；详细过程见 [`GATE_B2_OVERNIGHT_20260810.md`](GATE_B2_OVERNIGHT_20260810.md)。
 2. 正式 RTH 三路行情与 bounded Recorder 已完成；详细过程见 [`GATE_B2_RTH_20260810.md`](GATE_B2_RTH_20260810.md)。
-3. 当前部分日 Recorder 自然结束后，核对并封存最终 writer accounting、health、manifest 和 digest；不能
-   把它升级为 Full-RTH。
-4. **先做一次 10–20 分钟只读冒烟跑**，确认合并后的 `main` 在真实 Gateway 上起得来：默认不请求 tick 49
-   后不再出 321 且拿得到 LIVE 回调、`halt_state_available=false`、清淡 tape 下 `liveness_events` 为空、
-   incident marker 不再是每 0.25 秒一条。**这一步的目的不是采证据，是在投入一整个交易日之前排除
-   "新代码根本起不来"。**
-5. 再做一次受控断网，跑在合并后的 `main` 上。这是当前唯一能验证新 incident 生命周期与新恢复策略的
-   手段——`RecoveryScheduler` 只在 `QuoteRecorder.run()` 的真实断流里才会被执行到，bounded probe 碰不到它。
+3. 保留并索引 2026-08-12 Full-RTH 失败轮；详细见
+   [`INCIDENT_FULL_RTH_20260812_ZH.md`](INCIDENT_FULL_RTH_20260812_ZH.md)。先修复 scheduler 在生产默认
+   `fast_attempts=2` + `evidence_of_life=True` 时错误 full reconnect 的分支，并补足回归测试。
+4. 修复后做一次 **10–20 分钟只读冒烟跑**：确认 LIVE、三路持续、`halt_state_available=false`，且有生命
+   迹象时不会 full reconnect。事故后的 120 秒 probe 已证明当前 entitlement/route 可用，但不能替代修复后 smoke。
+5. 再做一次受控断网，跑在修复后的代码上，验证 incident 生命周期与恢复策略。
    任何 fault injection 仍需 operator 对该次精确目标和窗口重新授权。1101 保持“未观察”，不为取码反复断网
    （owner 决定，见 §3.3）。
-6. 另一天从开盘前运行一次 Full-RTH 全日 health，同时闭环 `finalize_day`、全日 bar cadence 和长期资源行为。
+6. P0 修复、回归和真实 smoke 均通过后，另一天从开盘前重跑 Full-RTH 全日 health，同时闭环
+   `finalize_day`、全日 bar cadence 和长期资源行为。
    容量与队列水位按 soak 实测外推已基本不构成风险（7.19 gzip bytes/event × 约 562 万条 ≈ 40MB/天；
    soak 在 10,000 events/s 下 queue high-water 仅 2,329/100,000，而 RTH 实测峰值约 240 events/s），
    但仍应在开跑前用一个真实 RTH segment 复核每行字节数，不用 soak 的合成行代替。
@@ -174,6 +178,7 @@ source、tests、docs 与后续真实 Gateway 证据仍需在最终 freeze 中�
 - [`GATE_B2_OVERNIGHT_20260810.md`](GATE_B2_OVERNIGHT_20260810.md)：正确 overnight routing、三路行情及 bounded Recorder 写盘证据。
 - [`GATE_B2_RTH_20260810.md`](GATE_B2_RTH_20260810.md)：RTH competing-session 失败、判定加固、正式三路行情及 bounded Recorder 写盘证据。
 - [`GATE_B2_CONTROLLED_DISCONNECT_20260812_ZH.md`](GATE_B2_CONTROLLED_DISCONNECT_20260812_ZH.md)：持三路订阅的 production 断网、旧 marker 重复、incident 修正和 Gateway 检测修复。
+- [`INCIDENT_FULL_RTH_20260812_ZH.md`](INCIDENT_FULL_RTH_20260812_ZH.md)：Full-RTH 提前终止、API log、恢复策略缺陷、owner 登录陈述和整改条件。
 - [`GATE_B2_READONLY_20260809.md`](GATE_B2_READONLY_20260809.md)：每一轮真实 Gateway 测试的详细过程与观测。
 - [`DOCUMENTED_VS_OBSERVED.md`](DOCUMENTED_VS_OBSERVED.md)：官方文档语义与真实 Gateway 直接观测的逐项矩阵。
 - [`GATE_B1_SIGNOFF_117188cea539.md`](GATE_B1_SIGNOFF_117188cea539.md)：Gate B1 exact-freeze owner acceptance；其范围不包含真实 IB 行为。

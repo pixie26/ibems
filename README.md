@@ -19,7 +19,7 @@
 | 无 IB 依赖的执行核心 | Gate B1 已在 exact-freeze commit `117188cea539...` 完成正式 campaign、真实存储故障证据和 owner acceptance，结论为 PASS。当前 B2 工作树已有 freeze 后改动，必须单独验证，不能沿用 B1 attestation。 |
 | Hypothesis Gate campaign | B1 exact-freeze campaign 已通过；详细计数与 artifact digest 见 `docs/GATE_B1_SIGNOFF_117188cea539.md`。任何 B2 行为代码改动都需要绑定新的 tree 重新验证。 |
 | 不变量 0 + 22 条安全不变量 | B1 exact-freeze 的 Property / Runtime / Auditor 与 B1.6 journal witness 已闭环。真实 IB reconciliation、unknown broker facts 和 callback 行为明确留给 B2，不属于 B1 PASS 的证明范围。 |
-| 只读 SPY Recorder / B2 preflight | Gateway 4002、server time、SPY `conId=756733`、account summary、空状态 broker snapshot、多 client、Gateway restart / `TerminateProcess` 已有直接观测。明确 `OVERNIGHT` 和正式 `RTH+SMART` 的三路行情及 bounded Recorder 写盘均已 PASS；持三路订阅的 production 断网已观察 1100→1102、不重订与三路恢复。当前 13:00 ET 起跑的长跑仍是部分日，不是 Full-RTH 全日 health；1101 未观察。 |
+| 只读 SPY Recorder / B2 preflight | Gateway 4002、server time、SPY `conId=756733`、account summary、空状态 broker snapshot、多 client、Gateway restart / `TerminateProcess` 已有直接观测。`OVERNIGHT` 和 `RTH+SMART` bounded Recorder 已 PASS；持订阅断网已观察 1100→1102。2026-08-12 Full-RTH 尝试约 66 分钟后因错误 full reconnect 后收到 `10197` 而 FAIL；事故后同策略 120 秒 LIVE probe PASS。Full-RTH 仍未完成，1101 未观察。 |
 | 交易型 IB Adapter | 未授权连接下单路径。`placeOrder`、`cancelOrder`、订单身份、完整 callback/error mapping 和非空动态 reconciliation 尚未在真实 Gateway 验证。 |
 | Emergency flatten broker path | 未实现。现有代码只覆盖计划生成与人工确认边界。 |
 
@@ -30,6 +30,7 @@
 - [Gate B2 只读详细证据](docs/GATE_B2_READONLY_20260809.md)
 - [Gate B2 SPY OVERNIGHT 行情与 Recorder 证据](docs/GATE_B2_OVERNIGHT_20260810.md)
 - [Gate B2 SPY RTH 行情与 Recorder 证据](docs/GATE_B2_RTH_20260810.md)
+- [2026-08-12 Full-RTH 提前终止事故报告](docs/INCIDENT_FULL_RTH_20260812_ZH.md)
 - [IB documented-vs-observed 矩阵](docs/DOCUMENTED_VS_OBSERVED.md)
 - [实施状态](docs/IMPLEMENTATION_STATUS.md)
 - [22 条不变量覆盖矩阵](docs/INVARIANT_COVERAGE.md)
