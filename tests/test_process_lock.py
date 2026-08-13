@@ -108,9 +108,18 @@ def test_refusal_reports_the_holder(tmp_path):
     path = tmp_path / "owner.lock"
     holder = _spawn_holder(path)
     try:
+        # Windows interpreter launchers/shims can make Popen.pid differ from
+        # os.getpid() inside the Python process that actually owns the lock.
+        # The refusal contract is that it reports the holder diagnostics the
+        # owner wrote, not the launcher's PID.
+        expected_holder = path.with_name(path.name + ".owner").read_text(
+            encoding="utf-8"
+        ).strip()
         with pytest.raises(ProcessLockUnavailable) as excinfo:
             ProcessLock(path).acquire()
-        assert str(holder.pid) in excinfo.value.holder
+        assert excinfo.value.holder == expected_holder
+        assert "pid=" in excinfo.value.holder
+        assert "holder" in excinfo.value.holder
     finally:
         holder.kill()
         holder.wait(timeout=20)
