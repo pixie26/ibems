@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 from pathlib import Path
 
 from ib_execution.gateway_detection import (
@@ -9,7 +10,19 @@ from ib_execution.gateway_detection import (
     ProcessObservation,
     classify_gateway,
 )
-from scripts import detect_ib_gateway
+
+
+def _load_detector_script():
+    script = Path(__file__).resolve().parents[1] / "scripts" / "detect_ib_gateway.py"
+    spec = importlib.util.spec_from_file_location("detect_ib_gateway", script)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load detector script: {script}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+detect_ib_gateway = _load_detector_script()
 
 EXPECTED = r"D:\tws\ibgateway\ibgateway.exe"
 
