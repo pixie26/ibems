@@ -15,10 +15,11 @@
   长跑，不是 Full-RTH。
 - 2026-08-12 Full-RTH 尝试约 66 分钟后出现三路静默；事故代码在 `evidence_of_life=True` 时错误 full reconnect，随后收到 `10197`，health FAIL、覆盖约 17%。事故后独立 120 秒 probe 又取得三路 LIVE，说明不是持久 entitlement/route 失败。
 - **2026-08-13 P0 recovery 修复已通过 PR #11 合并；P0.5 CI 基线已通过 PR #12 合并。** CI 基线修复后 Windows 完整测试真实执行并通过 `455 passed, 1 skipped`，provenance 与 NTFS safe drill 也通过。
-- **下一只读动作改为直接 Full-RTH 复测。** 不再单独设置 10–20 分钟 smoke gate：昨日缺陷在约 66 分钟后才暴露，短 smoke 对长期 subscription/recovery 行为增量有限，而当前仍严格 Read-Only、paper session、无 broker write。2026-08-13 21:20 HKT 启动 Recorder，程序等待至 21:30 HKT RTH 后订阅并持续至 2026-08-14 04:00 HKT 收盘/finalize。
+- **2026-08-13 Full-RTH 复测因 operator 手动关闭 Codex 而中断。** Owner 已明确确认该动作；Recorder 在三路仍为 LIVE、liveness 正常时于 23:35 HKT 被强制终止，Windows event 217 同时证明其父 Codex Desktop AppX container 被销毁。直接原因不是 P0 recovery 复发或 Recorder 产品故障，而是本轮长时进程依赖了交互式 Codex/AppX 生命周期。独立 Task Scheduler launcher 已实现并完成无 IB 本机探针；下一次必须用新 root/client id 从该 launcher 启动完整 RTH。详见 [`INCIDENT_FULL_RTH_20260813_APPX_TERMINATION_ZH.md`](INCIDENT_FULL_RTH_20260813_APPX_TERMINATION_ZH.md)。
 
 详细事故事实、owner“没有主动登录真实账户”的明确陈述、API log 边界、P0 修复与复测条件见
-[`INCIDENT_FULL_RTH_20260812_ZH.md`](INCIDENT_FULL_RTH_20260812_ZH.md)。Full-RTH 仍未完成。
+[`INCIDENT_FULL_RTH_20260812_ZH.md`](INCIDENT_FULL_RTH_20260812_ZH.md)；2026-08-13 的 AppX 连带终止见
+[`INCIDENT_FULL_RTH_20260813_APPX_TERMINATION_ZH.md`](INCIDENT_FULL_RTH_20260813_APPX_TERMINATION_ZH.md)。Full-RTH 仍未完成。
 
 `STATE.json` 是机器可读权威状态；当前为 `gate_b2=READ_ONLY_IN_PROGRESS`、`order_authorization=NONE`、
 `gate_b1_covers_worktree=false`——即当前这棵树不在任何 attestation 覆盖范围内，B2 全部证据都是在未覆盖
@@ -117,8 +118,9 @@ stall、execution service 强杀、volume failure-domain 判定）不受影响�
 PID 18488 加载的是旧代码，因此必须把“真实旧问题”和“新代码离线修正”分开。
 
 1. `completed orders` 被 Gateway Read-Only policy 阻断；继续需要降低保护，不接受。
-2. overnight 与 RTH bounded 行情均已完成。2026-08-12 Full-RTH 尝试只取得约 17% 覆盖后失败；它验证了
-   开盘至约 10:36 ET 的写盘前缀，但没有覆盖午盘、收盘 cross 或 `finalize_day` 的正常全日路径。P0 recovery 与 CI 基线现已完成，下一步直接 Full-RTH 复测。
+2. overnight 与 RTH bounded 行情均已完成。2026-08-12 Full-RTH 尝试因 recovery 缺陷失败；2026-08-13
+   复测又因父 Codex AppX container 销毁而被强杀。两轮都只有前缀，没有覆盖收盘 cross 或正常
+   `finalize_day`；下一次必须改由独立 Task Scheduler host 启动。
 3. 不应反复断网碰运气；持订阅实验也不得预设必得 1101。官方语义只支持按实际结果区分
    1101（requests lost，需要重订阅）与 1102（requests recovered），不得互相推断。
 4. 非空 broker facts、订单身份、cross-client order visibility 和订单 callback 必须先获得 paper-order 独立授权。
@@ -159,16 +161,15 @@ source、tests、docs 与后续真实 Gateway 证据仍需在最终 freeze 中�
 1. SPY overnight 行情/Recorder 已完成；详细过程见 [`GATE_B2_OVERNIGHT_20260810.md`](GATE_B2_OVERNIGHT_20260810.md)。
 2. 正式 RTH 三路行情与 bounded Recorder 已完成；详细过程见 [`GATE_B2_RTH_20260810.md`](GATE_B2_RTH_20260810.md)。
 3. 保留并索引 2026-08-12 Full-RTH 失败轮；详细见 [`INCIDENT_FULL_RTH_20260812_ZH.md`](INCIDENT_FULL_RTH_20260812_ZH.md)。P0 已修复 scheduler 默认排序、grace-period 假恢复重置、transport-only 三路重订以及 1101/10225 平行 shortcut，并补生产默认矩阵回归；P0.5 已修 CI 基线。
-4. **2026-08-13 21:20 HKT 直接启动完整 Full-RTH。** 默认 `wait_for_rth=True`，因此程序先连接、校验 contract/server time 并在 `WAITING_FOR_SESSION` 等待；21:30 HKT 才订阅，持续至 2026-08-14 04:00 HKT 正常 session end/finalize。不开独立 smoke。
+4. **2026-08-13 21:20 HKT 的完整 Full-RTH 已于 23:35 HKT 被 Codex AppX container teardown 连带终止。** 失败证据保留，不以同日 continuation 补成 PASS。下一次完整 RTH 必须使用新 artifact root、唯一 client id 和独立 Task Scheduler host。
 5. 本轮不做受控断网或其他 fault injection；若自然出现 1101/1102/10225、subscription stale 或 transport idle，则按新 recovery pipeline 被动采证。1101 保持“未观察”也可接受，不为取码反复断网（owner 决定，见 §3.3）。
-6. 本轮启动树锁定为当时最新 `main`；运行前记录 exact commit、`STATE.json` source/config/lock hashes 与 client id。建议命令：
+6. 本轮启动树锁定为当时最新 `main`；运行前记录 exact commit、`STATE.json` source/config/lock hashes 与 client id。下一轮建议命令：
 
 ```powershell
-uv run python -m ib_execution.quote_recorder `
-  --root artifacts/ib_preflight/20260813_full_rth_retest/raw `
-  --port 4002 `
-  --client-id 966 `
-  --status-path artifacts/ib_preflight/20260813_full_rth_retest/recorder-status.json
+.\.venv312\python.exe scripts\start_full_rth_recorder_task.py `
+  --task-name ibems-full-rth-YYYYMMDD `
+  --artifact-root artifacts\ib_preflight\YYYYMMDD_full_rth_task `
+  --client-id NEW_UNIQUE_CLIENT_ID
 ```
 
 7. Full-RTH 只有在全日覆盖、`health_ok=true`、三路 cadence/incident 正常、handler→readback accounting 平衡、`dropped_count=0`、`writer_error=null`、正常 session-end finalize 均成立时才可 PASS。若中途触发 recovery，还需验证实际 plan 与当时 capture/transport evidence 相符。

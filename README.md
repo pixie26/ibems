@@ -144,6 +144,12 @@ Recorder 与交易路径隔离开发，只采集：
   --root data\recordings --port 4002
 ```
 
+上面的直接命令只适合有人看守的 bounded run。完整 RTH 不得从 Codex、IDE 或其他可能被关闭/升级的
+交互式应用后台启动；2026-08-13 Recorder 曾因父 Codex AppX container 销毁而被连带强杀。Windows
+Full-RTH 应使用 [`scripts/start_full_rth_recorder_task.py`](scripts/start_full_rth_recorder_task.py) 交给
+Task Scheduler 独立托管，事故与修复边界见
+[`docs/INCIDENT_FULL_RTH_20260813_APPX_TERMINATION_ZH.md`](docs/INCIDENT_FULL_RTH_20260813_APPX_TERMINATION_ZH.md)。
+
 ## 本项目明确不做什么
 
 | 暂不实现 | 原因 |
