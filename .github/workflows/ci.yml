@@ -73,13 +73,22 @@ jobs:
       - name: Install pinned environment
         run: uv sync --locked --extra dev --extra ib
 
-      - name: Compile and run the complete Windows suite
+      - name: Prepare Windows CI artifact directory
         shell: powershell
-        run: |
-          New-Item -ItemType Directory -Force artifacts/ci | Out-Null
-          uv run python -m compileall -q src tests scripts
-          uv run pytest --junitxml=artifacts/ci/windows-full.xml
-          uv run python -m ib_execution.provenance --check
+        run: New-Item -ItemType Directory -Force artifacts/ci | Out-Null
+
+      # Keep native commands in separate Actions steps. Windows PowerShell does
+      # not reliably stop a multiline block merely because an external process
+      # set a non-zero exit code; a later successful command can otherwise mask
+      # a failed pytest invocation.
+      - name: Byte-compile every source file on Windows
+        run: uv run python -m compileall -q src tests scripts
+
+      - name: Complete Windows test suite
+        run: uv run pytest --junitxml=artifacts/ci/windows-full.xml
+
+      - name: STATE.json describes this Windows worktree
+        run: uv run python -m ib_execution.provenance --check
 
       - name: Run safe real-NTFS publication and process drills
         run: >-
