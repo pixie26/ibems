@@ -17,7 +17,7 @@ jobs:
           fetch-depth: 0
 
       - name: Apply exact P0 recovery patch
-        run: python scripts/_agent_apply_recovery_p0.py
+        run: python scripts/_agent_apply_recovery_p0_v2.py
 
       # Remove bootstrap-only files before provenance is generated. scripts/*.py
       # participates in source_tree_sha256, so leaving the patcher present here
@@ -25,6 +25,7 @@ jobs:
       - name: Remove bootstrap-only files
         run: |
           rm scripts/_agent_apply_recovery_p0.py
+          rm scripts/_agent_apply_recovery_p0_v2.py
           rm .github/workflows/agent-recovery-p0-bootstrap.yml
 
       - name: Install uv
@@ -74,6 +75,7 @@ jobs:
             docs/GATE_B2_STATUS_20260810_ZH.md \
             STATE.json \
             scripts/_agent_apply_recovery_p0.py \
+            scripts/_agent_apply_recovery_p0_v2.py \
             .github/workflows/agent-recovery-p0-bootstrap.yml
           git diff --cached --check
           git commit -m "Fix recorder recovery escalation"
