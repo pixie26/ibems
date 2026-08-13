@@ -1,6 +1,6 @@
 # Full-RTH 只读 Recorder 提前终止事故报告（2026-08-12）
 
-- 状态：**OPEN / Full-RTH 未通过 / 修复尚未实施**
+- 状态：**OPEN / Full-RTH 未通过 / P0 recovery 修复与 CI 基线修复已合并 / 待 2026-08-13 Full-RTH 复测**
 - 事故窗口：`2026-08-12 21:28:47–22:36:44 HKT`（`13:28:47–14:36:44 UTC`）
 - 运行标识：`20260812_full_rth_main_83e9573_v3`，Recorder run id `0313672deb`，API client id `964`
 - 安全边界：IB Gateway paper port `4002`、`readonly=True`、SPY `RTH+SMART`、`research_full`；没有发送、修改或取消订单，没有人为故障注入，`order_authorization=NONE` 不变。
@@ -11,7 +11,7 @@
 
 事故没有产生资本或持仓风险：本轮完全只读，稳定快照为零持仓、零 open orders、零 executions。写盘链本身完整：`1,261,833` 行 accepted/enqueued/persisted/readback 一致，`dropped_count=0`、`writer_error=null`，14 个 gzip segment 均完整。
 
-可以确认的代码缺陷是：`RecoveryScheduler.plan()` 在检查 `evidence_of_life` 之前先消耗默认的两次 fast full-reconnect，因此实现违反了同一文件中“有生命迹象时只修复最小故障”的设计说明。现有测试把 `fast_attempts` 人为设为 `0`，没有覆盖生产默认值，因而没有发现此缺陷。
+可以确认的原始代码缺陷是：`RecoveryScheduler.plan()` 在检查 `evidence_of_life` 之前先消耗默认的两次 fast full-reconnect，因此实现违反了同一文件中“有生命迹象时只修复最小故障”的设计说明。后续复核还发现 grace-period 假恢复会错误重置 backoff，以及 1101/10225 通过平行 shortcut 绕过 scheduler。上述 P0 已于 2026-08-13 修复并合并；事故 FAIL 结论本身不改变。
 
 `10197` 的服务器会话归因仍未闭环。Owner 于 2026-08-13 明确确认：**其本人没有主动登录真实账户；如果 IB 侧存在另一个真实账户会话，并非 owner 主动建立。** 这项陈述应作为 operator testimony 保留；它不能单独证明 IB 服务器当时不存在残留、他端、Client Portal、移动端或误分类会话。当前证据也不能证明凭证被他人使用。
 
@@ -27,7 +27,7 @@
 | 订单、持仓、资本 | 无影响；只读运行，无 broker write |
 | Gate B2 | 仍为 `READ_ONLY_IN_PROGRESS` |
 | Paper/Live order 授权 | 仍为 `NONE` |
-| 后续 Full-RTH | 修复和短时真实 smoke 前不得重跑并宣称可采证据 |
+| 后续 Full-RTH | P0 与 CI 基线均已修复；直接进行完整 Full-RTH 复测，不再单独设置 10–20 分钟 smoke gate |
 
 ## 3. 时间线
 
@@ -99,17 +99,11 @@ Windows System event log 在事故前后 `22:25–22:45 HKT` 没有 sleep、wake
 
 ### 5.1 已确认：恢复计划与设计说明相矛盾
 
-[`RecoveryScheduler`](../src/ib_execution/quote_recorder.py#L1332) 的说明要求“bar 停止而 quotes 仍活跃时，只重订 bar；全部没有生命迹象时才 full reconnect”。但 [`plan()`](../src/ib_execution/quote_recorder.py#L1408) 当前顺序是：
+事故时的 [`RecoveryScheduler`](../src/ib_execution/quote_recorder.py) 在生产默认 `fast_attempts=2` 下先选择 `FULL_RECONNECT`，之后才检查 capture evidence，因此 `evidence_of_life=True` 仍走 socket 重连。这是确定性代码行为，不依赖对 IB 的猜测。2026-08-13 的 P0 修复已把 capture evidence 放到 full reconnect 之前作为 veto。
 
-1. 先检查 `fast_used < fast_attempts`，默认允许 2 次；
-2. 直接返回 `FULL_RECONNECT`；
-3. 之后才检查 `evidence_of_life`。
+### 5.2 已确认：测试没有覆盖生产默认组合；现已补齐
 
-事故中 [`_recover_market_data()`](../src/ib_execution/quote_recorder.py#L1965) 计算出 `evidence_of_life=True`，durable event 也保存了这一值，仍被上述分支送入 full reconnect。这是确定性代码行为，不依赖对 IB 的猜测。
-
-### 5.2 已确认：测试没有覆盖生产默认组合
-
-[`test_live_quotes_veto_a_reconnect_and_get_a_targeted_bar_repair`](../tests/test_market_liveness.py#L572) 把 scheduler 构造为 `fast_attempts=0`，因此绕过了生产默认分支。另一个测试只验证 `evidence_of_life=False` 时默认两次 fast reconnect。缺少的回归组合是：**默认 `fast_attempts=2` + `evidence_of_life=True` 必须拒绝 full reconnect**。
+事故前的测试把 scheduler 构造为 `fast_attempts=0`，因此绕过了生产默认分支。P0 修复已增加生产默认矩阵：capture evidence、transport-only evidence 与全部失活三种组合分别约束为 targeted repair / targeted all-stream repair / bounded full reconnect，并验证只有真实 `BAR_5S` 才能重置 recovery state。
 
 ### 5.3 已确认：这不是整个 socket 立即断开
 
@@ -122,7 +116,7 @@ Windows System event log 在事故前后 `22:25–22:45 HKT` 没有 sleep、wake
 - client callback/event-loop 对不同消息类型的处理差异；
 - 请求/记录时间戳之间的短暂排队。
 
-因此报告不把“IB 上游断流”或“客户端 event loop stall”中的任何一个写成根因。修复前应增加按 request/stream 记录最后 protocol evidence 的诊断，并基于真实 cadence 决定是 targeted bar repair、targeted all-stream resubscribe，还是最后才 full reconnect。
+因此报告不把“IB 上游断流”或“客户端 event loop stall”中的任何一个写成根因。P0 现在按最小修复原则处理：capture 尚活时只修 bars；capture 全 stale 但 transport/L1 尚活时只重建三路 capture；只有 capture 与 transport evidence 都缺失时才允许 full reconnect。
 
 ### 5.4 部分确认：`10197` 是 fatal callback，竞争会话的主体未证实
 
@@ -149,24 +143,48 @@ Recorder durable row 保存了 `IB_ERROR:10197:reqId=3`，随后 prerequisite ch
 | 层级 | 当前结论 | 置信度 |
 |---|---|---|
 | 触发条件 | BAR_5S、BidAsk、AllLast 在约 2 秒内停止；L1 短暂继续 | 高，API plaintext + Recorder 一致 |
-| 放大因素 | scheduler 在 `evidence_of_life=True` 时错误 full reconnect | 高，可由源码和 durable event 确定 |
+| 放大因素 | scheduler 在 `evidence_of_life=True` 时错误 full reconnect | 高，可由事故源码和 durable event 确定；已修复 |
 | 最终终止 | 重连后 reqId 3 收到 fatal `10197`，Recorder fail-closed | 高，Recorder durable evidence；API 第二小文件待导出 |
 | `10197` 会话主体 | 未知；owner 明确没有主动登录 | 未证实 |
 | 原始三路静默归属 | IB、Gateway 或 client 内部路径尚不能区分 | 未证实 |
 | 电脑休眠 / Gateway crash | 与系统和进程证据不符 | 已排除 |
 | 持久 entitlement / route / 参数错误 | 与事故后同策略 LIVE PASS 不符 | 基本排除 |
 
-不作如下反事实声明：如果没有 full reconnect，数据“一定会自行恢复”。现有证据只能证明 full reconnect 违反了既定最小修复策略，并使 Recorder 进入了随后收到 `10197` 的请求路径；不能证明它是 10197 的服务器根因。
+不作如下反事实声明：如果没有 full reconnect，数据“一定会自行恢复”。现有证据只能证明事故时的 full reconnect 违反了既定最小修复策略，并使 Recorder 进入了随后收到 `10197` 的请求路径；不能证明它是 10197 的服务器根因。
 
 ## 7. 整改与重新验证条件
 
-### P0：再次 Full-RTH 前必须完成
+### P0：已完成并合并（2026-08-13）
 
-1. 调整 `RecoveryScheduler.plan()` 的决策顺序：`evidence_of_life=True` 必须先否决 destructive full reconnect；保留全静默时的有界 fast reconnect。
-2. 增加生产默认值回归：默认 `fast_attempts=2` + live evidence 首次只能 `BARS_ONLY`（或经批准的新 targeted plan），不得 `FULL_RECONNECT`。
-3. 复核“只有 L1 活跃、三路采集订阅均 stale”这一新观测，决定是否需要 targeted all-stream resubscribe；在决定前不要把单纯 bars-only 写成已证明充分。
-4. 运行 narrow liveness/resilience tests、affected regression 和 `python -m ib_execution.provenance --check`。
-5. 用当前修复代码执行一次 10–20 分钟只读 smoke；确认 LIVE、三路持续、无意外 full reconnect。该 smoke 不是 Full-RTH PASS。
+1. `RecoveryScheduler.plan()` 已调整：capture evidence 先 veto full reconnect；全静默才允许有界 fast full reconnect。
+2. 已增加生产默认矩阵回归，覆盖默认 `fast_attempts=2`。
+3. 已加入 veto-only `transport_evidence` 与 `ALL_MARKET_STREAMS`：L1/transport 尚活而三路 capture stale 时只重建三路 capture，不动 socket。
+4. `note_recovered()` 只由真实 `BAR_5S` 触发；grace-period `CONTINUE` 不再假重置 fast/backoff state。
+5. 删除 1101/10225 的 `_resubscribe -> ConnectionError` shortcut；统一映射为 `1101 -> ALL_MARKET_STREAMS`、`10225 -> BARS_ONLY`、`1102 -> NONE`。
+6. `10197` 保持 fatal prerequisite。
+7. PR #11 已合并；随后 P0.5 CI 基线 PR #12 修复 `scripts` 测试导入、Windows native exit-code masking，以及由 fail-fast 暴露出的 Windows process-lock 测试假设。最终 PR CI：Linux deterministic/property/provenance PASS；Windows `455 passed, 1 skipped`、provenance PASS、NTFS safe drill PASS。
+
+### P0.5：Full-RTH 复测决策（2026-08-13）
+
+不再单独跑 10–20 分钟 smoke。理由：昨日缺陷在约 66 分钟后才暴露，短 smoke 对长期 subscription/recovery 行为的增量信息有限；同时本轮保持 Gateway Read-Only、paper session、无 broker write，故直接 Full-RTH 的额外资本风险没有增加。Full-RTH 的前 10–20 分钟自然承担 startup smoke 作用，但不单独形成 PASS gate。
+
+计划：**2026-08-13 21:20 HKT 启动 Recorder；程序在 RTH 前保持 `WAITING_FOR_SESSION`，21:30 HKT 开始订阅并持续至 2026-08-14 04:00 HKT 正常收盘/finalize。** 不做故障注入，不为取得 1101 人为断网。
+
+拟运行树：当前 `main` `fda71cc4bdfad5052ac3c270ec1607140011ba36`；`STATE.json` 仍明确 `gate_b2=READ_ONLY_IN_PROGRESS`、`order_authorization=NONE`、`gate_b1_covers_worktree=false`。
+
+建议命令（client id 必须与其他 API client 不冲突）：
+
+```powershell
+uv run python -m ib_execution.quote_recorder `
+  --root artifacts/ib_preflight/20260813_full_rth_retest/raw `
+  --port 4002 `
+  --client-id 966 `
+  --status-path artifacts/ib_preflight/20260813_full_rth_retest/recorder-status.json
+```
+
+启动后正常行为是先显示/写入 `WAITING_FOR_SESSION`，到 RTH 才订阅。运行期间不要人为关闭进程来“帮它恢复”；targeted recovery 应由新逻辑自行处理。若出现 `10197`，继续按 fatal/fail-closed 终止并保存证据，不改成无限重试。
+
+Full-RTH PASS 至少要求：全 RTH 覆盖完成；`health_ok=true`；BidAsk/AllLast/BAR_5S 全程有合理 cadence；无未闭合 `FEED_OUTAGE`/`GAP_SUSPECTED`；handler→selected→enqueued→persisted→readback accounting 一致；`dropped_count=0`、`writer_error=null`；正常执行 session-end cancel/disconnect 与 finalize；若中途触发 recovery，则实际 plan 与 capture/transport evidence 相符。
 
 ### P1：证据闭环
 
@@ -183,13 +201,13 @@ Recorder durable row 保存了 `IB_ERROR:10197:reqId=3`，随后 prerequisite ch
 
 ## 8. 当前状态
 
-- `verified`：Full-RTH 失败；三路尾部时间；写盘完整；scheduler 决策缺陷；`10197` durable callback；事故后 LIVE probe；无 sleep/Gateway restart。
+- `verified`：2026-08-12 Full-RTH 失败；三路尾部时间；写盘完整；事故 scheduler 决策缺陷；`10197` durable callback；事故后 LIVE probe；无 sleep/Gateway restart；P0 recovery 代码与 P0.5 CI 基线已合并且 CI 通过。
 - `partially verified`：10197 符合 IB competing-session 语义，但最终 4KB API plaintext 尚缺。
-- `not verified`：谁或什么持有 competing session；三路最初静默位于 IB、Gateway 还是 client 的具体边界；无 full reconnect 时是否会自行恢复。
-- corrective code：**未修改**。
-- Full-RTH：**未通过，待修复后另日重跑**。
+- `not verified`：谁或什么持有 competing session；三路最初静默位于 IB、Gateway 还是 client 的具体边界；修复后的 Full-RTH 长时行为。
+- corrective code：**已合并**；PR #11 recovery + PR #12 CI baseline。
+- Full-RTH：**未通过，2026-08-13 21:20 HKT 直接启动完整复测。**
 
-## 8. Amendment：P0 recovery 修复实现（2026-08-13）
+## 9. Amendment：P0 recovery 修复实现（2026-08-13）
 
 后续代码复核确认事故报告 §5.1 之外还有两条独立生产缺陷：
 
@@ -205,5 +223,4 @@ Recorder durable row 保存了 `IB_ERROR:10197:reqId=3`，随后 prerequisite ch
 重建 BidAsk / AllLast / BAR_5S 三路订阅，不动 socket 或 L1 probe。只有 capture 与 transport evidence 都缺失
 时才允许 full reconnect。`10197` 继续保持 fatal prerequisite，不改成自动无限重试。
 
-本 amendment 只说明 P0 代码与离线回归的整改范围；**不改变本次事故 FAIL，不构成 Full-RTH PASS，也不替代
-修复后的 10–20 分钟真实只读 smoke。**
+本 amendment 只说明 P0 代码与离线回归的整改范围；**不改变 2026-08-12 事故 FAIL。真实验证由 2026-08-13 Full-RTH 复测承担。**
