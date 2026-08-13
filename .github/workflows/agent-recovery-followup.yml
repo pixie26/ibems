@@ -1,0 +1,76 @@
+name: agent-recovery-followup
+
+on:
+  push:
+    branches: [agent/recovery-p0-unified]
+
+permissions:
+  contents: write
+
+jobs:
+  apply-verify-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply 1102 follow-up
+        run: python scripts/_agent_recovery_followup.py
+
+      - name: Remove bootstrap-only files
+        run: |
+          rm scripts/_agent_recovery_followup.py
+          rm .github/workflows/agent-recovery-followup.yml
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install pinned environment
+        run: uv sync --locked --extra dev --extra ib
+
+      - name: Regenerate provenance
+        run: uv run python -m ib_execution.provenance
+
+      - name: Compile
+        run: uv run python -m compileall -q src tests scripts
+
+      - name: Targeted recovery regressions
+        run: >-
+          uv run pytest -q
+          tests/test_recovery_p0_regressions.py
+          tests/test_market_liveness.py
+
+      - name: Affected deterministic regression
+        run: >-
+          uv run pytest -m "not property" -q
+          --ignore=tests/test_gateway_detection.py
+
+      - name: Affected property regression
+        run: >-
+          uv run pytest -m property -q
+          --ignore=tests/test_gateway_detection.py
+
+      - name: Verify provenance and diff
+        run: |
+          uv run python -m ib_execution.provenance --check
+          git diff --check
+          git status --short
+          git diff --stat
+
+      - name: Commit verified follow-up
+        run: |
+          git config user.name "openai-agent"
+          git config user.email "noreply@openai.com"
+          git add -A -- \
+            src/ib_execution/market_liveness.py \
+            tests/test_recovery_p0_regressions.py \
+            STATE.json \
+            scripts/_agent_recovery_followup.py \
+            .github/workflows/agent-recovery-followup.yml
+          git diff --cached --check
+          git commit -m "Honor 1102 maintained subscriptions"
+          git push origin HEAD:agent/recovery-p0-unified
