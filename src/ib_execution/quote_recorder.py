@@ -83,6 +83,7 @@ from .market_liveness import (
     LivenessAction,
     LivenessIncidentTracker,
     MarketLiveness,
+    RecoveryHint,
 )
 from .processlock import ProcessLock, ProcessLockUnavailable
 from .recorder_modes import CapturePolicy, DataMode
@@ -1326,6 +1327,9 @@ class RecoveryPlan(Enum):
     #: Re-request only the bar stream. The socket and both tick-by-tick
     #: subscriptions are left untouched, so this costs no quote data.
     BARS_ONLY = "bars_only"
+    #: Rebuild the three capture subscriptions while preserving the proven-live
+    #: socket and ordinary L1 probe.
+    ALL_MARKET_STREAMS = "all_market_streams"
     FULL_RECONNECT = "full_reconnect"
 
 
@@ -1377,7 +1381,9 @@ class RecoveryScheduler:
         self.slow_base_seconds = float(slow_base_seconds)
         self.slow_max_seconds = float(slow_max_seconds)
         self.fast_used = 0
+        self.fast_full_attempts = 0
         self.bars_only_attempts = 0
+        self.all_market_stream_attempts = 0
         self.slow_full_attempts = 0
         self._slow_delay = float(slow_base_seconds)
         self._next_bars: Optional[float] = None
@@ -1405,19 +1411,52 @@ class RecoveryScheduler:
         if now_mono is not None and self._next_full is not None:
             self._next_full = min(self._next_full, now_mono + self.slow_base_seconds)
 
-    def plan(self, *, evidence_of_life: bool, now_mono: float) -> RecoveryPlan:
-        if self.fast_used < self.fast_attempts:
-            self.fast_used += 1
-            self._next_full = now_mono + self._slow_delay
-            self._next_bars = now_mono + self.bars_only_seconds
-            return RecoveryPlan.FULL_RECONNECT
+    def _targeted(self, plan: RecoveryPlan, now_mono: float) -> RecoveryPlan:
+        self._next_bars = now_mono + self.bars_only_seconds
+        if plan is RecoveryPlan.BARS_ONLY:
+            self.bars_only_attempts += 1
+        elif plan is RecoveryPlan.ALL_MARKET_STREAMS:
+            self.all_market_stream_attempts += 1
+        else:  # pragma: no cover - internal contract
+            raise ValueError(f"not a targeted recovery plan: {plan}")
+        return plan
 
+    def plan(
+        self,
+        *,
+        evidence_of_life: bool,
+        now_mono: float,
+        transport_evidence: bool = False,
+        requested_plan: RecoveryPlan | None = None,
+    ) -> RecoveryPlan:
+        # Explicit IB semantics outrank inference.  1101 says all market-data
+        # requests were lost; 10225 says the real-time bars alone were reset.
+        if requested_plan is not None:
+            return self._targeted(requested_plan, now_mono)
+
+        # Any capture event inside the heartbeat window proves at least one of
+        # the three subscriptions is alive.  Never tear down a working socket
+        # before trying the smallest repair.  This check must precede the fast
+        # full-reconnect allowance -- the 2026-08-12 incident proved why.
         if evidence_of_life:
             if self._next_bars is None or now_mono >= self._next_bars:
-                self._next_bars = now_mono + self.bars_only_seconds
-                self.bars_only_attempts += 1
-                return RecoveryPlan.BARS_ONLY
+                return self._targeted(RecoveryPlan.BARS_ONLY, now_mono)
             return RecoveryPlan.NONE
+
+        # The three capture streams may all be stale while TWS is demonstrably
+        # still talking (the incident's L1 request 3 did exactly this).  That
+        # evidence is veto-only: rebuild the capture subscriptions, not the
+        # socket.  It can never initiate recovery without a liveness fault.
+        if transport_evidence:
+            if self._next_bars is None or now_mono >= self._next_bars:
+                return self._targeted(RecoveryPlan.ALL_MARKET_STREAMS, now_mono)
+            return RecoveryPlan.NONE
+
+        if self.fast_used < self.fast_attempts:
+            self.fast_used += 1
+            self.fast_full_attempts += 1
+            self._next_full = now_mono + self._slow_delay
+            return RecoveryPlan.FULL_RECONNECT
 
         if self._next_full is None or now_mono >= self._next_full:
             self.slow_full_attempts += 1
@@ -1432,7 +1471,9 @@ class RecoveryScheduler:
             "bars_only_seconds": self.bars_only_seconds,
             "slow_base_seconds": self.slow_base_seconds,
             "slow_max_seconds": self.slow_max_seconds,
+            "fast_full_reconnect_attempts": self.fast_full_attempts,
             "bars_only_attempts": self.bars_only_attempts,
+            "all_market_stream_attempts": self.all_market_stream_attempts,
             "slow_full_reconnect_attempts": self.slow_full_attempts,
             "exits_on_unexplained_silence": False,
         }
@@ -1635,7 +1676,6 @@ class QuoteRecorder:
         self._connection_epoch = 0
         self._market_data_type = "UNKNOWN"
         self._clock_skew_samples: list[float] = []
-        self._resubscribe = False
         self._fatal_prerequisite_error: Optional[str] = None
         self._intentional_disconnect = False
         self._limiter = SubscriptionLimiter()
@@ -1681,6 +1721,11 @@ class QuoteRecorder:
         now = time.monotonic()
         self._last_handled_mono[event_type] = now
         self.liveness.note_event(event_type, now)
+        # Only a real time-driven heartbeat is positive recovery evidence.
+        # A grace-period CONTINUE, a quote, or an L1 update must never reset
+        # reconnect/backoff state.
+        if event_type == HEARTBEAT_STREAM:
+            self.recovery.note_recovered()
 
     def stream_staleness(self, now_mono: Optional[float] = None) -> dict[str, float]:
         """Over-threshold ages of the *event-driven* streams. Report only.
@@ -1921,6 +1966,15 @@ class QuoteRecorder:
             detail=f"market_data_generic_ticks={generic_ticks!r}",
         )
         probe = ib.reqMktData(contract, generic_ticks, False, False)
+
+        def on_probe_update(_updated) -> None:
+            # Ordinary L1 is event-driven, so silence here proves nothing.
+            # Arrival proves only transport life and is therefore veto-only.
+            now = time.monotonic()
+            self.liveness.note_transport_activity()
+            self.recovery.note_activity(now)
+
+        probe.updateEvent += on_probe_update
         probe.marketDataType = 0  # distinguish an actual callback from ib_async's default
         deadline = time.monotonic() + 10.0
         while int(probe.marketDataType) == 0 and time.monotonic() < deadline:
@@ -1949,29 +2003,41 @@ class QuoteRecorder:
         self._wire_bars(bars)
         return probe, (bidask_ticker, alllast_ticker), bars
 
-    def _recover_market_data(self, ib, contract, bars, state):
+    def _recover_market_data(self, ib, contract, tickers, bars, state):
         """Attempt the smallest repair that could fix what is broken.
 
-        Returns the bar handle to keep using. Raises
-        :class:`SlowRecoveryReconnect` when a full reconnect is due; the
-        session loop reconnects and does *not* charge it to the reconnect
-        budget, because this path is paced by its own backoff rather than by
-        a crash-loop cap. Nothing here ever ends the session.
+        Returns ``(tickers, bars)`` handles to keep using. Raises
+        :class:`SlowRecoveryReconnect` only when both capture and transport
+        evidence are absent; targeted repairs preserve the socket. Nothing
+        here ever ends the session.
         """
         now = time.monotonic()
         last_any = self.liveness.last_market_event_age(now)
-        # Anything arriving inside one heartbeat window proves the socket and
-        # at least one subscription are alive, whatever the bar clock says.
+        # Event-driven streams are allowed to veto destruction but never to
+        # create a fault.  The time-driven bar heartbeat remains the trigger.
         evidence_of_life = (
             last_any is not None and last_any <= self.config.bar_heartbeat_timeout_seconds
         )
-        plan = self.recovery.plan(evidence_of_life=evidence_of_life, now_mono=now)
+        transport_evidence = self.liveness.transport_evidence()
+        requested_plan = (
+            RecoveryPlan(state.recovery_hint.value)
+            if state.recovery_hint is not None
+            else None
+        )
+        plan = self.recovery.plan(
+            evidence_of_life=evidence_of_life,
+            transport_evidence=transport_evidence,
+            requested_plan=requested_plan,
+            now_mono=now,
+        )
         if plan is RecoveryPlan.NONE:
-            return bars
+            return tickers, bars
         self._append(
             "SYSTEM", datetime.now(timezone.utc), contract_id=contract.conId,
             special_conditions=(
                 f"RECOVERY_ATTEMPT:plan={plan.value};evidence_of_life={evidence_of_life};"
+                f"transport_evidence={transport_evidence};"
+                f"requested_plan={'none' if requested_plan is None else requested_plan.value};"
                 f"last_event_age={'unknown' if last_any is None else f'{last_any:.1f}s'};"
                 f"reason={state.reason}"
             ),
@@ -1979,8 +2045,39 @@ class QuoteRecorder:
         if plan is RecoveryPlan.FULL_RECONNECT:
             raise SlowRecoveryReconnect(f"market data not live: {state.reason}")
 
-        # Quotes are still flowing, so tearing down the socket would destroy
-        # working data to repair one stream. Re-request just the bars.
+        if plan is RecoveryPlan.ALL_MARKET_STREAMS:
+            for tick_type in ("BidAsk", "AllLast"):
+                try:
+                    ib.cancelTickByTickData(contract, tick_type)
+                except Exception as exc:
+                    self._append(
+                        "SYSTEM", datetime.now(timezone.utc), contract_id=contract.conId,
+                        special_conditions=(
+                            f"RECOVERY_CANCEL_{tick_type.upper()}_FAILED:"
+                            f"{type(exc).__name__}:{exc}"
+                        ),
+                    )
+            try:
+                ib.cancelRealTimeBars(bars)
+            except Exception as exc:
+                self._append(
+                    "SYSTEM", datetime.now(timezone.utc), contract_id=contract.conId,
+                    special_conditions=f"RECOVERY_CANCEL_BARS_FAILED:{type(exc).__name__}:{exc}",
+                )
+
+            self._limiter.wait(ib.sleep)
+            bidask = ib.reqTickByTickData(contract, "BidAsk", 0, False)
+            self._limiter.wait(ib.sleep)
+            alllast = ib.reqTickByTickData(contract, "AllLast", 0, False)
+            self._limiter.wait(ib.sleep)
+            refreshed_bars = ib.reqRealTimeBars(contract, 5, "TRADES", True)
+            self._wire_ticker(bidask)
+            self._wire_ticker(alllast)
+            self._wire_bars(refreshed_bars)
+            return (bidask, alllast), refreshed_bars
+
+        # At least one capture stream is still fresh, or IB explicitly told us
+        # that only real-time bars were reset. Re-request just the bars.
         try:
             ib.cancelRealTimeBars(bars)
         except Exception as exc:  # an already-dead subscription is fine to lose
@@ -1991,7 +2088,7 @@ class QuoteRecorder:
         self._limiter.wait(ib.sleep)
         refreshed = ib.reqRealTimeBars(contract, 5, "TRADES", True)
         self._wire_bars(refreshed)
-        return refreshed
+        return tickers, refreshed
 
     def _finalize(self, session) -> dict[str, Any]:
         assert self.log is not None
@@ -2128,8 +2225,6 @@ class QuoteRecorder:
                         self.liveness.note_halt_state_unavailable(
                             f"IB rejected the market-data request ({code}): {message}"
                         )
-                    if code in {1101, 10225}:
-                        self._resubscribe = True
                     if self._is_fatal_market_data_error(code, message):
                         self._fatal_prerequisite_error = (
                             f"IB market-data prerequisite failed ({code}): {message}"
@@ -2170,7 +2265,7 @@ class QuoteRecorder:
                     self._pulse(phase="WAITING_FOR_SESSION")
                     self._raise_if_fatal_error()
 
-                probe, _tickers, bars = self._subscribe(ib, contract)
+                probe, tickers, bars = self._subscribe(ib, contract)
                 last_mdt = None
                 last_halted = float("nan")
                 last_server_probe = time.monotonic()
@@ -2217,9 +2312,9 @@ class QuoteRecorder:
                             special_conditions=marker,
                         )
                     if state.action is LivenessAction.RECOVER_SUBSCRIPTION:
-                        bars = self._recover_market_data(ib, contract, bars, state)
-                    elif state.action is LivenessAction.CONTINUE:
-                        self.recovery.note_recovered()
+                        tickers, bars = self._recover_market_data(
+                            ib, contract, tickers, bars, state
+                        )
                     mdt = int(probe.marketDataType)
                     if mdt != last_mdt:
                         self._market_data_type = self.DATA_TYPE.get(mdt, f"UNKNOWN:{mdt}")
@@ -2228,12 +2323,6 @@ class QuoteRecorder:
                             special_conditions=f"MARKET_DATA_TYPE:{self._market_data_type}",
                         )
                         last_mdt = mdt
-                    if self._resubscribe:
-                        self._append(
-                            "SYSTEM", datetime.now(timezone.utc), contract_id=contract.conId,
-                            special_conditions="RESUBSCRIBE_REQUIRED",
-                        )
-                        raise ConnectionError("subscription reset required")
                     if time.monotonic() - last_server_probe >= 60:
                         self._clock_skew_samples.extend(
                             measure_clock_skew(ib, samples=3, pulse=self._pulse)
@@ -2321,7 +2410,6 @@ class QuoteRecorder:
                 while time.monotonic() < deadline:
                     self._pulse(phase="RECONNECT_BACKOFF")
                     time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
-                self._resubscribe = False
 
 
 def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - operator CLI
