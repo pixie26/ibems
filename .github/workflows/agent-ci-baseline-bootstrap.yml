@@ -1,0 +1,52 @@
+name: agent-ci-baseline-bootstrap
+
+on:
+  push:
+    branches: [agent/fix-ci-baseline]
+
+permissions:
+  contents: write
+
+jobs:
+  regenerate-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install pinned environment
+        run: uv sync --locked --extra dev --extra ib
+
+      - name: Remove bootstrap workflow from final tree
+        run: git rm .github/workflows/agent-ci-baseline-bootstrap.yml
+
+      - name: Regenerate provenance
+        run: uv run python -m ib_execution.provenance
+
+      - name: Compile
+        run: uv run python -m compileall -q src tests scripts
+
+      - name: Deterministic suite
+        run: uv run pytest -m "not property"
+
+      - name: Property suite
+        run: uv run pytest -m property
+
+      - name: Verify provenance and diff
+        run: |
+          uv run python -m ib_execution.provenance --check
+          git diff --check
+
+      - name: Commit verified provenance
+        run: |
+          git config user.name "openai-agent"
+          git config user.email "noreply@openai.com"
+          git add STATE.json
+          git diff --cached --check
+          git commit -m "Regenerate provenance for Windows CI baseline fix"
+          git push origin HEAD:${GITHUB_REF_NAME}
