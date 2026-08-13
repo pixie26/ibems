@@ -80,7 +80,7 @@ jobs:
       # Keep native commands in separate Actions steps. Windows PowerShell does
       # not reliably stop a multiline block merely because an external process
       # set a non-zero exit code; a later successful command can otherwise mask
-      # a failed pytest invocation.
+      # a failed pytest invocation. Separate steps preserve each native exit code.
       - name: Byte-compile every source file on Windows
         run: uv run python -m compileall -q src tests scripts
 
