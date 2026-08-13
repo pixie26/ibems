@@ -52,7 +52,7 @@ B2 freeze 时仍需统一机器状态、源码、文档和证据。
 | RTH handler→raw readback 一致性 | 已完成 | 2026-08-11 `8972/1707/25` handler counts 与 raw readback 逐项相等 | 直接关闭该窗口 handler 后写路径丢失；旧顺序窗口约 40% 差异不是有效测量，不再安排同步 A/B |
 | Liveness incident 去重 | 代码/测试完成 | poll 级重复 marker 改为 START/UPDATE/60s CHECKPOINT/END；恢复 END 必须晚于 incident 后首个 BAR_5S | 旧真实 run 有 380 条重复 marker；新实现尚未在真实 Gateway fault 上复测 |
 | 停牌态 generic tick 49 | 已证伪，不可得 | Gateway 对 STK 返回 error 321，整个 `reqMktData` 拿不到 LIVE 回调、三路归零 | 默认已改回不请求（`market_data_generic_ticks=""`）；抑制器因此无输入，manifest 用 `halt_state_available` 明示，读者不得把"无 halt marker"读成"未停牌" |
-| 未解释静默的恢复策略 | **发现生产默认组合缺陷，待修复** | 设计要求有生命迹象时只做最小修复，但 `plan()` 先消耗 fast full-reconnect；真实 run 已记录 `evidence_of_life=True` 仍 full reconnect | 测试使用 `fast_attempts=0` 隐藏了默认值缺陷；修复和真实 smoke 前不得再次投入 Full-RTH |
+| 未解释静默的恢复策略 | **P0 代码修复完成，待真实 smoke** | 默认 `fast_attempts=2` 下 capture 生命迹象先 veto full reconnect；真实 BAR 才重置 backoff；transport-only 时只重建三路 capture；1101/10225 已统一进入同一 recovery pipeline | 新回归覆盖生产默认矩阵；仍必须先做 10–20 分钟真实只读 smoke，Full-RTH 继续未完成 |
 | 丢覆盖时的 health 真实性 | 代码/测试完成 | `FEED_OUTAGE`/`GAP_SUSPECTED` 及收盘时未闭合的 incident 均使 `health_ok=false`；`EXPECTED_SILENCE` 单独不失败 | 这是"不退出"的配套约束：进程不再用退出报警，改由 health 报警 |
 | Parquet 内容保真 | 已完成（离线） | 分级价格、超 2^53 纳秒墙钟、带偏移与微秒的 broker timestamp、`special_conditions` 反解、跨段 event_id 顺序、空字段保持 null，逐值相等 | 此前只验行数与 schema，二者在四舍五入/丢时区/乱序下均会通过；本项用合成但真实形态的 tick，不替代真实 tick 复核 |
 | 强杀后重启续跑 | 已完成（离线） | 强杀 → 后继取新 run_id 续录 → `finalize_day` 折叠为单文件，4 行 / 2 个 run_id，且该日仍判 `health_ok=false` | 端到端覆盖了此前只测到"前缀可读"的缝 |
@@ -157,8 +157,8 @@ source、tests、docs 与后续真实 Gateway 证据仍需在最终 freeze 中�
 1. SPY overnight 行情/Recorder 已完成；详细过程见 [`GATE_B2_OVERNIGHT_20260810.md`](GATE_B2_OVERNIGHT_20260810.md)。
 2. 正式 RTH 三路行情与 bounded Recorder 已完成；详细过程见 [`GATE_B2_RTH_20260810.md`](GATE_B2_RTH_20260810.md)。
 3. 保留并索引 2026-08-12 Full-RTH 失败轮；详细见
-   [`INCIDENT_FULL_RTH_20260812_ZH.md`](INCIDENT_FULL_RTH_20260812_ZH.md)。先修复 scheduler 在生产默认
-   `fast_attempts=2` + `evidence_of_life=True` 时错误 full reconnect 的分支，并补足回归测试。
+   [`INCIDENT_FULL_RTH_20260812_ZH.md`](INCIDENT_FULL_RTH_20260812_ZH.md)。P0 已修复 scheduler 默认排序、
+   grace-period 假恢复重置、transport-only 三路重订以及 1101/10225 平行 shortcut，并补生产默认矩阵回归。
 4. 修复后做一次 **10–20 分钟只读冒烟跑**：确认 LIVE、三路持续、`halt_state_available=false`，且有生命
    迹象时不会 full reconnect。事故后的 120 秒 probe 已证明当前 entitlement/route 可用，但不能替代修复后 smoke。
 5. 再做一次受控断网，跑在修复后的代码上，验证 incident 生命周期与恢复策略。

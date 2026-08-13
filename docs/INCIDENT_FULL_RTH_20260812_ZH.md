@@ -188,3 +188,22 @@ Recorder durable row 保存了 `IB_ERROR:10197:reqId=3`，随后 prerequisite ch
 - `not verified`：谁或什么持有 competing session；三路最初静默位于 IB、Gateway 还是 client 的具体边界；无 full reconnect 时是否会自行恢复。
 - corrective code：**未修改**。
 - Full-RTH：**未通过，待修复后另日重跑**。
+
+## 8. Amendment：P0 recovery 修复实现（2026-08-13）
+
+后续代码复核确认事故报告 §5.1 之外还有两条独立生产缺陷：
+
+1. 主循环把任何 `LivenessAction.CONTINUE` 都当成恢复并调用 `note_recovered()`。重连后的 12 秒 grace
+   period 即使一条新 `BAR_5S` 都没收到也会返回 `CONTINUE`，因此 `fast_used` 会被反复清零，持续故障下
+   slow backoff 可能永远无法启动。修复后只有真实 `BAR_5S` handler 才能重置 recovery state。
+2. `1101` 与 `10225` 原先通过 `_resubscribe -> ConnectionError` 的平行 shortcut 无条件做 socket 级重连，
+   完全绕过 `RecoveryScheduler`。修复后删除该 shortcut：`1101 -> ALL_MARKET_STREAMS`、
+   `10225 -> BARS_ONLY`、`1102 -> NONE`，统一进入一条 recovery pipeline。
+
+同时增加 veto-only `transport_evidence`：普通 L1/其他 inbound activity 只能证明当前 transport 尚活，不能因
+自身沉默触发任何动作；当三路 capture 都 stale 但 transport 尚有证据时，新增 `ALL_MARKET_STREAMS` 仅取消并
+重建 BidAsk / AllLast / BAR_5S 三路订阅，不动 socket 或 L1 probe。只有 capture 与 transport evidence 都缺失
+时才允许 full reconnect。`10197` 继续保持 fatal prerequisite，不改成自动无限重试。
+
+本 amendment 只说明 P0 代码与离线回归的整改范围；**不改变本次事故 FAIL，不构成 Full-RTH PASS，也不替代
+修复后的 10–20 分钟真实只读 smoke。**
