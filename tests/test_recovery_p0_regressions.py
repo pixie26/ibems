@@ -136,6 +136,26 @@ def test_1101_10225_and_1102_map_to_one_recovery_pipeline():
     assert state_1102.recovery_hint is None
 
 
+def test_1102_clears_a_timeout_pending_behind_1100():
+    liveness = MarketLiveness()
+    liveness.subscription_started(0.0)
+    # Keep the independent BAR heartbeat inside its 12s threshold so this test
+    # isolates the pending recovery created behind 1100.
+    liveness.note_event("BAR_5S", 50.0)
+    liveness.note_status(1100, "Connectivity lost")
+    liveness.note_transport_idle(60.0)
+
+    # The known 1100 outage suppresses the timeout recovery while disconnected.
+    assert liveness.assess(60.1).action is LivenessAction.WAIT
+
+    # 1102 says subscriptions were maintained.  The timeout pending from the
+    # outage must not leak through and trigger a synthetic resubscribe now.
+    liveness.note_status(1102, "Connectivity restored - data maintained")
+    restored = liveness.assess(60.2)
+    assert restored.action is LivenessAction.CONTINUE
+    assert restored.recovery_hint is None
+
+
 class _FakeIB:
     def __init__(self):
         self.cancelled = []

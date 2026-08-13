@@ -477,6 +477,10 @@ class MarketLiveness:
             )
         elif code == CONNECTIVITY_RESTORED_DATA_KEPT:
             self._outages.pop(CONNECTIVITY_LOST, None)
+            # 1102 explicitly says market-data requests were maintained.  A
+            # pending timeout recorded while 1100 was suppressing recovery must
+            # not leak through after restoration and manufacture a resubscribe.
+            self._pending_recover = None
         elif code == REALTIME_BARS_RESET:
             self._pending_recover = (
                 LivenessIncidentKind.GAP_SUSPECTED,
