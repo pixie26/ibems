@@ -19,5 +19,10 @@ new = """replace_once(
 if text.count(old) != 1:
     raise RuntimeError(f"expected one generic _resubscribe patch block, got {text.count(old)}")
 text = text.replace(old, new, 1)
+old_eof = '''incident.write_text(incident_text.rstrip() + amendment + "\\n", encoding="utf-8", newline="\\n")'''
+new_eof = '''incident.write_text(incident_text.rstrip() + amendment.rstrip() + "\\n", encoding="utf-8", newline="\\n")'''
+if text.count(old_eof) != 1:
+    raise RuntimeError(f"expected one incident EOF writer, got {text.count(old_eof)}")
+text = text.replace(old_eof, new_eof, 1)
 code = compile(text, str(path), "exec")
 exec(code, {"__file__": str(path), "__name__": "__main__"})
