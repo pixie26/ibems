@@ -13,13 +13,12 @@
 - 2026-08-12 已在真实 `QuoteRecorder.run()` 持有三路订阅时执行一次经授权的 45 秒 outbound block，
   直接观察 1100→1102、不重订阅和三路自动恢复；1101 仍未观察。该进程约 13:00 ET 才启动，属于部分日
   长跑，不是 Full-RTH。
+- 2026-08-12 Full-RTH 尝试约 66 分钟后出现三路静默；事故代码在 `evidence_of_life=True` 时错误 full reconnect，随后收到 `10197`，health FAIL、覆盖约 17%。事故后独立 120 秒 probe 又取得三路 LIVE，说明不是持久 entitlement/route 失败。
+- **2026-08-13 P0 recovery 修复已通过 PR #11 合并；P0.5 CI 基线已通过 PR #12 合并。** CI 基线修复后 Windows 完整测试真实执行并通过 `455 passed, 1 skipped`，provenance 与 NTFS safe drill 也通过。
+- **下一只读动作改为直接 Full-RTH 复测。** 不再单独设置 10–20 分钟 smoke gate：昨日缺陷在约 66 分钟后才暴露，短 smoke 对长期 subscription/recovery 行为增量有限，而当前仍严格 Read-Only、paper session、无 broker write。2026-08-13 21:20 HKT 启动 Recorder，程序等待至 21:30 HKT RTH 后订阅并持续至 2026-08-14 04:00 HKT 收盘/finalize。
 
-- **2026-08-13 Amendment：原“当前 `main` 从未接触过 Gateway”的状态已失效。** commit `83e9573` 已于
-  2026-08-12 运行一次 Full-RTH 尝试：约 66 分钟后出现三路静默，`RecoveryScheduler` 在 durable event
-  明确记录 `evidence_of_life=True` 时仍错误选择 full reconnect，随后新行情请求收到 `10197`，最终 health
-  FAIL、覆盖约 17%。事故后独立 120 秒 probe 又取得三路 LIVE，说明不是持久 entitlement/route 失败。
-  详细事实、owner“没有主动登录真实账户”的明确陈述、API log 边界及整改条件见
-  [`INCIDENT_FULL_RTH_20260812_ZH.md`](INCIDENT_FULL_RTH_20260812_ZH.md)。Full-RTH 仍未完成。
+详细事故事实、owner“没有主动登录真实账户”的明确陈述、API log 边界、P0 修复与复测条件见
+[`INCIDENT_FULL_RTH_20260812_ZH.md`](INCIDENT_FULL_RTH_20260812_ZH.md)。Full-RTH 仍未完成。
 
 `STATE.json` 是机器可读权威状态；当前为 `gate_b2=READ_ONLY_IN_PROGRESS`、`order_authorization=NONE`、
 `gate_b1_covers_worktree=false`——即当前这棵树不在任何 attestation 覆盖范围内，B2 全部证据都是在未覆盖
@@ -48,11 +47,12 @@ B2 freeze 时仍需统一机器状态、源码、文档和证据。
 | 持三路订阅受控断网 + production `run()` | 部分完成 | 真实 1100→1102；connection epoch 保持 1；未重订；1102 后 BidAsk/AllLast/BAR_5S 分别约 0.264/0.267/0.896 秒恢复本地接收 | 未观察 1101；新 incident 去重代码是在本轮后加入，尚未真实复测 |
 | SPY overnight 三路行情 / Recorder | 已完成 | 正确 `OVERNIGHT` route：preflight `1620/13/25`；落盘 Recorder `923/16/25`，两轮均 PASS | 只证明 overnight；不是 RTH 或 Full-RTH health report |
 | SPY RTH BidAsk / AllLast / 5s bars / Recorder | 已完成 | preflight 120.109 秒 `25665/3168/25`；Recorder 120.360 秒落盘 `15590/2843/25`，均为 LIVE | bounded 两分钟证据；不是 Full-RTH 全日 health |
-| SPY Full-RTH 全日 health | **失败，未完成** | commit `83e9573` 从开盘起取得约 66 分钟三路 LIVE；随后 `evidence_of_life=True` 时错误 full reconnect，新请求收到 `10197`，health FAIL、覆盖约 17% | 失败证据保留；不得把前缀非零升级为 Full-RTH PASS；见事故报告 |
+| SPY Full-RTH 全日 health | **失败，未完成；待 2026-08-13 复测** | commit `83e9573` 从开盘起取得约 66 分钟三路 LIVE；随后事故代码错误 full reconnect，新请求收到 `10197`，health FAIL、覆盖约 17% | 失败证据保留；P0 已修复，但 Full-RTH 必须重新实测才能升级 |
 | RTH handler→raw readback 一致性 | 已完成 | 2026-08-11 `8972/1707/25` handler counts 与 raw readback 逐项相等 | 直接关闭该窗口 handler 后写路径丢失；旧顺序窗口约 40% 差异不是有效测量，不再安排同步 A/B |
 | Liveness incident 去重 | 代码/测试完成 | poll 级重复 marker 改为 START/UPDATE/60s CHECKPOINT/END；恢复 END 必须晚于 incident 后首个 BAR_5S | 旧真实 run 有 380 条重复 marker；新实现尚未在真实 Gateway fault 上复测 |
 | 停牌态 generic tick 49 | 已证伪，不可得 | Gateway 对 STK 返回 error 321，整个 `reqMktData` 拿不到 LIVE 回调、三路归零 | 默认已改回不请求（`market_data_generic_ticks=""`）；抑制器因此无输入，manifest 用 `halt_state_available` 明示，读者不得把"无 halt marker"读成"未停牌" |
-| 未解释静默的恢复策略 | **P0 代码修复完成，待真实 smoke** | 默认 `fast_attempts=2` 下 capture 生命迹象先 veto full reconnect；真实 BAR 才重置 backoff；transport-only 时只重建三路 capture；1101/10225 已统一进入同一 recovery pipeline | 新回归覆盖生产默认矩阵；仍必须先做 10–20 分钟真实只读 smoke，Full-RTH 继续未完成 |
+| 未解释静默的恢复策略 | **P0 代码/回归完成，待 Full-RTH 真实验证** | 默认 `fast_attempts=2` 下 capture evidence 先 veto full reconnect；真实 BAR 才重置 backoff；transport-only 时只重建三路 capture；1101/10225 已统一进入同一 recovery pipeline | 不再单独跑短 smoke；Full-RTH 前 10–20 分钟承担 startup smoke，但只有全日完成才可关闭本项 |
+| CI 基线 | **已修复** | `scripts` 导入稳定；Windows compile/pytest/provenance 分独立 step，native 非零退出不会被后续命令吞掉；修复后暴露并修正 Windows process-lock 测试假设 | CI harness/test-only；未改 Recorder 或 broker 行为 |
 | 丢覆盖时的 health 真实性 | 代码/测试完成 | `FEED_OUTAGE`/`GAP_SUSPECTED` 及收盘时未闭合的 incident 均使 `health_ok=false`；`EXPECTED_SILENCE` 单独不失败 | 这是"不退出"的配套约束：进程不再用退出报警，改由 health 报警 |
 | Parquet 内容保真 | 已完成（离线） | 分级价格、超 2^53 纳秒墙钟、带偏移与微秒的 broker timestamp、`special_conditions` 反解、跨段 event_id 顺序、空字段保持 null，逐值相等 | 此前只验行数与 schema，二者在四舍五入/丢时区/乱序下均会通过；本项用合成但真实形态的 tick，不替代真实 tick 复核 |
 | 强杀后重启续跑 | 已完成（离线） | 强杀 → 后继取新 run_id 续录 → `finalize_day` 折叠为单文件，4 行 / 2 个 run_id，且该日仍判 `health_ok=false` | 端到端覆盖了此前只测到"前缀可读"的缝 |
@@ -104,7 +104,11 @@ stall、execution service 强杀、volume failure-domain 判定）不受影响�
 代码路径保留，碰上真实 1101 时被动采集。不得由 1102 反推 1101，也不得因未观察而删除该分支。
 任何未来的断网实验都不以取得 1101 为目的。
 
-## 4. 只读实测的剩余边界（2026-08-12 复核）
+### 3.4 直接 Full-RTH，不再单独 smoke —— 已确认（2026-08-13）
+
+当前复测仍是 paper Gateway + Read-Only API + 无 broker write。昨日真正缺陷直到约 66 分钟后才出现，10–20 分钟 smoke 对长期订阅、recovery escalation 和 10197 复现的辨识力有限。因此 owner 决定：**直接跑完整 Full-RTH，把开盘前 10 分钟和开盘后的最初 10–20 分钟作为同一次全日测试的 startup observation，不再设置独立 smoke gate。**
+
+## 4. 只读实测的剩余边界（2026-08-13 复核）
 
 原最高优先级“持三路订阅受控断网 + production `run()`”已经执行，详细见
 [`GATE_B2_CONTROLLED_DISCONNECT_20260812_ZH.md`](GATE_B2_CONTROLLED_DISCONNECT_20260812_ZH.md)。本轮取得
@@ -114,14 +118,12 @@ PID 18488 加载的是旧代码，因此必须把“真实旧问题”和“新�
 
 1. `completed orders` 被 Gateway Read-Only policy 阻断；继续需要降低保护，不接受。
 2. overnight 与 RTH bounded 行情均已完成。2026-08-12 Full-RTH 尝试只取得约 17% 覆盖后失败；它验证了
-   开盘至约 10:36 ET 的写盘前缀，但没有覆盖午盘、收盘 cross 或 `finalize_day` 的正常全日路径。必须先修复
-   recovery 默认组合，再做短时真实 smoke，之后另日重跑。
+   开盘至约 10:36 ET 的写盘前缀，但没有覆盖午盘、收盘 cross 或 `finalize_day` 的正常全日路径。P0 recovery 与 CI 基线现已完成，下一步直接 Full-RTH 复测。
 3. 不应反复断网碰运气；持订阅实验也不得预设必得 1101。官方语义只支持按实际结果区分
    1101（requests lost，需要重订阅）与 1102（requests recovered），不得互相推断。
 4. 非空 broker facts、订单身份、cross-client order visibility 和订单 callback 必须先获得 paper-order 独立授权。
 
-现在仍可开展当前部分日运行的最终封存、官方文档复核、证据索引整理、代码审查和 freeze 准备。不得为
-碰取 1101 重复断网；任何新的 fault injection 仍需 operator 对该次精确目标和窗口重新授权。
+当前不安排新的 fault injection。优先完成 2026-08-13 Full-RTH 长跑；任何未来的 fault injection 仍需 operator 对该次精确目标和窗口重新授权。
 
 ## 5. 已封存的本地证据索引
 
@@ -156,21 +158,22 @@ source、tests、docs 与后续真实 Gateway 证据仍需在最终 freeze 中�
 
 1. SPY overnight 行情/Recorder 已完成；详细过程见 [`GATE_B2_OVERNIGHT_20260810.md`](GATE_B2_OVERNIGHT_20260810.md)。
 2. 正式 RTH 三路行情与 bounded Recorder 已完成；详细过程见 [`GATE_B2_RTH_20260810.md`](GATE_B2_RTH_20260810.md)。
-3. 保留并索引 2026-08-12 Full-RTH 失败轮；详细见
-   [`INCIDENT_FULL_RTH_20260812_ZH.md`](INCIDENT_FULL_RTH_20260812_ZH.md)。P0 已修复 scheduler 默认排序、
-   grace-period 假恢复重置、transport-only 三路重订以及 1101/10225 平行 shortcut，并补生产默认矩阵回归。
-4. 修复后做一次 **10–20 分钟只读冒烟跑**：确认 LIVE、三路持续、`halt_state_available=false`，且有生命
-   迹象时不会 full reconnect。事故后的 120 秒 probe 已证明当前 entitlement/route 可用，但不能替代修复后 smoke。
-5. 再做一次受控断网，跑在修复后的代码上，验证 incident 生命周期与恢复策略。
-   任何 fault injection 仍需 operator 对该次精确目标和窗口重新授权。1101 保持“未观察”，不为取码反复断网
-   （owner 决定，见 §3.3）。
-6. P0 修复、回归和真实 smoke 均通过后，另一天从开盘前重跑 Full-RTH 全日 health，同时闭环
-   `finalize_day`、全日 bar cadence 和长期资源行为。
-   容量与队列水位按 soak 实测外推已基本不构成风险（7.19 gzip bytes/event × 约 562 万条 ≈ 40MB/天；
-   soak 在 10,000 events/s 下 queue high-water 仅 2,329/100,000，而 RTH 实测峰值约 240 events/s），
-   但仍应在开跑前用一个真实 RTH segment 复核每行字节数，不用 soak 的合成行代替。
-7. 逐项完成官方 IB 文档复核，整理 B2 source、tests、docs 和 evidence，形成新的可复查 freeze；不得借用 B1 exact-freeze 为新代码背书。
-8. 只读证据完成并封存后，由 owner **单独决定**是否授权“paper account、1 股 SPY、机械订单生命周期”的 paper-order protocol。只有进入该子阶段后，才验证非空 reconciliation、订单身份、跨 client 订单可见性、submit ambiguity、modify/cancel/fill、Gateway restart 和 late/duplicate/out-of-order callback；live order 继续禁止。
+3. 保留并索引 2026-08-12 Full-RTH 失败轮；详细见 [`INCIDENT_FULL_RTH_20260812_ZH.md`](INCIDENT_FULL_RTH_20260812_ZH.md)。P0 已修复 scheduler 默认排序、grace-period 假恢复重置、transport-only 三路重订以及 1101/10225 平行 shortcut，并补生产默认矩阵回归；P0.5 已修 CI 基线。
+4. **2026-08-13 21:20 HKT 直接启动完整 Full-RTH。** 默认 `wait_for_rth=True`，因此程序先连接、校验 contract/server time 并在 `WAITING_FOR_SESSION` 等待；21:30 HKT 才订阅，持续至 2026-08-14 04:00 HKT 正常 session end/finalize。不开独立 smoke。
+5. 本轮不做受控断网或其他 fault injection；若自然出现 1101/1102/10225、subscription stale 或 transport idle，则按新 recovery pipeline 被动采证。1101 保持“未观察”也可接受，不为取码反复断网（owner 决定，见 §3.3）。
+6. 本轮启动树锁定为当时最新 `main`；运行前记录 exact commit、`STATE.json` source/config/lock hashes 与 client id。建议命令：
+
+```powershell
+uv run python -m ib_execution.quote_recorder `
+  --root artifacts/ib_preflight/20260813_full_rth_retest/raw `
+  --port 4002 `
+  --client-id 966 `
+  --status-path artifacts/ib_preflight/20260813_full_rth_retest/recorder-status.json
+```
+
+7. Full-RTH 只有在全日覆盖、`health_ok=true`、三路 cadence/incident 正常、handler→readback accounting 平衡、`dropped_count=0`、`writer_error=null`、正常 session-end finalize 均成立时才可 PASS。若中途触发 recovery，还需验证实际 plan 与当时 capture/transport evidence 相符。
+8. Full-RTH PASS 后，再逐项完成官方 IB 文档复核，整理 B2 source、tests、docs 和 evidence，形成新的可复查 freeze；不得借用 B1 exact-freeze 为新代码背书。
+9. 只读证据完成并封存后，由 owner **单独决定**是否授权“paper account、1 股 SPY、机械订单生命周期”的 paper-order protocol。只有进入该子阶段后，才验证非空 reconciliation、订单身份、跨 client 订单可见性、submit ambiguity、modify/cancel/fill、Gateway restart 和 late/duplicate/out-of-order callback；live order 继续禁止。
 
 ## 7. 文档导航
 
@@ -178,7 +181,7 @@ source、tests、docs 与后续真实 Gateway 证据仍需在最终 freeze 中�
 - [`GATE_B2_OVERNIGHT_20260810.md`](GATE_B2_OVERNIGHT_20260810.md)：正确 overnight routing、三路行情及 bounded Recorder 写盘证据。
 - [`GATE_B2_RTH_20260810.md`](GATE_B2_RTH_20260810.md)：RTH competing-session 失败、判定加固、正式三路行情及 bounded Recorder 写盘证据。
 - [`GATE_B2_CONTROLLED_DISCONNECT_20260812_ZH.md`](GATE_B2_CONTROLLED_DISCONNECT_20260812_ZH.md)：持三路订阅的 production 断网、旧 marker 重复、incident 修正和 Gateway 检测修复。
-- [`INCIDENT_FULL_RTH_20260812_ZH.md`](INCIDENT_FULL_RTH_20260812_ZH.md)：Full-RTH 提前终止、API log、恢复策略缺陷、owner 登录陈述和整改条件。
+- [`INCIDENT_FULL_RTH_20260812_ZH.md`](INCIDENT_FULL_RTH_20260812_ZH.md)：Full-RTH 提前终止、API log、恢复策略缺陷、P0 修复、CI 基线和 2026-08-13 Full-RTH 复测方案。
 - [`GATE_B2_READONLY_20260809.md`](GATE_B2_READONLY_20260809.md)：每一轮真实 Gateway 测试的详细过程与观测。
 - [`DOCUMENTED_VS_OBSERVED.md`](DOCUMENTED_VS_OBSERVED.md)：官方文档语义与真实 Gateway 直接观测的逐项矩阵。
 - [`GATE_B1_SIGNOFF_117188cea539.md`](GATE_B1_SIGNOFF_117188cea539.md)：Gate B1 exact-freeze owner acceptance；其范围不包含真实 IB 行为。
