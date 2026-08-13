@@ -94,6 +94,7 @@ DEFAULT_TRANSPORT_IDLE_SECONDS = 60.0
 CONNECTIVITY_LOST = 1100
 CONNECTIVITY_RESTORED_DATA_LOST = 1101
 CONNECTIVITY_RESTORED_DATA_KEPT = 1102
+REALTIME_BARS_RESET = 10225
 
 # Data farm went away / came back. 2157/2158 are the sec-def farm, which
 # does not carry market data, but a broken one still means the session is
@@ -125,6 +126,13 @@ class LivenessIncidentKind(Enum):
     GAP_SUSPECTED = "GAP_SUSPECTED"
 
 
+class RecoveryHint(Enum):
+    """An explicit IB instruction about the smallest subscription repair."""
+
+    BARS_ONLY = "bars_only"
+    ALL_MARKET_STREAMS = "all_market_streams"
+
+
 @dataclass(frozen=True)
 class LivenessState:
     """One assessment. Everything a SYSTEM marker or report needs."""
@@ -137,6 +145,7 @@ class LivenessState:
     advisory_ages: dict[str, float] = field(default_factory=dict)
     incident_kind: LivenessIncidentKind | None = None
     heartbeat_last_mono: float | None = None
+    recovery_hint: RecoveryHint | None = None
 
     def as_marker(self) -> str:
         """Compact, greppable form for the raw log."""
@@ -147,6 +156,8 @@ class LivenessState:
             parts.append(f"bar_age={self.heartbeat_age:.1f}s")
         if self.expected_silence:
             parts.append(f"expected_silence={self.expected_silence}")
+        if self.recovery_hint is not None:
+            parts.append(f"recovery_hint={self.recovery_hint.value}")
         for stream, age in sorted(self.advisory_ages.items()):
             parts.append(f"{stream}_age={age:.1f}s")
         return ";".join(parts)
@@ -370,7 +381,14 @@ class MarketLiveness:
         self._halted: Optional[int] = None
         self._outages: dict[int, str] = {}
         self._calendar_silence: Optional[str] = None
-        self._pending_recover: tuple[LivenessIncidentKind, str] | None = None
+        self._pending_recover: tuple[
+            LivenessIncidentKind, str, RecoveryHint | None
+        ] | None = None
+        # Veto-only transport evidence.  True means the current connection has
+        # not crossed ib_async's transport-idle boundary since the last inbound
+        # activity.  It can prevent a destructive socket reconnect, but it can
+        # never initiate recovery by itself.
+        self._transport_evidence = False
         #: Counted for the report: how often silence was explained rather
         #: than alarmed. A detector that never suppresses is not measuring.
         self.suppressed_assessments = 0
@@ -390,9 +408,22 @@ class MarketLiveness:
         self._started_mono = self._now(now_mono)
         self._last_event_mono.clear()
         self._pending_recover = None
+        # A successful subscribe handshake is positive evidence that the peer
+        # is reachable.  If it subsequently goes completely silent, the
+        # transport watchdog revokes this after its own bounded timeout.
+        self._transport_evidence = True
 
     def note_event(self, stream: str, now_mono: Optional[float] = None) -> None:
         self._last_event_mono[stream] = self._now(now_mono)
+        self._transport_evidence = True
+
+    def note_transport_activity(self) -> None:
+        """Record inbound protocol activity without treating it as market cadence."""
+        self._transport_evidence = True
+
+    def transport_evidence(self) -> bool:
+        """Whether transport is known alive; veto-only, never a recovery trigger."""
+        return self._transport_evidence
 
     def note_halted(self, value: float) -> None:
         """Generic tick 49. ``nan`` means IB has not told us, not "trading".
@@ -429,6 +460,10 @@ class MarketLiveness:
 
     def note_status(self, code: int, message: str = "") -> None:
         """Classify an IB error/status code into liveness facts."""
+        # The callback itself proves TWS is talking.  This is deliberately
+        # weaker than a healthy market stream: it may veto socket destruction,
+        # but explicit outage/recovery semantics below still decide what to do.
+        self._transport_evidence = True
         if code == CONNECTIVITY_LOST:
             # Told, not inferred. Reconnecting before IB says it is back
             # just burns the reconnect budget against a known outage.
@@ -438,9 +473,16 @@ class MarketLiveness:
             self._pending_recover = (
                 LivenessIncidentKind.FEED_OUTAGE,
                 f"connectivity restored, market data lost ({code})",
+                RecoveryHint.ALL_MARKET_STREAMS,
             )
         elif code == CONNECTIVITY_RESTORED_DATA_KEPT:
             self._outages.pop(CONNECTIVITY_LOST, None)
+        elif code == REALTIME_BARS_RESET:
+            self._pending_recover = (
+                LivenessIncidentKind.GAP_SUSPECTED,
+                f"real-time bars reset by IB ({code})",
+                RecoveryHint.BARS_ONLY,
+            )
         elif code in FARM_BROKEN_CODES:
             self._outages[code] = f"data farm down ({code}): {message}".strip()
         elif code in FARM_OK_CODES:
@@ -456,9 +498,11 @@ class MarketLiveness:
         Stronger than any per-stream gap, because it does not depend on
         market activity -- TWS keeps talking even when the tape does not.
         """
+        self._transport_evidence = False
         self._pending_recover = (
             LivenessIncidentKind.GAP_SUSPECTED,
             f"no data of any kind from TWS for {idle_seconds:.1f}s",
+            None,
         )
 
     def enter_calendar_silence(self, reason: str) -> None:
@@ -563,7 +607,7 @@ class MarketLiveness:
         # Explicit "your subscription is gone" beats waiting for the bar
         # timeout to notice the same thing several seconds later.
         if self._pending_recover is not None:
-            incident_kind, reason = self._pending_recover
+            incident_kind, reason, recovery_hint = self._pending_recover
             self._pending_recover = None
             return LivenessState(
                 action=LivenessAction.RECOVER_SUBSCRIPTION,
@@ -572,6 +616,7 @@ class MarketLiveness:
                 advisory_ages=advisory,
                 incident_kind=incident_kind,
                 heartbeat_last_mono=heartbeat_last_mono,
+                recovery_hint=recovery_hint,
             )
 
         if age is not None and age > self.bar_timeout_seconds:
@@ -612,6 +657,7 @@ class MarketLiveness:
             "suppressed_assessments": self.suppressed_assessments,
             "suppressed_assessments_are_poll_count": True,
             "heartbeat_losses": self.heartbeat_losses,
+            "transport_evidence": self._transport_evidence,
         }
 
     def _now(self, now_mono: Optional[float]) -> float:
