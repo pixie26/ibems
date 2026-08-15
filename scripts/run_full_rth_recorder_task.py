@@ -4,6 +4,11 @@ Task Scheduler owns this Python process directly. QuoteRecorder runs in that
 same process, with no intermediate shell or child Recorder lifecycle. A
 watchdog enforces the actual session deadline even if the main thread is stuck
 inside a blocking storage call.
+
+``--lifecycle-probe`` exercises the identical Task-owned Python lifecycle with
+no IB connection: PASS returns 0, FAIL returns 2, and HOLD remains alive until
+Task Scheduler stops it. This makes Scheduler exit-code/PID/orphan validation
+possible outside RTH and without a Gateway.
 """
 
 from __future__ import annotations
@@ -16,6 +21,7 @@ import os
 from pathlib import Path
 import sys
 import threading
+import time
 import traceback
 from typing import Any
 
@@ -201,7 +207,49 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--runtime-status", required=True, type=Path)
     parser.add_argument("--stdout", required=True, type=Path)
     parser.add_argument("--stderr", required=True, type=Path)
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--lifecycle-probe",
+        choices=("pass", "fail", "hold"),
+        help="exercise Scheduler lifecycle without connecting to IB",
+    )
+    parser.add_argument("--probe-hold-seconds", type=float, default=3600.0)
+    args = parser.parse_args(argv)
+    if args.probe_hold_seconds <= 0:
+        parser.error("--probe-hold-seconds must be positive")
+    return args
+
+
+def _run_lifecycle_probe(args: argparse.Namespace, status: RuntimeStatus) -> int:
+    mode = str(args.lifecycle_probe)
+    status.update(
+        "PROBE_RUNNING",
+        lifecycle_probe=mode,
+        health_ok=(mode == "pass"),
+        note="no IB connection is made in lifecycle-probe mode",
+    )
+    if mode == "pass":
+        status.update("FINALIZED", lifecycle_probe=mode, health_ok=True)
+        return EXIT_HEALTH_PASS
+    if mode == "fail":
+        status.update("FINALIZED", lifecycle_probe=mode, health_ok=False)
+        return EXIT_HEALTH_FAIL
+
+    status.update(
+        "PROBE_HOLDING",
+        lifecycle_probe=mode,
+        health_ok=None,
+        hold_seconds=float(args.probe_hold_seconds),
+        instruction="stop this task with Task Scheduler and verify this PID no longer exists",
+    )
+    deadline = time.monotonic() + float(args.probe_hold_seconds)
+    while time.monotonic() < deadline:
+        time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+    status.update(
+        "FAILED",
+        lifecycle_probe=mode,
+        failure="hold probe reached its timeout without an external Scheduler stop",
+    )
+    return EXIT_RUNTIME_ERROR
 
 
 def run(argv: list[str] | None = None) -> int:
@@ -209,57 +257,68 @@ def run(argv: list[str] | None = None) -> int:
     stdout = _FsyncLog(args.stdout)
     stderr = _FsyncLog(args.stderr)
     status = RuntimeStatus(args.runtime_status)
-    watchdog = DeadlineWatchdog(status)
-    startup_deadline = datetime.now(timezone.utc) + SESSION_RESOLUTION_GRACE
-    watchdog.arm(startup_deadline)
-    status.update(
-        "WAITING_FOR_SESSION",
-        startup_deadline_utc=startup_deadline.isoformat(),
-        startup_deadline_rule="SESSION_DETAILS_MUST_RESOLVE_WITHIN_30_MINUTES",
-    )
     try:
         with redirect_stdout(stdout), redirect_stderr(stderr):
-            recorder = TaskOwnedQuoteRecorder(
-                args.root,
-                args.symbol,
-                host=args.host,
-                port=args.port,
-                client_id=args.client_id,
-                status_path=args.recorder_status,
-                runtime_status=status,
-                watchdog=watchdog,
+            if args.lifecycle_probe is not None:
+                return _run_lifecycle_probe(args, status)
+
+            watchdog = DeadlineWatchdog(status)
+            startup_deadline = datetime.now(timezone.utc) + SESSION_RESOLUTION_GRACE
+            watchdog.arm(startup_deadline)
+            status.update(
+                "WAITING_FOR_SESSION",
+                startup_deadline_utc=startup_deadline.isoformat(),
+                startup_deadline_rule="SESSION_DETAILS_MUST_RESOLVE_WITHIN_30_MINUTES",
             )
             try:
-                manifest_v3 = recorder.run()
-                session = recorder.task_session
-                if session is None:
-                    raise RuntimeError("Recorder completed without resolving an RTH session")
-                session_dir = args.root / session.start.date().isoformat()
-                health_v4_path, amendment_path = write_reanalysis_v4(
-                    session_dir,
-                    session_dir,
-                    session_open=session.start,
-                    session_close=session.end,
-                    original_health=session_dir / "health.json",
-                    original_manifest=session_dir / "manifest.json",
+                recorder = TaskOwnedQuoteRecorder(
+                    args.root,
+                    args.symbol,
+                    host=args.host,
+                    port=args.port,
+                    client_id=args.client_id,
+                    status_path=args.recorder_status,
+                    runtime_status=status,
+                    watchdog=watchdog,
                 )
-                health_v4 = json.loads(health_v4_path.read_text(encoding="utf-8"))
-                health_ok = bool(health_v4.get("health_ok"))
-                status.update(
-                    "FINALIZED",
-                    health_ok=health_ok,
-                    health_v3_ok=bool(manifest_v3.get("health_ok")),
-                    health_v4=str(health_v4_path),
-                    manifest_amendment_v4=str(amendment_path),
-                )
-                print(json.dumps({"v3": manifest_v3, "v4": health_v4}, indent=2, sort_keys=True))
-                return EXIT_HEALTH_PASS if health_ok else EXIT_HEALTH_FAIL
-            except BaseException as exc:
-                status.update("FAILED", failure=f"{type(exc).__name__}: {exc}")
-                traceback.print_exc(file=sys.stderr)
-                return EXIT_RUNTIME_ERROR
+                try:
+                    manifest_v3 = recorder.run()
+                    session = recorder.task_session
+                    if session is None:
+                        raise RuntimeError("Recorder completed without resolving an RTH session")
+                    session_dir = args.root / session.start.date().isoformat()
+                    health_v4_path, amendment_path = write_reanalysis_v4(
+                        session_dir,
+                        session_dir,
+                        session_open=session.start,
+                        session_close=session.end,
+                        original_health=session_dir / "health.json",
+                        original_manifest=session_dir / "manifest.json",
+                    )
+                    health_v4 = json.loads(health_v4_path.read_text(encoding="utf-8"))
+                    health_ok = bool(health_v4.get("health_ok"))
+                    status.update(
+                        "FINALIZED",
+                        health_ok=health_ok,
+                        health_v3_ok=bool(manifest_v3.get("health_ok")),
+                        health_v4=str(health_v4_path),
+                        manifest_amendment_v4=str(amendment_path),
+                    )
+                    print(
+                        json.dumps(
+                            {"v3": manifest_v3, "v4": health_v4},
+                            indent=2,
+                            sort_keys=True,
+                        )
+                    )
+                    return EXIT_HEALTH_PASS if health_ok else EXIT_HEALTH_FAIL
+                except BaseException as exc:
+                    status.update("FAILED", failure=f"{type(exc).__name__}: {exc}")
+                    traceback.print_exc(file=sys.stderr)
+                    return EXIT_RUNTIME_ERROR
+            finally:
+                watchdog.close()
     finally:
-        watchdog.close()
         stdout.close()
         stderr.close()
 
