@@ -4,16 +4,17 @@ v3 artifacts are historical evidence and are never rewritten. This module
 re-reads immutable raw Recorder segments and emits a sidecar health verdict
 whose semantics match the live liveness contract:
 
-* BAR_5S is time-driven and may create a hard problem.
-* BID_ASK and ALL_LAST are event-driven; silence is quality evidence only.
-* 1100 is a direct FEED_OUTAGE.
-* 2103/2104 describe the real-time market-data farm. A 2103 interval becomes
-  a FEED_OUTAGE only when BAR_5S also stops.
-* 2105/2106 (historical) and 2157/2158 (security definition) are advisory
-  status only and can neither create nor hide a SPY real-time outage.
+* ``BAR_5S`` is time-driven and may create a hard problem.
+* ``BID_ASK`` and ``ALL_LAST`` are event-driven; silence is quality evidence.
+* 1100 is a direct ``FEED_OUTAGE``.
+* 2103/2104 describe the real-time market-data farm. Only the temporal overlap
+  between a 2103 degradation and an independently missing BAR is classified as
+  ``FEED_OUTAGE``; unexplained remainder stays ``GAP_SUSPECTED``.
+* 2105/2106 (historical) and 2157/2158 (security definition) are structured
+  advisories. They can neither create nor hide a SPY real-time outage.
 
-The implementation is disk-backed and single-pass over gzip JSONL. It never
-materializes a Full-RTH day in Python memory.
+The implementation is disk-backed and single-pass over gzip JSONL for semantic
+analysis. It never materializes a Full-RTH day in Python memory.
 """
 
 from __future__ import annotations
@@ -21,7 +22,6 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
-import math
 import os
 import re
 import sqlite3
@@ -44,7 +44,20 @@ CONNECTIVITY_RESTORED_DATA_LOST = 1101
 CONNECTIVITY_RESTORED_DATA_KEPT = 1102
 REALTIME_FARM_BROKEN = 2103
 REALTIME_FARM_OK = 2104
-AUXILIARY_FARM_CODES = frozenset({2105, 2106, 2157, 2158, 2108})
+HISTORICAL_FARM_BROKEN = 2105
+HISTORICAL_FARM_OK = 2106
+FARM_INACTIVE = 2108
+SECDEF_FARM_BROKEN = 2157
+SECDEF_FARM_OK = 2158
+AUXILIARY_FARM_CODES = frozenset(
+    {
+        HISTORICAL_FARM_BROKEN,
+        HISTORICAL_FARM_OK,
+        FARM_INACTIVE,
+        SECDEF_FARM_BROKEN,
+        SECDEF_FARM_OK,
+    }
+)
 FATAL_MARKET_DATA_CODES = frozenset({354, 10089, 10189, 10197})
 REALTIME_BARS_RESET = 10225
 
@@ -208,7 +221,7 @@ def iter_raw_rows(
     *,
     integrity: list[dict[str, Any]] | None = None,
 ) -> Iterator[dict[str, Any]]:
-    """Read each immutable raw segment exactly once, preserving salvage facts."""
+    """Read each immutable raw segment exactly once for semantic analysis."""
     for segment in _raw_segments(raw_dir):
         rows = 0
         error: str | None = None
@@ -232,7 +245,9 @@ def iter_raw_rows(
                 )
 
 
-def _batched(rows: Iterable[dict[str, Any]], size: int = 50_000) -> Iterator[list[dict[str, Any]]]:
+def _batched(
+    rows: Iterable[dict[str, Any]], size: int = 50_000
+) -> Iterator[list[dict[str, Any]]]:
     batch: list[dict[str, Any]] = []
     for row in rows:
         batch.append(row)
@@ -275,7 +290,13 @@ def _gaps(
 
     for start_ns, end_ns in gaps:
         max_gap = max(max_gap, _duration_seconds(start_ns, end_ns))
-    return rows, (_iso(first) if first is not None else None), (_iso(last) if last is not None else None), max_gap, gaps
+    return (
+        rows,
+        _iso(first) if first is not None else None,
+        _iso(last) if last is not None else None,
+        max_gap,
+        gaps,
+    )
 
 
 def _status_state_at(statuses: Sequence[StatusEvent], target_ns: int) -> tuple[bool, bool]:
@@ -286,7 +307,10 @@ def _status_state_at(statuses: Sequence[StatusEvent], target_ns: int) -> tuple[b
             break
         if status.code == CONNECTIVITY_LOST:
             connectivity_lost = True
-        elif status.code in (CONNECTIVITY_RESTORED_DATA_LOST, CONNECTIVITY_RESTORED_DATA_KEPT):
+        elif status.code in (
+            CONNECTIVITY_RESTORED_DATA_LOST,
+            CONNECTIVITY_RESTORED_DATA_KEPT,
+        ):
             connectivity_lost = False
         elif status.code == REALTIME_FARM_BROKEN:
             realtime_farm_broken = True
@@ -295,39 +319,16 @@ def _status_state_at(statuses: Sequence[StatusEvent], target_ns: int) -> tuple[b
     return connectivity_lost, realtime_farm_broken
 
 
-def _statuses_in(
-    statuses: Sequence[StatusEvent], start_ns: int, end_ns: int
-) -> list[StatusEvent]:
-    return [status for status in statuses if start_ns <= status.wall_ns <= end_ns]
-
-
-def _gap_classification(
-    statuses: Sequence[StatusEvent], start_ns: int, end_ns: int
-) -> tuple[str, list[str]]:
-    connectivity_lost, realtime_farm_broken = _status_state_at(statuses, start_ns)
-    evidence = [
-        f"BAR_5S gap {_duration_seconds(start_ns, end_ns):.3f}s > {BAR_GAP_SECONDS:.0f}s"
-    ]
-    for status in _statuses_in(statuses, start_ns, end_ns):
-        evidence.append(f"IB {status.code}: {status.message}")
-        if status.code == CONNECTIVITY_LOST:
-            connectivity_lost = True
-        elif status.code in (CONNECTIVITY_RESTORED_DATA_LOST, CONNECTIVITY_RESTORED_DATA_KEPT):
-            connectivity_lost = False
-        elif status.code == REALTIME_FARM_BROKEN:
-            realtime_farm_broken = True
-        elif status.code == REALTIME_FARM_OK:
-            realtime_farm_broken = False
-    if connectivity_lost:
-        return "FEED_OUTAGE", evidence
-    # A 2103 observed anywhere in the gap is corroborated by the missing BAR.
-    farm_seen = realtime_farm_broken or any(
-        status.code == REALTIME_FARM_BROKEN
-        for status in _statuses_in(statuses, start_ns, end_ns)
-    )
-    if farm_seen:
-        return "FEED_OUTAGE", evidence
-    return "GAP_SUSPECTED", evidence
+def _latest_relevant_status(
+    statuses: Sequence[StatusEvent], target_ns: int, codes: frozenset[int]
+) -> StatusEvent | None:
+    latest = None
+    for status in statuses:
+        if status.wall_ns > target_ns:
+            break
+        if status.code in codes:
+            latest = status
+    return latest
 
 
 def _connectivity_outages(
@@ -336,48 +337,214 @@ def _connectivity_outages(
     findings: list[HealthFinding] = []
     open_status: StatusEvent | None = None
     for status in statuses:
-        if status.wall_ns < session_open_ns:
-            continue
         if status.wall_ns > session_close_ns:
             break
-        if status.code == CONNECTIVITY_LOST and open_status is None:
+        if status.code == CONNECTIVITY_LOST:
             open_status = status
-        elif (
-            status.code in (CONNECTIVITY_RESTORED_DATA_LOST, CONNECTIVITY_RESTORED_DATA_KEPT)
-            and open_status is not None
-        ):
+            continue
+        if status.code not in (
+            CONNECTIVITY_RESTORED_DATA_LOST,
+            CONNECTIVITY_RESTORED_DATA_KEPT,
+        ) or open_status is None:
+            continue
+        end_ns = min(status.wall_ns, session_close_ns)
+        start_ns = max(open_status.wall_ns, session_open_ns)
+        if end_ns > start_ns:
             findings.append(
                 HealthFinding(
                     stream=BAR_STREAM,
                     classification="FEED_OUTAGE",
-                    start_utc=_iso(open_status.wall_ns),
-                    end_utc=_iso(status.wall_ns),
-                    duration_seconds=_duration_seconds(open_status.wall_ns, status.wall_ns),
+                    start_utc=_iso(start_ns),
+                    end_utc=_iso(end_ns),
+                    duration_seconds=_duration_seconds(start_ns, end_ns),
                     evidence=[
                         f"IB {open_status.code}: {open_status.message}",
                         f"IB {status.code}: {status.message}",
                     ],
                 )
             )
-            open_status = None
-    if open_status is not None:
+        open_status = None
+    if open_status is not None and open_status.wall_ns < session_close_ns:
+        start_ns = max(open_status.wall_ns, session_open_ns)
+        if session_close_ns > start_ns:
+            findings.append(
+                HealthFinding(
+                    stream=BAR_STREAM,
+                    classification="FEED_OUTAGE",
+                    start_utc=_iso(start_ns),
+                    end_utc=_iso(session_close_ns),
+                    duration_seconds=_duration_seconds(start_ns, session_close_ns),
+                    evidence=[
+                        f"IB {open_status.code}: {open_status.message}",
+                        "no connectivity restoration before session close",
+                    ],
+                )
+            )
+    return findings
+
+
+def _bar_gap_findings(
+    statuses: Sequence[StatusEvent], start_ns: int, end_ns: int
+) -> list[HealthFinding]:
+    """Partition one missing-BAR interval by actual IB state transitions."""
+    boundaries = {start_ns, end_ns}
+    relevant = frozenset(
+        {
+            CONNECTIVITY_LOST,
+            CONNECTIVITY_RESTORED_DATA_LOST,
+            CONNECTIVITY_RESTORED_DATA_KEPT,
+            REALTIME_FARM_BROKEN,
+            REALTIME_FARM_OK,
+        }
+    )
+    for status in statuses:
+        if start_ns < status.wall_ns < end_ns and status.code in relevant:
+            boundaries.add(status.wall_ns)
+    ordered = sorted(boundaries)
+    findings: list[HealthFinding] = []
+    total_gap = _duration_seconds(start_ns, end_ns)
+
+    for sub_start, sub_end in zip(ordered, ordered[1:]):
+        if sub_end <= sub_start:
+            continue
+        connectivity_lost, realtime_farm_broken = _status_state_at(statuses, sub_start)
+        if connectivity_lost:
+            # 1100 produces its own direct exact-duration hard finding.
+            continue
+        if realtime_farm_broken:
+            latest = _latest_relevant_status(
+                statuses,
+                sub_start,
+                frozenset({REALTIME_FARM_BROKEN, REALTIME_FARM_OK}),
+            )
+            evidence = [
+                f"BAR_5S gap {total_gap:.3f}s > {BAR_GAP_SECONDS:.0f}s",
+                "BAR heartbeat is absent during a real-time market-data farm degradation",
+            ]
+            if latest is not None:
+                evidence.append(f"IB {latest.code}: {latest.message}")
+            classification = "FEED_OUTAGE"
+        else:
+            evidence = [
+                f"BAR_5S gap {total_gap:.3f}s > {BAR_GAP_SECONDS:.0f}s",
+                "no IB connectivity or real-time farm outage explains this subinterval",
+            ]
+            classification = "GAP_SUSPECTED"
         findings.append(
             HealthFinding(
                 stream=BAR_STREAM,
-                classification="FEED_OUTAGE",
-                start_utc=_iso(open_status.wall_ns),
-                end_utc=_iso(session_close_ns),
-                duration_seconds=_duration_seconds(open_status.wall_ns, session_close_ns),
-                evidence=[f"IB {open_status.code}: {open_status.message}", "no restoration before session close"],
+                classification=classification,
+                start_utc=_iso(sub_start),
+                end_utc=_iso(sub_end),
+                duration_seconds=_duration_seconds(sub_start, sub_end),
+                evidence=evidence,
             )
         )
     return findings
 
 
-def _overlaps(finding: HealthFinding, start_ns: int, end_ns: int) -> bool:
-    finding_start = int(datetime.fromisoformat(finding.start_utc).timestamp() * 1e9)
-    finding_end = int(datetime.fromisoformat(finding.end_utc).timestamp() * 1e9)
-    return finding_start <= end_ns and finding_end >= start_ns
+def _paired_auxiliary_advisories(
+    statuses: Sequence[StatusEvent],
+    *,
+    broken_code: int,
+    ok_code: int,
+    stream: str,
+    session_open_ns: int,
+    session_close_ns: int,
+) -> list[HealthFinding]:
+    advisories: list[HealthFinding] = []
+    opened: StatusEvent | None = None
+    for status in statuses:
+        if status.wall_ns > session_close_ns:
+            break
+        if status.code == broken_code:
+            opened = status
+            continue
+        if status.code != ok_code or opened is None:
+            continue
+        start_ns = max(opened.wall_ns, session_open_ns)
+        end_ns = min(status.wall_ns, session_close_ns)
+        if end_ns >= start_ns:
+            advisories.append(
+                HealthFinding(
+                    stream=stream,
+                    classification="AUXILIARY_FARM_DEGRADED",
+                    start_utc=_iso(start_ns),
+                    end_utc=_iso(end_ns),
+                    duration_seconds=_duration_seconds(start_ns, end_ns),
+                    evidence=[
+                        f"IB {opened.code}: {opened.message}",
+                        f"IB {status.code}: {status.message}",
+                        "auxiliary farm state is not evidence about SPY real-time feed liveness",
+                    ],
+                )
+            )
+        opened = None
+    if opened is not None and opened.wall_ns < session_close_ns:
+        start_ns = max(opened.wall_ns, session_open_ns)
+        advisories.append(
+            HealthFinding(
+                stream=stream,
+                classification="AUXILIARY_FARM_DEGRADED",
+                start_utc=_iso(start_ns),
+                end_utc=_iso(session_close_ns),
+                duration_seconds=_duration_seconds(start_ns, session_close_ns),
+                evidence=[
+                    f"IB {opened.code}: {opened.message}",
+                    "no auxiliary-farm restoration observed before session close",
+                    "auxiliary farm state is not evidence about SPY real-time feed liveness",
+                ],
+            )
+        )
+    return advisories
+
+
+def _auxiliary_advisories(
+    statuses: Sequence[StatusEvent], session_open_ns: int, session_close_ns: int
+) -> list[HealthFinding]:
+    advisories = _paired_auxiliary_advisories(
+        statuses,
+        broken_code=HISTORICAL_FARM_BROKEN,
+        ok_code=HISTORICAL_FARM_OK,
+        stream="HISTORICAL_DATA_FARM",
+        session_open_ns=session_open_ns,
+        session_close_ns=session_close_ns,
+    )
+    advisories.extend(
+        _paired_auxiliary_advisories(
+            statuses,
+            broken_code=SECDEF_FARM_BROKEN,
+            ok_code=SECDEF_FARM_OK,
+            stream="SECURITY_DEFINITION_FARM",
+            session_open_ns=session_open_ns,
+            session_close_ns=session_close_ns,
+        )
+    )
+    for status in statuses:
+        if status.code != FARM_INACTIVE:
+            continue
+        if not session_open_ns <= status.wall_ns <= session_close_ns:
+            continue
+        advisories.append(
+            HealthFinding(
+                stream="AUXILIARY_FARM",
+                classification="AUXILIARY_FARM_INACTIVE",
+                start_utc=_iso(status.wall_ns),
+                end_utc=_iso(status.wall_ns),
+                duration_seconds=0.0,
+                evidence=[
+                    f"IB {status.code}: {status.message}",
+                    "inactive/on-demand auxiliary farm status is advisory only",
+                ],
+            )
+        )
+    return sorted(advisories, key=lambda item: (item.start_utc, item.stream))
+
+
+def _fatal_market_data_status(status: StatusEvent) -> bool:
+    if status.code in FATAL_MARKET_DATA_CODES:
+        return True
+    return status.code == 420 and "market data permissions" in status.message.lower()
 
 
 def analyze_rows_v4(
@@ -403,11 +570,14 @@ def analyze_rows_v4(
                 staging.add_rows(batch)
             statuses = staging.statuses()
             problems: list[HealthFinding] = []
-            advisories: list[HealthFinding] = []
+            advisories: list[HealthFinding] = _auxiliary_advisories(
+                statuses, session_open_ns, session_close_ns
+            )
             metrics: dict[str, StreamMetrics] = {}
 
-            direct_outages = _connectivity_outages(statuses, session_open_ns, session_close_ns)
-            problems.extend(direct_outages)
+            problems.extend(
+                _connectivity_outages(statuses, session_open_ns, session_close_ns)
+            )
 
             for stream in MARKET_STREAMS:
                 row_count, first_utc, last_utc, max_gap, gaps = _gaps(
@@ -453,26 +623,11 @@ def analyze_rows_v4(
                                 ],
                             )
                         )
-                        continue
-
-                    if any(_overlaps(finding, start_ns, end_ns) for finding in direct_outages):
-                        # 1100 already created the direct hard finding. Keep the
-                        # BAR gap in metrics without double-counting one outage.
-                        continue
-                    classification, evidence = _gap_classification(statuses, start_ns, end_ns)
-                    problems.append(
-                        HealthFinding(
-                            stream=BAR_STREAM,
-                            classification=classification,
-                            start_utc=_iso(start_ns),
-                            end_utc=_iso(end_ns),
-                            duration_seconds=duration,
-                            evidence=evidence,
-                        )
-                    )
+                    else:
+                        problems.extend(_bar_gap_findings(statuses, start_ns, end_ns))
 
             for status in statuses:
-                if status.code in FATAL_MARKET_DATA_CODES:
+                if _fatal_market_data_status(status):
                     problems.append(
                         HealthFinding(
                             stream="MARKET_DATA",
@@ -549,7 +704,7 @@ def analyze_rows_v4(
                 for status in staging.auxiliary_farm_statuses
             ]
             analyzer_path = Path(__file__)
-            result = {
+            return {
                 "schema_version": SCHEMA_VERSION,
                 "semantics": "FULL_RTH_HEALTH_V4",
                 "session_open": session_open.astimezone(timezone.utc).isoformat(),
@@ -566,7 +721,6 @@ def analyze_rows_v4(
                 "analyzer_sha256": _sha256(analyzer_path),
                 "input": input_metadata or {},
             }
-            return result
         finally:
             staging.close()
 
@@ -600,6 +754,15 @@ def reanalyze_raw_v4(
     return health, {"integrity": integrity, **input_metadata}
 
 
+def _create_durable(path: Path, payload: bytes) -> None:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    try:
+        os.write(fd, payload)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def write_reanalysis_v4(
     raw_dir: Path,
     output_dir: Path,
@@ -609,13 +772,21 @@ def write_reanalysis_v4(
     original_health: Path | None = None,
     original_manifest: Path | None = None,
 ) -> tuple[Path, Path]:
-    """Write v4 sidecars once. Existing artifacts are never overwritten."""
+    """Write v4 sidecars once; amendment is the completion marker.
+
+    Existing targets are never replaced. A crash after health publication but
+    before amendment publication leaves a visibly incomplete pair and the next
+    invocation refuses to overwrite it, preserving fail-closed provenance.
+    """
     output_dir = output_dir.resolve(strict=False)
     output_dir.mkdir(parents=True, exist_ok=True)
     health_path = output_dir / "health-v4.json"
     amendment_path = output_dir / "manifest-amendment-v4.json"
     if health_path.exists() or amendment_path.exists():
-        raise FileExistsError("v4 reanalysis target already exists; refusing to overwrite evidence")
+        raise FileExistsError(
+            "v4 reanalysis target already exists (or a prior attempt is incomplete); "
+            "refusing to overwrite evidence"
+        )
 
     health, input_metadata = reanalyze_raw_v4(
         raw_dir,
@@ -646,14 +817,10 @@ def write_reanalysis_v4(
             "It does not overwrite, upgrade, or retroactively change any v3 Gate verdict."
         ),
     }
-    amendment_bytes = (json.dumps(amendment, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    amendment_bytes = (json.dumps(amendment, indent=2, sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
 
-    # Create-only semantics. O_EXCL prevents a race from replacing evidence.
-    for path, payload in ((health_path, health_bytes), (amendment_path, amendment_bytes)):
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-        try:
-            os.write(fd, payload)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+    _create_durable(health_path, health_bytes)
+    _create_durable(amendment_path, amendment_bytes)
     return health_path, amendment_path
