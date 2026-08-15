@@ -1,12 +1,13 @@
 """Same-process Windows Task Scheduler host for the read-only Full-RTH Recorder.
 
-Task Scheduler owns this Python process directly. The process imports and runs
-QuoteRecorder in-process: there is no cmd.exe and no child Python lifecycle.
+Task Scheduler owns this Python process directly. QuoteRecorder runs in that
+same process, with no intermediate shell or child Recorder lifecycle. A
+watchdog enforces the actual session deadline even if the main thread is stuck
+inside a blocking storage call.
 """
 
 from __future__ import annotations
 
-import _thread
 import argparse
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
@@ -22,6 +23,7 @@ from ib_execution.durable_io import durable_atomic_write
 from ib_execution.quote_recorder import QuoteRecorder
 from ib_execution.recorder_health_v4 import write_reanalysis_v4
 
+SESSION_RESOLUTION_GRACE = timedelta(minutes=30)
 FINALIZE_GRACE = timedelta(hours=3)
 DEADLINE_SAFETY = timedelta(minutes=30)
 EXIT_HEALTH_PASS = 0
@@ -86,12 +88,21 @@ class RuntimeStatus:
 
 
 class DeadlineWatchdog:
+    """Hard process deadline independent of main-thread responsiveness.
+
+    ``KeyboardInterrupt`` is insufficient here: a main thread stuck inside a
+    kernel fsync cannot service it. The watchdog therefore terminates the one
+    Task-owned Python process directly with ``EXIT_DEADLINE``. It intentionally
+    performs no disk I/O at expiry, because the very failure being bounded may
+    be a wedged storage stack. The last durable runtime-status phase plus the
+    Scheduler exit code are the evidence in that case.
+    """
+
     def __init__(self, status: RuntimeStatus) -> None:
         self.status = status
         self._deadline: datetime | None = None
         self._changed = threading.Event()
         self._closed = threading.Event()
-        self.expired = False
         self._thread = threading.Thread(target=self._run, name="full-rth-deadline", daemon=True)
         self._thread.start()
 
@@ -115,16 +126,7 @@ class DeadlineWatchdog:
                 continue
             remaining = (deadline - datetime.now(timezone.utc)).total_seconds()
             if remaining <= 0:
-                self.expired = True
-                try:
-                    self.status.update(
-                        "FAILED",
-                        failure="dynamic Full-RTH deadline exceeded",
-                        deadline_utc=deadline.isoformat(),
-                    )
-                finally:
-                    _thread.interrupt_main()
-                return
+                os._exit(EXIT_DEADLINE)
             self._changed.wait(min(remaining, 1.0))
             self._changed.clear()
 
@@ -132,7 +134,13 @@ class DeadlineWatchdog:
 class TaskOwnedQuoteRecorder(QuoteRecorder):
     """QuoteRecorder with task lifecycle publication, still the same process."""
 
-    def __init__(self, *args: Any, runtime_status: RuntimeStatus, watchdog: DeadlineWatchdog, **kwargs: Any):
+    def __init__(
+        self,
+        *args: Any,
+        runtime_status: RuntimeStatus,
+        watchdog: DeadlineWatchdog,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
         self.runtime_status = runtime_status
         self.watchdog = watchdog
@@ -202,6 +210,13 @@ def run(argv: list[str] | None = None) -> int:
     stderr = _FsyncLog(args.stderr)
     status = RuntimeStatus(args.runtime_status)
     watchdog = DeadlineWatchdog(status)
+    startup_deadline = datetime.now(timezone.utc) + SESSION_RESOLUTION_GRACE
+    watchdog.arm(startup_deadline)
+    status.update(
+        "WAITING_FOR_SESSION",
+        startup_deadline_utc=startup_deadline.isoformat(),
+        startup_deadline_rule="SESSION_DETAILS_MUST_RESOLVE_WITHIN_30_MINUTES",
+    )
     try:
         with redirect_stdout(stdout), redirect_stderr(stderr):
             recorder = TaskOwnedQuoteRecorder(
@@ -240,9 +255,6 @@ def run(argv: list[str] | None = None) -> int:
                 print(json.dumps({"v3": manifest_v3, "v4": health_v4}, indent=2, sort_keys=True))
                 return EXIT_HEALTH_PASS if health_ok else EXIT_HEALTH_FAIL
             except BaseException as exc:
-                if watchdog.expired and isinstance(exc, KeyboardInterrupt):
-                    print("dynamic Full-RTH deadline exceeded", file=sys.stderr)
-                    return EXIT_DEADLINE
                 status.update("FAILED", failure=f"{type(exc).__name__}: {exc}")
                 traceback.print_exc(file=sys.stderr)
                 return EXIT_RUNTIME_ERROR
