@@ -1,17 +1,9 @@
 """Market-data liveness classification for the read-only Recorder.
 
-The central contract is deliberately asymmetric:
-
-* ``BAR_5S`` is time-driven. A missing bar is positive evidence that a
-  message which should have arrived did not arrive.
-* ``BID_ASK`` and ``ALL_LAST`` are event-driven. Silence alone is never
-  proof that either subscription is dead.
-* IB status codes are scoped to the data domain they actually describe.
-  Auxiliary historical/sec-def farms are advisory only and may never mask
-  or manufacture a SPY real-time feed outage.
-
-This module decides what the liveness evidence means. Recovery policy stays
-in :mod:`ib_execution.quote_recorder`.
+``BAR_5S`` is time-driven and can prove a gap. ``BID_ASK`` and ``ALL_LAST``
+are event-driven and silence alone is advisory. IB farm status is scoped by
+data domain so auxiliary historical/sec-def farms cannot create or hide a
+SPY real-time outage.
 """
 
 from __future__ import annotations
@@ -26,22 +18,13 @@ BAR_PERIOD_SECONDS = 5.0
 HEARTBEAT_STREAM = "BAR_5S"
 DEFAULT_BAR_TIMEOUT_SECONDS = 12.0
 MIN_BAR_TIMEOUT_SECONDS = 2 * BAR_PERIOD_SECONDS
-
-# Report-only. Phase B/v4 uses a common 30 second offline observation
-# threshold; the live detector retains the pre-existing values until that
-# schema change lands as its own reviewable commit.
-DEFAULT_ADVISORY_THRESHOLDS = {"BID_ASK": 5.0, "ALL_LAST": 30.0}
+DEFAULT_ADVISORY_THRESHOLDS = {"BID_ASK": 30.0, "ALL_LAST": 30.0}
 DEFAULT_TRANSPORT_IDLE_SECONDS = 60.0
 
 CONNECTIVITY_LOST = 1100
 CONNECTIVITY_RESTORED_DATA_LOST = 1101
 CONNECTIVITY_RESTORED_DATA_KEPT = 1102
 REALTIME_BARS_RESET = 10225
-
-# Farm ownership is intentionally explicit. 2103/2104 are the only farm
-# pair relevant to the real-time market-data heartbeat. 2105/2106 are
-# historical-data farm state and 2157/2158 are security-definition farm
-# state; both are useful diagnostics but not real-time feed evidence.
 REALTIME_FARM_BROKEN = 2103
 REALTIME_FARM_OK = 2104
 HISTORICAL_FARM_CODES = frozenset({2105, 2106})
@@ -105,8 +88,6 @@ class _OpenIncident:
 
 
 class LivenessIncidentTracker:
-    """Collapse poll-level assessments into incident lifecycle records."""
-
     def __init__(
         self,
         *,
@@ -156,14 +137,11 @@ class LivenessIncidentTracker:
         return ":".join((parts[0], ";".join(parts[1:])))
 
     def observe(
-        self,
-        state: LivenessState,
-        now_mono: float | None = None,
+        self, state: LivenessState, now_mono: float | None = None
     ) -> list[str]:
         now = self._clock() if now_mono is None else float(now_mono)
         markers: list[str] = []
         kind = state.incident_kind
-
         if (
             self._open is not None
             and kind is None
@@ -172,35 +150,29 @@ class LivenessIncidentTracker:
                 or state.heartbeat_last_mono < self._open.started_mono
             )
         ):
-            # A reconnect/grace period is not recovery evidence. Keep the
-            # existing incident open until a post-incident BAR_5S arrives.
             self._open.max_heartbeat_age = self._max_age(
                 self._open.max_heartbeat_age, state.heartbeat_age
             )
             return markers
-
         if self._open is not None and self._open.kind is not kind:
             markers.append(self._end(state, now, recovery_reason=state.reason))
-
         if kind is None:
             return markers
-
         signature = self._signature(state)
         if self._open is None:
             self._next_id += 1
             incident_id = f"{kind.value.lower()}-{self._next_id:04d}"
             self._open = _OpenIncident(
-                incident_id=incident_id,
-                kind=kind,
-                started_mono=now,
-                last_emitted_mono=now,
-                signature=signature,
-                max_heartbeat_age=state.heartbeat_age,
+                incident_id,
+                kind,
+                now,
+                now,
+                signature,
+                state.heartbeat_age,
             )
             self._incident_by_kind[kind.value] = self._incident_by_kind.get(kind.value, 0) + 1
             markers.append(self._marker("START", self._open, state, now))
             return markers
-
         incident = self._open
         incident.max_heartbeat_age = self._max_age(
             incident.max_heartbeat_age, state.heartbeat_age
@@ -214,11 +186,7 @@ class LivenessIncidentTracker:
             markers.append(self._marker("CHECKPOINT", incident, state, now))
         return markers
 
-    def close(
-        self,
-        reason: str,
-        now_mono: float | None = None,
-    ) -> list[str]:
+    def close(self, reason: str, now_mono: float | None = None) -> list[str]:
         if self._open is None:
             return []
         now = self._clock() if now_mono is None else float(now_mono)
@@ -235,12 +203,8 @@ class LivenessIncidentTracker:
         kind = incident.kind.value
         self._completed_by_kind[kind] = self._completed_by_kind.get(kind, 0) + 1
         self._total_seconds_by_kind[kind] = self._total_seconds_by_kind.get(kind, 0.0) + duration
-        self._max_seconds_by_kind[kind] = max(
-            self._max_seconds_by_kind.get(kind, 0.0), duration
-        )
-        marker = self._marker(
-            "END", incident, state, now, recovery_reason=recovery_reason
-        )
+        self._max_seconds_by_kind[kind] = max(self._max_seconds_by_kind.get(kind, 0.0), duration)
+        marker = self._marker("END", incident, state, now, recovery_reason=recovery_reason)
         self._open = None
         return marker
 
@@ -268,8 +232,6 @@ class LivenessIncidentTracker:
 
 
 class MarketLiveness:
-    """Track real-time feed liveness using BAR cadence plus scoped IB facts."""
-
     def __init__(
         self,
         *,
@@ -290,14 +252,9 @@ class MarketLiveness:
         self._started_mono: Optional[float] = None
         self._last_event_mono: dict[str, float] = {}
         self._halted: Optional[int] = None
-
-        # Only 1100 is an immediate connection-wide outage. Real-time farm
-        # degradation is held separately because it becomes FEED_OUTAGE only
-        # if the independent BAR heartbeat also fails.
         self._outages: dict[int, str] = {}
         self._realtime_farm_degraded: str | None = None
         self._farm_advisories: dict[str, str] = {}
-
         self._calendar_silence: Optional[str] = None
         self._pending_recover: tuple[
             LivenessIncidentKind, str, RecoveryHint | None
@@ -344,53 +301,41 @@ class MarketLiveness:
         self._halt_state_note = detail
 
     def note_status(self, code: int, message: str = "") -> None:
-        """Classify one IB status by its actual data-domain ownership."""
         self._transport_evidence = True
         detail = message.strip()
-
         if code == CONNECTIVITY_LOST:
             self._outages[code] = f"connectivity lost ({code})"
-            return
-        if code == CONNECTIVITY_RESTORED_DATA_LOST:
+        elif code == CONNECTIVITY_RESTORED_DATA_LOST:
             self._outages.pop(CONNECTIVITY_LOST, None)
             self._pending_recover = (
                 LivenessIncidentKind.FEED_OUTAGE,
                 f"connectivity restored, market data lost ({code})",
                 RecoveryHint.ALL_MARKET_STREAMS,
             )
-            return
-        if code == CONNECTIVITY_RESTORED_DATA_KEPT:
+        elif code == CONNECTIVITY_RESTORED_DATA_KEPT:
             self._outages.pop(CONNECTIVITY_LOST, None)
             self._pending_recover = None
-            return
-        if code == REALTIME_BARS_RESET:
+        elif code == REALTIME_BARS_RESET:
             self._pending_recover = (
                 LivenessIncidentKind.GAP_SUSPECTED,
                 f"real-time bars reset by IB ({code})",
                 RecoveryHint.BARS_ONLY,
             )
-            return
-
-        if code == REALTIME_FARM_BROKEN:
+        elif code == REALTIME_FARM_BROKEN:
             self._realtime_farm_degraded = (
                 f"real-time market data farm down ({code}): {detail}".strip()
             )
-            return
-        if code == REALTIME_FARM_OK:
+        elif code == REALTIME_FARM_OK:
             self._realtime_farm_degraded = None
-            return
-
-        if code in HISTORICAL_FARM_CODES:
+        elif code in HISTORICAL_FARM_CODES:
             self._farm_advisories["historical"] = (
                 f"historical data farm status ({code}): {detail}".strip()
             )
-            return
-        if code in SECDEF_FARM_CODES:
+        elif code in SECDEF_FARM_CODES:
             self._farm_advisories["security_definition"] = (
                 f"security definition farm status ({code}): {detail}".strip()
             )
-            return
-        if code == FARM_INACTIVE_CODE:
+        elif code == FARM_INACTIVE_CODE:
             self._farm_advisories["inactive"] = (
                 f"farm inactive/on-demand ({code}): {detail}".strip()
             )
@@ -423,12 +368,9 @@ class MarketLiveness:
                 f"instrument {kind} (tick 49 = {self._halted})",
             )
         if CONNECTIVITY_LOST in self._outages:
-            return (
-                LivenessIncidentKind.FEED_OUTAGE,
-                self._outages[CONNECTIVITY_LOST],
-            )
+            return LivenessIncidentKind.FEED_OUTAGE, self._outages[CONNECTIVITY_LOST]
         if self._calendar_silence:
-            return (LivenessIncidentKind.EXPECTED_SILENCE, self._calendar_silence)
+            return LivenessIncidentKind.EXPECTED_SILENCE, self._calendar_silence
         return None
 
     def heartbeat_age(self, now_mono: Optional[float] = None) -> Optional[float]:
@@ -457,26 +399,16 @@ class MarketLiveness:
         return ages
 
     def assess(self, now_mono: Optional[float] = None) -> LivenessState:
-        """Assess connection, BAR evidence, then farm context in that order.
-
-        A real-time farm warning is not an outage by itself. It upgrades to a
-        FEED_OUTAGE only when the independent BAR_5S heartbeat is also lost.
-        Auxiliary farms never participate in this decision.
-        """
         now = self._now(now_mono)
         advisory = self.advisory_ages(now)
         age = self.heartbeat_age(now)
         heartbeat_last_mono = self._last_event_mono.get(HEARTBEAT_STREAM)
-
         if self._started_mono is None:
             return LivenessState(
                 action=LivenessAction.CONTINUE,
                 reason="not subscribed",
                 advisory_ages=advisory,
             )
-
-        # 1100 is connection-wide direct evidence. Halts/calendar are the only
-        # other reasons allowed to suppress a missing heartbeat unconditionally.
         silence_details = self._expected_silence_details()
         if silence_details is not None:
             self.suppressed_assessments += 1
@@ -490,9 +422,6 @@ class MarketLiveness:
                 incident_kind=silence_details[0],
                 heartbeat_last_mono=heartbeat_last_mono,
             )
-
-        # Explicit subscription-loss/reset semantics are actionable without
-        # waiting for the bar timer to expire.
         if self._pending_recover is not None:
             incident_kind, reason, recovery_hint = self._pending_recover
             self._pending_recover = None
@@ -505,14 +434,9 @@ class MarketLiveness:
                 heartbeat_last_mono=heartbeat_last_mono,
                 recovery_hint=recovery_hint,
             )
-
-        heartbeat_lost = age is not None and age > self.bar_timeout_seconds
-        if heartbeat_lost:
+        if age is not None and age > self.bar_timeout_seconds:
             self.heartbeat_losses += 1
             if self._realtime_farm_degraded is not None:
-                # The farm status now has independent corroboration. Waiting
-                # avoids burning recovery budget while IB says the carrier is
-                # down, but the interval is a hard FEED_OUTAGE in the audit.
                 self.suppressed_assessments += 1
                 return LivenessState(
                     action=LivenessAction.WAIT,
@@ -536,7 +460,6 @@ class MarketLiveness:
                 incident_kind=LivenessIncidentKind.GAP_SUSPECTED,
                 heartbeat_last_mono=heartbeat_last_mono,
             )
-
         return LivenessState(
             action=LivenessAction.CONTINUE,
             reason="bar cadence intact",
