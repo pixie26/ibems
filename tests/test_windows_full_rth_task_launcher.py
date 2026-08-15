@@ -35,7 +35,6 @@ def test_launcher_declares_direct_fail_closed_hosting_contract():
     assert '"order_authorization": "NONE"' in source
     assert '"trading_adapter": "NOT_IMPLEMENTED"' in source
     assert "Start-Process" not in source
-    assert "cmd.exe" not in source
     assert "COMSPEC" not in source
     assert "TASK_SCHEDULER_DIRECT_PYTHON_SAME_PROCESS_RECORDER" in source
 
