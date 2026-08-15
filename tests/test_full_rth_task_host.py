@@ -35,6 +35,7 @@ def test_task_host_contains_no_child_process_lifecycle() -> None:
     assert "subprocess.run" not in source
     assert "TaskOwnedQuoteRecorder" in source
     assert "recorder.run()" in source
+    assert "os._exit(EXIT_DEADLINE)" in source
 
 
 def test_runtime_status_records_one_pid_for_task_action_and_recorder(tmp_path: Path) -> None:
@@ -98,12 +99,33 @@ def test_finalize_progress_exposes_the_requested_lifecycle_names(tmp_path: Path)
         assert state["segments_total"] == 7
 
 
+def test_no_ib_probe_returns_the_same_pass_and_fail_exit_codes(tmp_path: Path) -> None:
+    host = _load_host()
+
+    def run_probe(mode: str) -> tuple[int, dict[str, object]]:
+        status_path = tmp_path / f"{mode}-runtime.json"
+        status = host.RuntimeStatus(status_path)
+        args = SimpleNamespace(lifecycle_probe=mode, probe_hold_seconds=1.0)
+        code = host._run_lifecycle_probe(args, status)
+        return code, json.loads(status_path.read_text(encoding="utf-8"))
+
+    pass_code, pass_state = run_probe("pass")
+    fail_code, fail_state = run_probe("fail")
+
+    assert pass_code == host.EXIT_HEALTH_PASS == 0
+    assert pass_state["phase"] == "FINALIZED"
+    assert pass_state["health_ok"] is True
+    assert fail_code == host.EXIT_HEALTH_FAIL == 2
+    assert fail_state["phase"] == "FINALIZED"
+    assert fail_state["health_ok"] is False
+
+
 def test_exit_codes_are_explicit_and_stable() -> None:
     host = _load_host()
 
     assert host.EXIT_HEALTH_PASS == 0
     assert host.EXIT_HEALTH_FAIL == 2
     assert host.EXIT_RUNTIME_ERROR != 0
-    assert host.EXIT_DEADLINE != 0
+    assert host.EXIT_DEADLINE == 5
     assert host.EXIT_RUNTIME_ERROR != host.EXIT_HEALTH_FAIL
     assert host.EXIT_DEADLINE != host.EXIT_HEALTH_FAIL
