@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import importlib.util
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -9,9 +9,9 @@ from xml.etree import ElementTree as ET
 
 import pytest
 
-
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "start_full_rth_recorder_task.py"
+HOST = ROOT / "scripts" / "run_full_rth_recorder_task.py"
 
 
 def _load_launcher():
@@ -23,7 +23,7 @@ def _load_launcher():
     return module
 
 
-def test_launcher_declares_independent_fail_closed_hosting_contract():
+def test_launcher_declares_direct_fail_closed_hosting_contract():
     source = SCRIPT.read_text(encoding="utf-8")
 
     assert "WINDOWS_TASK_SCHEDULER" in source
@@ -35,15 +35,17 @@ def test_launcher_declares_independent_fail_closed_hosting_contract():
     assert '"order_authorization": "NONE"' in source
     assert '"trading_adapter": "NOT_IMPLEMENTED"' in source
     assert "Start-Process" not in source
+    assert "cmd.exe" not in source
+    assert "COMSPEC" not in source
+    assert "TASK_SCHEDULER_DIRECT_PYTHON_SAME_PROCESS_RECORDER" in source
 
 
-def test_task_xml_has_no_restart_and_has_bounded_limited_execution():
+def test_task_xml_has_no_restart_and_delegates_deadline_to_owned_python():
     launcher = _load_launcher()
     plan = {
         "principal": "HOST\\user",
-        "execution_time_limit_hours": 8,
-        "execute": r"C:\Windows\System32\cmd.exe",
-        "arguments": "/D /S /C echo probe",
+        "execute": sys.executable,
+        "arguments": f'"{HOST}" --probe',
         "working_directory": str(ROOT),
     }
     root = ET.fromstring(launcher._task_xml(plan))
@@ -51,13 +53,14 @@ def test_task_xml_has_no_restart_and_has_bounded_limited_execution():
 
     assert root.findtext(".//t:LogonType", namespaces=ns) == "InteractiveToken"
     assert root.findtext(".//t:RunLevel", namespaces=ns) == "LeastPrivilege"
-    assert root.findtext(".//t:ExecutionTimeLimit", namespaces=ns) == "PT8H"
+    assert root.findtext(".//t:ExecutionTimeLimit", namespaces=ns) == "PT0S"
     assert root.findtext(".//t:MultipleInstancesPolicy", namespaces=ns) == "IgnoreNew"
     assert root.find(".//t:RestartOnFailure", namespaces=ns) is None
+    assert root.findtext(".//t:Command", namespaces=ns) == sys.executable
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows Task Scheduler launcher")
-def test_validate_only_builds_readonly_task_without_registering_it():
+def test_validate_only_builds_direct_readonly_python_task_without_registering_it():
     artifact_root = ROOT / "artifacts" / "ib_preflight" / "launcher-validation-only"
     completed = subprocess.run(
         [
@@ -88,7 +91,11 @@ def test_validate_only_builds_readonly_task_without_registering_it():
     assert plan["auto_restart"] is False
     assert plan["operating_mode"] == "READ_ONLY"
     assert plan["order_authorization"] == "NONE"
-    assert plan["recorder_arguments"][:2] == ["-m", "ib_execution.quote_recorder"]
+    assert plan["execute"] == str(Path(sys.executable).resolve())
+    assert plan["task_host_script"] == str(HOST.resolve())
+    assert plan["process_ownership"] == "TASK_SCHEDULER_DIRECT_PYTHON_SAME_PROCESS_RECORDER"
+    assert plan["scheduler_execution_time_limit"] == "PT0S"
+    assert plan["dynamic_deadline_rule"] == "RTH_CLOSE_PLUS_3H_FINALIZE_PLUS_30M_SAFETY"
     assert plan["artifact_root"] == str(artifact_root.resolve())
     expected_status = subprocess.run(
         ["git", "-C", str(ROOT), "status", "--porcelain"],
