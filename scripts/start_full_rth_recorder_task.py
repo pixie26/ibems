@@ -1,8 +1,11 @@
 """Register and start the read-only Full-RTH Recorder as a direct Python task.
 
-Task Scheduler owns the actual Python process. There is no ``cmd.exe`` parent
-and no child Python process. The task host computes its deadline from the
-actual IB RTH session and enforces ``RTH close + 3h finalize + 30m safety``.
+Task Scheduler owns the actual Python process. There is no shell parent and no
+child Python process. The task host computes its deadline from the actual IB
+RTH session and enforces ``RTH close + 3h finalize + 30m safety``.
+
+For acceptance outside RTH, ``--lifecycle-probe`` passes a no-IB probe mode to
+the identical Task-owned host process.
 """
 
 from __future__ import annotations
@@ -124,6 +127,8 @@ def build_plan(args: argparse.Namespace) -> dict[str, object]:
         raise ValueError("client id is outside the supported range")
     if not 1 <= args.port <= 65_535:
         raise ValueError("port is outside the supported range")
+    if args.probe_hold_seconds <= 0:
+        raise ValueError("probe hold seconds must be positive")
 
     repo = Path(__file__).resolve().parents[1]
     state = json.loads((repo / "STATE.json").read_text(encoding="utf-8"))
@@ -171,6 +176,15 @@ def build_plan(args: argparse.Namespace) -> dict[str, object]:
         "--stderr",
         str(stderr_path),
     ]
+    if args.lifecycle_probe is not None:
+        host_arguments.extend(
+            [
+                "--lifecycle-probe",
+                str(args.lifecycle_probe),
+                "--probe-hold-seconds",
+                str(float(args.probe_hold_seconds)),
+            ]
+        )
 
     return {
         "schema_version": 2,
@@ -194,6 +208,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, object]:
         "process_ownership": "TASK_SCHEDULER_DIRECT_PYTHON_SAME_PROCESS_RECORDER",
         "scheduler_execution_time_limit": "PT0S",
         "dynamic_deadline_rule": "RTH_CLOSE_PLUS_3H_FINALIZE_PLUS_30M_SAFETY",
+        "lifecycle_probe": args.lifecycle_probe,
         "allow_start_on_battery": True,
         "stop_on_battery": False,
         "multiple_instances": "IGNORE_NEW",
@@ -217,6 +232,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--client-id", required=True, type=int)
     parser.add_argument("--port", default=4002, type=int)
     parser.add_argument("--python-exe")
+    parser.add_argument(
+        "--lifecycle-probe",
+        choices=("pass", "fail", "hold"),
+        help="start the Task-owned host without connecting to IB",
+    )
+    parser.add_argument("--probe-hold-seconds", type=float, default=3600.0)
     parser.add_argument("--validate-only", action="store_true")
     return parser.parse_args(argv)
 
