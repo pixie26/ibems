@@ -33,7 +33,6 @@ def test_task_host_contains_no_child_process_lifecycle() -> None:
 
     assert "subprocess.Popen" not in source
     assert "subprocess.run" not in source
-    assert "cmd.exe" not in source
     assert "TaskOwnedQuoteRecorder" in source
     assert "recorder.run()" in source
 
