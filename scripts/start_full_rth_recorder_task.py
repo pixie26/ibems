@@ -1,7 +1,8 @@
-"""Launch the read-only Full-RTH Recorder outside the Codex AppX lifecycle.
+"""Register and start the read-only Full-RTH Recorder as a direct Python task.
 
-The task is registered without triggers and started explicitly.  It never
-restarts the Recorder and never changes broker or order authorization.
+Task Scheduler owns the actual Python process. There is no ``cmd.exe`` parent
+and no child Python process. The task host computes its deadline from the
+actual IB RTH session and enforces ``RTH close + 3h finalize + 30m safety``.
 """
 
 from __future__ import annotations
@@ -19,7 +20,6 @@ import subprocess
 import sys
 import tempfile
 from xml.etree import ElementTree as ET
-
 
 TASK_NAME_RE = re.compile(r"^ibems-full-rth-[A-Za-z0-9_.-]{1,64}$")
 TASK_NS = "http://schemas.microsoft.com/windows/2004/02/mit/task"
@@ -45,7 +45,7 @@ def _task_xml(plan: dict[str, object]) -> bytes:
     task = ET.Element(f"{{{TASK_NS}}}Task", {"version": "1.4"})
     registration = ET.SubElement(task, f"{{{TASK_NS}}}RegistrationInfo")
     ET.SubElement(registration, f"{{{TASK_NS}}}Description").text = (
-        "ibems read-only Full-RTH Recorder; no restart and no broker writes"
+        "ibems read-only Full-RTH Recorder; direct Python ownership; no restart"
     )
     ET.SubElement(task, f"{{{TASK_NS}}}Triggers")
 
@@ -65,7 +65,9 @@ def _task_xml(plan: dict[str, object]) -> bytes:
         "RunOnlyIfNetworkAvailable": "false",
         "Enabled": "true",
         "Hidden": "false",
-        "ExecutionTimeLimit": f"PT{plan['execution_time_limit_hours']}H",
+        # PT0S disables Scheduler's fixed wall-clock kill. The directly-owned
+        # Python host enforces the actual IB session close + 3h30m deadline.
+        "ExecutionTimeLimit": "PT0S",
         "Priority": "7",
     }
     for name, value in values.items():
@@ -78,7 +80,6 @@ def _task_xml(plan: dict[str, object]) -> bytes:
     ET.SubElement(execute, f"{{{TASK_NS}}}WorkingDirectory").text = str(
         plan["working_directory"]
     )
-
     return ET.tostring(task, encoding="utf-16", xml_declaration=True)
 
 
@@ -96,10 +97,13 @@ def _run_schtasks(*arguments: str, check: bool = True) -> subprocess.CompletedPr
 
 def _write_atomic_json(path: Path, value: dict[str, object]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(value, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    payload = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    try:
+        os.write(fd, payload)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
     os.replace(temporary, path)
 
 
@@ -115,15 +119,11 @@ def _git_output(repo: Path, *arguments: str) -> str:
 
 def build_plan(args: argparse.Namespace) -> dict[str, object]:
     if not TASK_NAME_RE.fullmatch(args.task_name):
-        raise ValueError(
-            "task name must match ibems-full-rth-[A-Za-z0-9_.-]{1,64}"
-        )
+        raise ValueError("task name must match ibems-full-rth-[A-Za-z0-9_.-]{1,64}")
     if not 1 <= args.client_id <= 2_147_483_647:
         raise ValueError("client id is outside the supported range")
     if not 1 <= args.port <= 65_535:
         raise ValueError("port is outside the supported range")
-    if not 1 <= args.execution_hours <= 24:
-        raise ValueError("execution hours must be between 1 and 24")
 
     repo = Path(__file__).resolve().parents[1]
     state = json.loads((repo / "STATE.json").read_text(encoding="utf-8"))
@@ -137,9 +137,9 @@ def build_plan(args: argparse.Namespace) -> dict[str, object]:
         if gate.get(key) != expected:
             raise RuntimeError(f"STATE.json {key} must be {expected}")
 
-    python = Path(args.python_exe or repo / ".venv312" / "python.exe").resolve(
-        strict=True
-    )
+    python = Path(args.python_exe or repo / ".venv312" / "python.exe").resolve(strict=True)
+    host_script = (repo / "scripts" / "run_full_rth_recorder_task.py").resolve(strict=True)
+
     artifact_root = Path(args.artifact_root)
     if not artifact_root.is_absolute():
         artifact_root = repo / artifact_root
@@ -149,53 +149,51 @@ def build_plan(args: argparse.Namespace) -> dict[str, object]:
         raise ValueError(f"artifact root must stay below {allowed_root}")
 
     raw_root = artifact_root / "raw"
-    status_path = (
-        Path(args.status_path)
-        if args.status_path
-        else artifact_root / "recorder-status.json"
-    )
-    if not status_path.is_absolute():
-        status_path = repo / status_path
-    status_path = status_path.resolve(strict=False)
-    if not _within(status_path, artifact_root):
-        raise ValueError("status path must stay under artifact root")
-
+    recorder_status = artifact_root / "recorder-status.json"
+    runtime_status = artifact_root / "task-runtime-status.json"
     stdout_path = artifact_root / "recorder-stdout.log"
     stderr_path = artifact_root / "recorder-stderr.log"
-    recorder_arguments = [
-        "-m",
-        "ib_execution.quote_recorder",
+
+    host_arguments = [
+        str(host_script),
         "--root",
         str(raw_root),
         "--port",
         str(args.port),
         "--client-id",
         str(args.client_id),
-        "--status-path",
-        str(status_path),
+        "--recorder-status",
+        str(recorder_status),
+        "--runtime-status",
+        str(runtime_status),
+        "--stdout",
+        str(stdout_path),
+        "--stderr",
+        str(stderr_path),
     ]
-    command = subprocess.list2cmdline([str(python), *recorder_arguments])
-    command += f" 1>>{subprocess.list2cmdline([str(stdout_path)])}"
-    command += f" 2>>{subprocess.list2cmdline([str(stderr_path)])}"
-    comspec = os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe")
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "launcher": "WINDOWS_TASK_SCHEDULER",
         "purpose": "read-only Full-RTH QuoteRecorder outside the Codex AppX lifecycle",
         "task_name": args.task_name,
         "principal": _windows_identity(),
         "run_level": "LIMITED",
         "working_directory": str(repo),
-        "execute": comspec,
-        "arguments": f'/D /S /C "{command}"',
+        "execute": str(python),
+        "arguments": subprocess.list2cmdline(host_arguments),
         "python": str(python),
-        "recorder_arguments": recorder_arguments,
+        "task_host_script": str(host_script),
+        "task_host_arguments": host_arguments,
         "artifact_root": str(artifact_root),
-        "status_path": str(status_path),
+        "raw_root": str(raw_root),
+        "recorder_status_path": str(recorder_status),
+        "runtime_status_path": str(runtime_status),
         "stdout_path": str(stdout_path),
         "stderr_path": str(stderr_path),
-        "execution_time_limit_hours": args.execution_hours,
+        "process_ownership": "TASK_SCHEDULER_DIRECT_PYTHON_SAME_PROCESS_RECORDER",
+        "scheduler_execution_time_limit": "PT0S",
+        "dynamic_deadline_rule": "RTH_CLOSE_PLUS_3H_FINALIZE_PLUS_30M_SAFETY",
         "allow_start_on_battery": True,
         "stop_on_battery": False,
         "multiple_instances": "IGNORE_NEW",
@@ -219,8 +217,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--client-id", required=True, type=int)
     parser.add_argument("--port", default=4002, type=int)
     parser.add_argument("--python-exe")
-    parser.add_argument("--status-path")
-    parser.add_argument("--execution-hours", default=8, type=int)
     parser.add_argument("--validate-only", action="store_true")
     return parser.parse_args(argv)
 
@@ -243,10 +239,7 @@ def main(argv: list[str] | None = None) -> int:
 
     query = _run_schtasks("/Query", "/TN", args.task_name, check=False)
     if query.returncode == 0:
-        print(
-            f"refusing to launch: scheduled task already exists: {args.task_name}",
-            file=sys.stderr,
-        )
+        print(f"refusing to launch: scheduled task already exists: {args.task_name}", file=sys.stderr)
         return 3
 
     artifact_root = Path(str(plan["artifact_root"]))
