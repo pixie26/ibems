@@ -1,9 +1,57 @@
-"""Market-data liveness classification for the read-only Recorder.
+"""
+Is the feed dead, or is the market merely quiet?
 
-``BAR_5S`` is time-driven and can prove a gap. ``BID_ASK`` and ``ALL_LAST``
-are event-driven and silence alone is advisory. IB farm status is scoped by
-data domain so auxiliary historical/sec-def farms cannot create or hide a
-SPY real-time outage.
+    ####################################################################
+    #  For an event-driven stream, those two are indistinguishable by  #
+    #  timing alone. No amount of threshold tuning fixes that; the     #
+    #  information is not in the data.                                #
+    ####################################################################
+
+WHY A TIMEOUT IS THE WRONG PRIMITIVE
+------------------------------------
+For an event-driven stream, "no BidAsk for 30 seconds" and "no quote update
+happened in 30 seconds" are the same observation. Real market-data protocols
+solve this with sequence numbers and/or protocol heartbeats. IB's API exposes
+neither per-stream sequence numbers nor an event-driven heartbeat, so silence
+on ``BID_ASK`` or ``ALL_LAST`` remains a quality observation, not proof of
+feed loss.
+
+IB does expose the other half: ``reqRealTimeBars`` is time-driven. A bar is a
+message we know should arrive, so a missing ``BAR_5S`` is decidable in exactly
+the way a missing quote is not.
+
+THE OBSERVATION THIS RESTS ON
+-----------------------------
+``docs/GATE_B2_OVERNIGHT_20260810.md`` section 3 records a 120.047s OVERNIGHT
+window on a real Gateway:
+
+    ALL_LAST   13 events   largest gap 29.641s
+    BAR_5S     25 events   largest gap  5.235s
+
+The tape was nearly dead and the bar cadence did not move. That asymmetry is
+the whole design:
+
+    BAR_5S              time-driven    heartbeat; may stop the run
+    BID_ASK, ALL_LAST   event-driven   recorded/advisory; never act alone
+
+WHAT ANSWERS "SHOULD THIS SILENCE ALARM?"
+-----------------------------------------
+Explicit evidence, not a quote timeout. ``1100`` is a connection-wide outage.
+``2103/2104`` describe the real-time market-data farm, but a 2103 warning alone
+is only degradation evidence: it becomes a hard ``FEED_OUTAGE`` only when the
+independent BAR heartbeat is also missing. ``2105/2106`` are historical-data
+farm status and ``2157/2158`` are security-definition farm status; both are
+useful diagnostics but cannot manufacture or suppress SPY real-time liveness.
+A known halt/session boundary remains legitimate expected silence.
+
+The two open questions this cannot answer offline -- whether bars keep flowing
+through a halt, and whether tick 49 arrives without being asked for in
+``genericTickList`` -- still need a real Gateway. Until measured, an unobserved
+halt state is unknown, never assumed.
+
+    NOTE ON SCOPE: this module decides what the evidence means. Recovery
+    machinery (reconnect budget, resubscribe, finalize) stays in
+    ``quote_recorder`` and is not duplicated here.
 """
 
 from __future__ import annotations
@@ -14,44 +62,71 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Optional
 
+# IB emits one real-time bar per five seconds per subscription.
 BAR_PERIOD_SECONDS = 5.0
 HEARTBEAT_STREAM = "BAR_5S"
+
+# Two full periods plus room for delivery jitter. Never derived from how busy
+# the tape is, because the bar cadence is not either.
 DEFAULT_BAR_TIMEOUT_SECONDS = 12.0
 MIN_BAR_TIMEOUT_SECONDS = 2 * BAR_PERIOD_SECONDS
+
+# Event-driven silence is report-only. Use one common observation threshold so
+# BID_ASK and ALL_LAST have one health vocabulary without implying a hard SLA.
 DEFAULT_ADVISORY_THRESHOLDS = {"BID_ASK": 30.0, "ALL_LAST": 30.0}
+
+# ib_async's transport watchdog is separate: it detects a silent peer, not a
+# quiet market stream. EventLoopHeartbeat covers a stuck event loop.
 DEFAULT_TRANSPORT_IDLE_SECONDS = 60.0
 
+# 1100/1101/1102 are connection-wide. After 1101 subscriptions are lost and
+# must be re-requested; after 1102 they are maintained.
 CONNECTIVITY_LOST = 1100
 CONNECTIVITY_RESTORED_DATA_LOST = 1101
 CONNECTIVITY_RESTORED_DATA_KEPT = 1102
 REALTIME_BARS_RESET = 10225
+
+# Farm ownership matters. Only 2103/2104 describe the real-time market-data
+# farm. Historical and security-definition farms are advisory diagnostics.
 REALTIME_FARM_BROKEN = 2103
 REALTIME_FARM_OK = 2104
 HISTORICAL_FARM_CODES = frozenset({2105, 2106})
 SECDEF_FARM_CODES = frozenset({2157, 2158})
 FARM_ADVISORY_CODES = HISTORICAL_FARM_CODES | SECDEF_FARM_CODES
+
+# "inactive but should be available upon demand" -- never an outage.
 FARM_INACTIVE_CODE = 2108
 
 
 class LivenessAction(Enum):
+    """What the Recorder loop should do, decided in one place."""
+
     CONTINUE = "continue"
+    #: Silence is explained. Record it, do not act, do not call it a gap.
     WAIT = "wait"
+    #: The subscription is gone or unresponsive; re-request market data.
     RECOVER_SUBSCRIPTION = "recover_subscription"
 
 
 class LivenessIncidentKind(Enum):
+    """Audit classification for a sustained non-normal liveness state."""
+
     FEED_OUTAGE = "FEED_OUTAGE"
     EXPECTED_SILENCE = "EXPECTED_SILENCE"
     GAP_SUSPECTED = "GAP_SUSPECTED"
 
 
 class RecoveryHint(Enum):
+    """An explicit IB instruction about the smallest subscription repair."""
+
     BARS_ONLY = "bars_only"
     ALL_MARKET_STREAMS = "all_market_streams"
 
 
 @dataclass(frozen=True)
 class LivenessState:
+    """One assessment. Everything a SYSTEM marker or report needs."""
+
     action: LivenessAction
     reason: str
     heartbeat_age: Optional[float] = None
@@ -63,6 +138,7 @@ class LivenessState:
     recovery_hint: RecoveryHint | None = None
 
     def as_marker(self) -> str:
+        """Compact, greppable form for the raw log."""
         parts = [f"action={self.action.value}", f"reason={self.reason}"]
         if self.incident_kind is not None:
             parts.append(f"incident_kind={self.incident_kind.value}")
@@ -88,6 +164,13 @@ class _OpenIncident:
 
 
 class LivenessIncidentTracker:
+    """Turn poll-level assessments into bounded incident lifecycle records.
+
+    The Recorder assesses liveness repeatedly. That polling cadence is an
+    implementation detail, not an incident count. Emit only state edges,
+    material updates, optional durable checkpoints, and recovery.
+    """
+
     def __init__(
         self,
         *,
@@ -107,6 +190,8 @@ class LivenessIncidentTracker:
 
     @staticmethod
     def _signature(state: LivenessState) -> tuple[str, str | None]:
+        # Ages move on every poll and are deliberately excluded. Only a
+        # semantic action or explicit-silence change merits an UPDATE row.
         return (state.action.value, state.expected_silence)
 
     @staticmethod
@@ -139,6 +224,7 @@ class LivenessIncidentTracker:
     def observe(
         self, state: LivenessState, now_mono: float | None = None
     ) -> list[str]:
+        """Return zero or more lifecycle markers for one assessment."""
         now = self._clock() if now_mono is None else float(now_mono)
         markers: list[str] = []
         kind = state.incident_kind
@@ -150,6 +236,8 @@ class LivenessIncidentTracker:
                 or state.heartbeat_last_mono < self._open.started_mono
             )
         ):
+            # A reconnect/grace reset is not recovery evidence. Keep the
+            # incident open until a post-incident BAR_5S arrives.
             self._open.max_heartbeat_age = self._max_age(
                 self._open.max_heartbeat_age, state.heartbeat_age
             )
@@ -187,6 +275,7 @@ class LivenessIncidentTracker:
         return markers
 
     def close(self, reason: str, now_mono: float | None = None) -> list[str]:
+        """Close an incident at a clean boundary such as normal session end."""
         if self._open is None:
             return []
         now = self._clock() if now_mono is None else float(now_mono)
@@ -209,6 +298,7 @@ class LivenessIncidentTracker:
         return marker
 
     def manifest(self, now_mono: float | None = None) -> dict[str, object]:
+        """Bounded incident statistics for the final manifest."""
         now = self._clock() if now_mono is None else float(now_mono)
         open_incident = None
         if self._open is not None:
@@ -232,6 +322,12 @@ class LivenessIncidentTracker:
 
 
 class MarketLiveness:
+    """Track feed liveness from BAR cadence plus scoped IB evidence.
+
+    Pure state: no IO, no IB objects, injectable clock. The Recorder feeds it
+    observations and asks one question. Recovery actions remain elsewhere.
+    """
+
     def __init__(
         self,
         *,
@@ -252,6 +348,10 @@ class MarketLiveness:
         self._started_mono: Optional[float] = None
         self._last_event_mono: dict[str, float] = {}
         self._halted: Optional[int] = None
+
+        # Only 1100 belongs in unconditional outage state. A real-time farm
+        # warning is held separately until a missing BAR independently confirms
+        # that the market-data path is not producing its time-driven heartbeat.
         self._outages: dict[int, str] = {}
         self._realtime_farm_degraded: str | None = None
         self._farm_advisories: dict[str, str] = {}
@@ -259,13 +359,19 @@ class MarketLiveness:
         self._pending_recover: tuple[
             LivenessIncidentKind, str, RecoveryHint | None
         ] | None = None
+
+        # Veto-only transport evidence. Positive TWS activity can prevent a
+        # destructive socket reconnect, but never initiates recovery itself.
         self._transport_evidence = False
         self.suppressed_assessments = 0
         self.heartbeat_losses = 0
         self._halt_state_available: Optional[bool] = None
         self._halt_state_note: Optional[str] = None
 
+    # -- observations -------------------------------------------------
+
     def subscription_started(self, now_mono: Optional[float] = None) -> None:
+        """Reset the clock origin. Before this there is nothing to judge."""
         self._started_mono = self._now(now_mono)
         self._last_event_mono.clear()
         self._pending_recover = None
@@ -276,12 +382,15 @@ class MarketLiveness:
         self._transport_evidence = True
 
     def note_transport_activity(self) -> None:
+        """Record inbound protocol activity without treating it as cadence."""
         self._transport_evidence = True
 
     def transport_evidence(self) -> bool:
+        """Whether transport is known alive; veto-only, never a trigger."""
         return self._transport_evidence
 
     def note_halted(self, value: float) -> None:
+        """Generic tick 49: 0 trading, 1 halted, 2 volatility pause."""
         if value is None or (isinstance(value, float) and math.isnan(value)):
             return
         self._halted = int(value)
@@ -289,6 +398,7 @@ class MarketLiveness:
         self._halt_state_note = "tick 49 observed"
 
     def note_halt_state_source(self, requested: bool, detail: str = "") -> None:
+        """Record whether tick 49 was actually requested."""
         if requested:
             if self._halt_state_available is None:
                 self._halt_state_note = detail or "tick 49 requested; awaiting first value"
@@ -297,10 +407,12 @@ class MarketLiveness:
         self._halt_state_note = detail or "tick 49 not requested"
 
     def note_halt_state_unavailable(self, detail: str) -> None:
+        """The Gateway refused to serve the halt tick (for example error 321)."""
         self._halt_state_available = False
         self._halt_state_note = detail
 
     def note_status(self, code: int, message: str = "") -> None:
+        """Classify one IB status by the data domain it actually describes."""
         self._transport_evidence = True
         detail = message.strip()
         if code == CONNECTIVITY_LOST:
@@ -341,6 +453,7 @@ class MarketLiveness:
             )
 
     def note_transport_idle(self, idle_seconds: float) -> None:
+        """ib_async timeout: nothing at all arrived from TWS."""
         self._transport_evidence = False
         self._pending_recover = (
             LivenessIncidentKind.GAP_SUSPECTED,
@@ -349,12 +462,16 @@ class MarketLiveness:
         )
 
     def enter_calendar_silence(self, reason: str) -> None:
+        """A known auction/session boundary. Silence here is scheduled."""
         self._calendar_silence = reason
 
     def leave_calendar_silence(self) -> None:
         self._calendar_silence = None
 
+    # -- the question -------------------------------------------------
+
     def expected_silence(self) -> Optional[str]:
+        """Why silence is legitimate right now, or None."""
         details = self._expected_silence_details()
         return None if details is None else details[1]
 
@@ -374,12 +491,14 @@ class MarketLiveness:
         return None
 
     def heartbeat_age(self, now_mono: Optional[float] = None) -> Optional[float]:
+        """Seconds since the last 5-second bar, measured from subscribe."""
         if self._started_mono is None:
             return None
         last = self._last_event_mono.get(HEARTBEAT_STREAM, self._started_mono)
         return max(0.0, self._now(now_mono) - last)
 
     def last_market_event_age(self, now_mono: Optional[float] = None) -> Optional[float]:
+        """Seconds since any market stream last delivered."""
         if self._started_mono is None:
             return None
         now = self._now(now_mono)
@@ -387,6 +506,7 @@ class MarketLiveness:
         return max(0.0, now - last)
 
     def advisory_ages(self, now_mono: Optional[float] = None) -> dict[str, float]:
+        """Over-threshold ages of event-driven streams. Report only."""
         if self._started_mono is None:
             return {}
         now = self._now(now_mono)
@@ -399,6 +519,7 @@ class MarketLiveness:
         return ages
 
     def assess(self, now_mono: Optional[float] = None) -> LivenessState:
+        """Combine connection, BAR cadence, and scoped farm evidence."""
         now = self._now(now_mono)
         advisory = self.advisory_ages(now)
         age = self.heartbeat_age(now)
@@ -409,6 +530,9 @@ class MarketLiveness:
                 reason="not subscribed",
                 advisory_ages=advisory,
             )
+
+        # Only truly explicit silence -- halt, 1100, calendar boundary -- may
+        # suppress a missing heartbeat without corroboration.
         silence_details = self._expected_silence_details()
         if silence_details is not None:
             self.suppressed_assessments += 1
@@ -422,6 +546,8 @@ class MarketLiveness:
                 incident_kind=silence_details[0],
                 heartbeat_last_mono=heartbeat_last_mono,
             )
+
+        # Explicit subscription loss/reset beats waiting for the bar timer.
         if self._pending_recover is not None:
             incident_kind, reason, recovery_hint = self._pending_recover
             self._pending_recover = None
@@ -434,9 +560,12 @@ class MarketLiveness:
                 heartbeat_last_mono=heartbeat_last_mono,
                 recovery_hint=recovery_hint,
             )
+
         if age is not None and age > self.bar_timeout_seconds:
             self.heartbeat_losses += 1
             if self._realtime_farm_degraded is not None:
+                # 2103 alone is not an outage. Missing BAR is the independent
+                # corroboration that upgrades the interval to FEED_OUTAGE.
                 self.suppressed_assessments += 1
                 return LivenessState(
                     action=LivenessAction.WAIT,
@@ -460,6 +589,7 @@ class MarketLiveness:
                 incident_kind=LivenessIncidentKind.GAP_SUSPECTED,
                 heartbeat_last_mono=heartbeat_last_mono,
             )
+
         return LivenessState(
             action=LivenessAction.CONTINUE,
             reason="bar cadence intact",
@@ -469,6 +599,7 @@ class MarketLiveness:
         )
 
     def manifest(self) -> dict[str, object]:
+        """Configuration and liveness evidence needed by the report."""
         return {
             "heartbeat_stream": HEARTBEAT_STREAM,
             "bar_period_seconds": BAR_PERIOD_SECONDS,
