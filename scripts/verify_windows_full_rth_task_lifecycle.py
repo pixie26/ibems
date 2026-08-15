@@ -113,6 +113,33 @@ def _descendant_processes(pid: int) -> list[dict[str, Any]]:
     return descendants
 
 
+def _classify_descendants(
+    pid: int, descendants: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Separate the one Windows console host from application descendants."""
+    expected_console_hosts: list[dict[str, Any]] = []
+    unexpected: list[dict[str, Any]] = []
+    for process in descendants:
+        executable = str(process.get("ExecutablePath") or "").replace("/", "\\").lower()
+        command_line = str(process.get("CommandLine") or "").lower()
+        try:
+            parent_pid = int(process.get("ParentProcessId"))
+        except (TypeError, ValueError):
+            parent_pid = -1
+        if (
+            parent_pid == int(pid)
+            and executable.endswith("\\windows\\system32\\conhost.exe")
+            and "conhost.exe" in command_line
+        ):
+            expected_console_hosts.append(process)
+        else:
+            unexpected.append(process)
+    if len(expected_console_hosts) > 1:
+        unexpected.extend(expected_console_hosts[1:])
+        expected_console_hosts = expected_console_hosts[:1]
+    return expected_console_hosts, unexpected
+
+
 def _wait_for_status(
     path: Path,
     phases: set[str],
@@ -337,9 +364,13 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
         process_before = _assert_owned_process(state)
         pid = int(state["task_action_pid"])
         descendants_before = _descendant_processes(pid)
-        if descendants_before:
+        console_hosts, unexpected_descendants = _classify_descendants(
+            pid, descendants_before
+        )
+        if unexpected_descendants:
             raise RuntimeError(
-                f"Task-owned Recorder host unexpectedly created child processes: {descendants_before}"
+                "Task-owned Recorder host unexpectedly created application descendants: "
+                f"{unexpected_descendants}"
             )
         ended = _run(["schtasks.exe", "/End", "/TN", task_name], check=False)
         if ended.returncode != 0:
@@ -354,8 +385,10 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
             "runtime_status_before_stop": state,
             "process_before_stop": process_before,
             "descendant_processes_before_stop": descendants_before,
+            "expected_console_host_processes": console_hosts,
+            "unexpected_descendant_processes": unexpected_descendants,
             "pid_gone_after_scheduler_stop": True,
-            "no_descendant_processes": True,
+            "no_unexpected_descendant_processes": True,
             "launcher_already_exited_while_task_alive": True,
             "stdout_bytes": stdout.stat().st_size,
             "stderr_bytes": stderr.stat().st_size,
@@ -419,7 +452,35 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(report, indent=2, sort_keys=True))
         return 0
     except (KeyError, OSError, RuntimeError, subprocess.SubprocessError, ValueError, TimeoutError) as exc:
+        artifact_parent = Path(args.artifact_parent)
+        if not artifact_parent.is_absolute():
+            artifact_parent = ROOT / artifact_parent
+        artifact_parent = artifact_parent.resolve(strict=False)
+        artifact_parent.mkdir(parents=True, exist_ok=True)
+        failure_path = artifact_parent / (
+            "lifecycle-probe-failure-"
+            + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            + ".json"
+        )
+        failure_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "passed": False,
+                    "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+                    "artifact_parent": str(artifact_parent),
+                    "task_prefix": args.task_prefix,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         print(f"lifecycle probe failed: {exc}", file=sys.stderr)
+        print(f"failure evidence: {failure_path}", file=sys.stderr)
         return 2
 
 

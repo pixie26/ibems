@@ -103,6 +103,60 @@ def test_lifecycle_probe_cleanup_ends_task_before_delete_and_waits_for_tree(
     assert calls[-1] == ("delete", "ibems-full-rth-test")
 
 
+def test_lifecycle_allows_only_one_direct_system_console_host() -> None:
+    verifier = _load_verifier()
+    console = {
+        "ProcessId": 202,
+        "ParentProcessId": 101,
+        "ExecutablePath": r"C:\Windows\System32\conhost.exe",
+        "CommandLine": r"\??\C:\Windows\System32\conhost.exe 0x4",
+    }
+    application_child = {
+        "ProcessId": 303,
+        "ParentProcessId": 101,
+        "ExecutablePath": r"C:\Windows\System32\cmd.exe",
+        "CommandLine": r"C:\Windows\System32\cmd.exe /c echo unsafe",
+    }
+    grandchild_console = {**console, "ProcessId": 404, "ParentProcessId": 303}
+
+    expected, unexpected = verifier._classify_descendants(
+        101, [console, application_child, grandchild_console]
+    )
+
+    assert expected == [console]
+    assert unexpected == [application_child, grandchild_console]
+
+
+def test_lifecycle_failure_is_preserved_as_small_unique_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verifier = _load_verifier()
+
+    def fail(_args):
+        raise RuntimeError("causal failure")
+
+    monkeypatch.setattr(verifier, "verify", fail)
+
+    assert (
+        verifier.main(
+            [
+                "--artifact-parent",
+                str(tmp_path),
+                "--task-prefix",
+                "ibems-full-rth-test",
+            ]
+        )
+        == 2
+    )
+    reports = list(tmp_path.glob("lifecycle-probe-failure-*.json"))
+    assert len(reports) == 1
+    payload = json.loads(reports[0].read_text(encoding="utf-8"))
+    assert payload["passed"] is False
+    assert payload["error_type"] == "RuntimeError"
+    assert payload["error"] == "causal failure"
+    assert reports[0].stat().st_size < 4096
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows Task Scheduler launcher")
 def test_validate_only_builds_direct_readonly_python_task_without_registering_it():
     artifact_root = ROOT / "artifacts" / "ib_preflight" / "launcher-validation-only"

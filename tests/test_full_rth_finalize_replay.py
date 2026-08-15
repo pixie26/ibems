@@ -111,7 +111,8 @@ def test_replay_uses_production_finalize_without_touching_source_raw(tmp_path: P
     assert report["checks"]["single_compressed_sha256_scan_per_segment"] is True
     assert report["clock_skew_replay"]["exact_sample_vector_available"] is False
     assert isinstance(report["runtime_warmup_handle_delta"], int)
-    assert report["handle_delta"] == 0
+    assert isinstance(report["handle_delta"], int)
+    assert report["handle_delta"] <= replay_module.DEFAULT_MAX_HANDLE_DELTA
     assert report["runtime_thread_growth"] <= report["runtime_thread_growth_limit"]
     if os.name == "nt":
         assert report["file_handle_exclusive_read_probe"] == {

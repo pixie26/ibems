@@ -68,7 +68,7 @@ Full-RTH replay 验收器直接调用 production `finalize_day()`，但在外层
 
 Task Scheduler 直接拥有运行 Recorder 的同一个 Python PID，不再使用 `cmd.exe → child python`。正常 deadline 由进程内 watchdog 按真实 IB session 执行 `RTH close + 3h finalize + 30m safety`；Scheduler 同时保留 `PT24H` 独立 backstop，覆盖 Python import、首个 durable status 或 watchdog 创建前卡死，以及进程内 watchdog 本身失效。两层 deadline 都是 fail-closed，且都不自动重启。
 
-no-IB lifecycle verifier 的 PASS/FAIL/HOLD task 只运行同一 Python host 的 probe mode。任何退出路径都先 `/End`、等待 runtime-status 记录的 Task-owned PID 及其已观测 descendants 消失，再 `/Delete`；HOLD 正常验收要求 child-process 列表为空。该工具会真实注册和删除 Windows Scheduled Tasks，仍需在运行前给出精确 task/artifact 目标并取得 owner 对该次系统操作的确认。
+no-IB lifecycle verifier 的 PASS/FAIL/HOLD task 只运行同一 Python host 的 probe mode。任何退出路径都先 `/End`、等待 runtime-status 记录的 Task-owned PID 及其已观测 descendants 消失，再 `/Delete`。Windows 可以给直接运行的 console Python 附加一个 direct-child `C:\Windows\System32\conhost.exe`；验收最多只允许这一个路径和命令行均匹配的 OS console host，任何 `cmd.exe`、第二个 Python、其他 child 或 grandchild 都 FAIL。该工具会真实注册和删除 Windows Scheduled Tasks，仍需在运行前给出精确 task/artifact 目标并取得 owner 对该次系统操作的确认。
 
 ## Event-loop watchdog
 
