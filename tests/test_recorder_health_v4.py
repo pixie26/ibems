@@ -58,6 +58,15 @@ def test_auxiliary_farm_churn_cannot_fail_a_day_with_live_bars() -> None:
     assert health["health_ok"] is True
     assert health["problems"] == []
     assert [item["code"] for item in health["auxiliary_farm_statuses"]] == [2157, 2158]
+    secdef = next(
+        item
+        for item in health["advisories"]
+        if item["stream"] == "SECURITY_DEFINITION_FARM"
+    )
+    assert secdef["classification"] == "AUXILIARY_FARM_DEGRADED"
+    assert secdef["duration_seconds"] == pytest.approx(2.8)
+    assert datetime.fromisoformat(secdef["start_utc"]) == BASE + timedelta(seconds=10)
+    assert datetime.fromisoformat(secdef["end_utc"]) == BASE + timedelta(seconds=12.8)
 
 
 def test_six_short_bidask_gaps_remain_a_metric_not_a_hard_problem() -> None:
@@ -140,6 +149,38 @@ def test_realtime_farm_plus_bar_gap_is_hard_feed_outage() -> None:
 
     assert health["health_ok"] is False
     assert any(item["classification"] == "FEED_OUTAGE" for item in health["problems"])
+
+
+def test_realtime_farm_only_marks_its_actual_overlap_with_a_bar_gap() -> None:
+    start, end = _session()
+    rows = [
+        _market("BAR_5S", 5),
+        _market("BAR_5S", 10),
+        _status(2103, 20.0, "real-time farm broken"),
+        _status(2104, 22.8, "real-time farm OK"),
+        _market("BAR_5S", 40),
+        _market("BAR_5S", 45),
+        _market("BAR_5S", 50),
+        _market("BAR_5S", 55),
+        _market("BID_ASK", 0),
+        _market("BID_ASK", 60),
+        _market("ALL_LAST", 0),
+        _market("ALL_LAST", 60),
+    ]
+
+    health = analyze_rows_v4(rows, session_open=start, session_close=end)
+    outages = [
+        item for item in health["problems"] if item["classification"] == "FEED_OUTAGE"
+    ]
+    suspected = [
+        item for item in health["problems"] if item["classification"] == "GAP_SUSPECTED"
+    ]
+
+    assert len(outages) == 1
+    assert outages[0]["duration_seconds"] == pytest.approx(2.8)
+    assert datetime.fromisoformat(outages[0]["start_utc"]) == BASE + timedelta(seconds=20)
+    assert datetime.fromisoformat(outages[0]["end_utc"]) == BASE + timedelta(seconds=22.8)
+    assert sum(item["duration_seconds"] for item in suspected) == pytest.approx(27.2)
 
 
 def test_1100_is_direct_hard_outage_even_if_bars_continue() -> None:
