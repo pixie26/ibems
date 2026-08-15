@@ -82,6 +82,42 @@ class Watchdog:
         if status is None:
             return self._degraded(now_mono, "status file missing or unreadable", "CRITICAL")
 
+        if status.get("fatal_shutdown_requested"):
+            return Verdict(
+                False,
+                "engine requested fatal shutdown "
+                f"({status.get('journal_failure', 'runtime fault')})",
+                should_alert=True,
+                should_kill=True,
+                severity="CRITICAL",
+            )
+
+        phase = status.get("phase")
+        if phase in {"FINALIZED", "STOPPED"}:
+            self._unhealthy_since = None
+            return Verdict(True, f"recorder terminal phase {phase}")
+
+        if phase == "FINALIZING":
+            progress = status.get("finalize_progress_mono")
+            if progress is None:
+                return self._degraded(
+                    now_mono, "finalizer status has no progress heartbeat", "CRITICAL"
+                )
+            age = now_mono - float(progress)
+            if age > cfg.heartbeat_timeout_seconds:
+                return self._degraded(
+                    now_mono,
+                    f"finalizer progress stale by {age:.0f}s "
+                    f"(stage={status.get('finalize_stage', '?')})",
+                    "CRITICAL",
+                )
+            self._unhealthy_since = None
+            return Verdict(
+                True,
+                f"finalizing {status.get('finalize_stage', '?')} "
+                f"rows={status.get('finalize_rows_processed', '?')}",
+            )
+
         hb = status.get("heartbeat_mono")
         if hb is None:
             return self._degraded(now_mono, "status file has no heartbeat", "CRITICAL")
@@ -93,15 +129,6 @@ class Watchdog:
                 f"heartbeat stale by {age:.0f}s "
                 f"(position={status.get('net_position', '?')})",
                 "CRITICAL",
-            )
-
-        if status.get("fatal_shutdown_requested"):
-            return Verdict(
-                False,
-                f"engine requested fatal shutdown ({status.get('journal_failure', 'runtime fault')})",
-                should_alert=True,
-                should_kill=True,
-                severity="CRITICAL",
             )
 
         # Healthy link but a state we should be told about.

@@ -65,10 +65,13 @@ import json
 import math
 import os
 import queue
+import sqlite3
 import statistics
 import threading
+import tempfile
 import time
 from collections import defaultdict, deque
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass, field, fields
 from datetime import date, datetime, timezone
 from enum import Enum
@@ -110,6 +113,13 @@ MARKET_STREAMS = ("BID_ASK", "ALL_LAST", "BAR_5S")
 # live split lives in market_liveness -- BAR_5S is time-driven and decidable,
 # the other two are event-driven and only ever recorded.
 DEFAULT_GAP_THRESHOLDS = {"BID_ASK": 5.0, "ALL_LAST": 30.0, "BAR_5S": 15.0}
+
+# Finalization must be bounded independently of the number of events in a
+# session. The raw writer is bounded already; using one similarly sized batch
+# here keeps Python dictionaries and Arrow builders from becoming a second,
+# post-close unbounded queue.
+FINALIZE_BATCH_ROWS = 50_000
+FINALIZE_SQLITE_CACHE_KIB = 64 * 1024
 
 HEARTBEAT_STREAM = market_liveness.HEARTBEAT_STREAM
 ADVISORY_GAP_THRESHOLDS = dict(market_liveness.DEFAULT_ADVISORY_THRESHOLDS)
@@ -542,7 +552,9 @@ class RawEventLog:
             + list(self.dir.glob("crashed-*.jsonl.gz"))
         )
 
-    def segment_integrity(self) -> list[dict[str, Any]]:
+    def segment_integrity(
+        self, segments: Optional[Iterable[Path]] = None
+    ) -> list[dict[str, Any]]:
         """Per-segment: what was readable, and where the stream stopped.
 
         "A segment was salvaged" is a weaker statement than a reader needs.
@@ -558,7 +570,7 @@ class RawEventLog:
         flushed at all.
         """
         report: list[dict[str, Any]] = []
-        for seg in self.segments():
+        for seg in self.segments() if segments is None else segments:
             rows = 0
             decompressed = 0
             trailing_partial = 0
@@ -590,23 +602,59 @@ class RawEventLog:
             )
         return report
 
-    def read_all(self) -> Iterator[dict[str, Any]]:
+    def read_all(
+        self,
+        segments: Optional[Iterable[Path]] = None,
+        *,
+        integrity_report: Optional[list[dict[str, Any]]] = None,
+    ) -> Iterator[dict[str, Any]]:
         with self._state_lock:
             open_for_writes = self._accepting and not self._closed
         if open_for_writes:
             self.flush(publish=True)
-        for seg in self.segments():
-            with gzip.open(seg, "rt", encoding="utf-8") as fh:
-                try:
+        for seg in self.segments() if segments is None else segments:
+            rows = 0
+            decompressed = 0
+            trailing_partial = 0
+            complete = True
+            error: Optional[str] = None
+            yield_rows = True
+            try:
+                with gzip.open(seg, "rb") as fh:
                     for line in fh:
+                        decompressed += len(line)
+                        if line.endswith(b"\n"):
+                            rows += 1
+                        else:
+                            trailing_partial = len(line)
+                        if not yield_rows:
+                            continue
                         try:
                             yield json.loads(line)
                         except json.JSONDecodeError:
-                            break
-                except (EOFError, OSError):
-                    # A forced kill can leave a valid prefix with no gzip footer.
-                    # The immutable crashed segment remains in the manifest.
-                    continue
+                            # Preserve the old readback prefix while continuing
+                            # to drain bytes when the caller requested exact
+                            # segment-integrity accounting in the same pass.
+                            yield_rows = False
+            except (EOFError, OSError, gzip.BadGzipFile) as exc:
+                # A forced kill can leave a valid prefix with no gzip footer.
+                # The immutable crashed segment remains in the manifest.
+                complete = False
+                error = f"{type(exc).__name__}: {exc}"
+            finally:
+                if integrity_report is not None:
+                    integrity_report.append(
+                        {
+                            "segment": seg.name,
+                            "salvaged": seg.name.startswith("crashed-"),
+                            "compressed_bytes": seg.stat().st_size,
+                            "decompressed_bytes": decompressed,
+                            "readable_rows": rows,
+                            "trailing_partial_bytes": trailing_partial,
+                            "gzip_stream_complete": complete,
+                            "read_error": error,
+                        }
+                    )
 
     @property
     def count(self) -> int:
@@ -1029,6 +1077,395 @@ class DailyHealth:
         }
 
 
+class _HealthStaging:
+    """Disk-backed, exact health computation with a fixed memory cache.
+
+    Arrival order is not a valid substitute for sorting: wall clocks can jump,
+    same-day runs are folded together, and callbacks may be delayed. SQLite is
+    used only as rebuildable scratch space so the production health algorithm
+    keeps the old ordering semantics without retaining a Python object per row.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.connection = sqlite3.connect(path)
+        self.connection.execute("PRAGMA journal_mode=OFF")
+        self.connection.execute("PRAGMA synchronous=OFF")
+        self.connection.execute("PRAGMA temp_store=FILE")
+        self.connection.execute(f"PRAGMA cache_size=-{FINALIZE_SQLITE_CACHE_KIB}")
+        self.connection.executescript(
+            """
+            CREATE TABLE stream_times (
+                stream TEXT NOT NULL,
+                wall_ns INTEGER NOT NULL
+            );
+            CREATE TABLE trades (
+                broker_ts REAL NOT NULL,
+                size REAL NOT NULL,
+                price REAL NOT NULL
+            );
+            CREATE TABLE bars (
+                input_sequence INTEGER PRIMARY KEY,
+                broker_ts REAL NOT NULL,
+                volume REAL,
+                trade_count REAL,
+                low REAL,
+                high REAL
+            );
+            """
+        )
+        self.events = 0
+        self.disconnects = 0
+        self.data_types: set[str] = set()
+        self.fatal_errors: list[str] = []
+        self.run_ids: set[str] = set()
+        self._bar_sequence = 0
+        self._prepared = False
+        self._last_progress_mono = 0.0
+        self._progress_failure: Optional[BaseException] = None
+
+    def add_batch(self, rows: list[dict[str, Any]]) -> None:
+        stream_times: list[tuple[str, int]] = []
+        trades: list[tuple[float, float, float]] = []
+        bars: list[tuple[int, float, Any, Any, Any, Any]] = []
+        for row in rows:
+            self.events += 1
+            run_id = row.get("recorder_run_id")
+            if run_id:
+                self.run_ids.add(str(run_id))
+            event_type = str(row.get("event_type"))
+            if event_type == "SYSTEM":
+                condition = str(row.get("special_conditions") or "").upper()
+                if any(token in condition for token in ("DISCONNECT", "1100", "1101")):
+                    self.disconnects += 1
+                if condition.startswith("RECORDER_ERROR:"):
+                    self.fatal_errors.append(str(row.get("special_conditions")))
+                continue
+
+            stream_times.append((event_type, int(row["local_wall_ns"])))
+            self.data_types.add(str(row.get("market_data_type", "UNKNOWN")))
+            broker_ts = _parse_broker_ts(str(row.get("broker_timestamp", "")))
+            if broker_ts is None:
+                continue
+            if event_type == "ALL_LAST":
+                trades.append(
+                    (
+                        broker_ts,
+                        float(row.get("last_size") or 0.0),
+                        float(row.get("last") or 0.0),
+                    )
+                )
+            elif event_type == "BAR_5S":
+                self._bar_sequence += 1
+                bars.append(
+                    (
+                        self._bar_sequence,
+                        broker_ts,
+                        row.get("volume"),
+                        row.get("trade_count"),
+                        row.get("low"),
+                        row.get("high"),
+                    )
+                )
+
+        # Each finalize batch is its own transaction. This bounds SQLite's
+        # rollback/transaction bookkeeping as well as the Python/Arrow batch.
+        with self.connection:
+            self.connection.executemany(
+                "INSERT INTO stream_times(stream, wall_ns) VALUES (?, ?)", stream_times
+            )
+            self.connection.executemany(
+                "INSERT INTO trades(broker_ts, size, price) VALUES (?, ?, ?)", trades
+            )
+            self.connection.executemany(
+                """INSERT INTO bars(
+                       input_sequence, broker_ts, volume, trade_count, low, high
+                   ) VALUES (?, ?, ?, ?, ?, ?)""",
+                bars,
+            )
+
+    def _notify_progress(
+        self, progress: Optional[Callable[[], None]], *, force: bool = False
+    ) -> None:
+        if progress is None:
+            return
+        now = time.monotonic()
+        if force or now - self._last_progress_mono >= 1.0:
+            progress()
+            self._last_progress_mono = now
+
+    def _sql_progress_handler(
+        self, progress: Optional[Callable[[], None]]
+    ) -> Callable[[], int]:
+        def advance() -> int:
+            try:
+                self._notify_progress(progress)
+            except BaseException as exc:
+                # sqlite3 otherwise replaces the publisher failure with the
+                # much less useful "interrupted" OperationalError.
+                self._progress_failure = exc
+                return 1
+            return 0
+
+        return advance
+
+    def _raise_progress_failure(self) -> None:
+        if self._progress_failure is not None:
+            raise self._progress_failure
+
+    def _prepare(self, progress: Optional[Callable[[], None]] = None) -> None:
+        if self._prepared:
+            return
+        self.connection.commit()
+        for statement in (
+            "CREATE INDEX stream_times_order ON stream_times(stream, wall_ns)",
+            "CREATE INDEX trades_order ON trades(broker_ts, size, price)",
+            "CREATE INDEX bars_order ON bars(broker_ts, input_sequence)",
+        ):
+            self._notify_progress(progress, force=True)
+            self.connection.execute(statement)
+            self._raise_progress_failure()
+        self._prepared = True
+
+    def _stream_health(
+        self,
+        stream: str,
+        session_open_ns: int,
+        session_close_ns: int,
+        gap_threshold: float,
+    ) -> StreamHealth:
+        session_seconds = max((session_close_ns - session_open_ns) / 1e9, 0.0)
+        cursor = self.connection.execute(
+            "SELECT wall_ns FROM stream_times WHERE stream=? ORDER BY wall_ns", (stream,)
+        )
+        first: Optional[int] = None
+        last: Optional[int] = None
+        previous_clipped: Optional[int] = None
+        rows = 0
+        max_gap = 0.0
+        internal_missing = 0.0
+        over = 0
+        for (stamp,) in cursor:
+            stamp = int(stamp)
+            if first is None:
+                first = stamp
+            last = stamp
+            rows += 1
+            clipped = min(max(stamp, session_open_ns), session_close_ns)
+            if previous_clipped is not None:
+                gap = (clipped - previous_clipped) / 1e9
+                max_gap = max(max_gap, gap)
+                if gap > gap_threshold:
+                    over += 1
+                    internal_missing += gap
+            previous_clipped = clipped
+
+        if first is None or last is None:
+            return StreamHealth(
+                stream=stream,
+                rows=0,
+                first_utc=None,
+                last_utc=None,
+                max_gap_seconds=session_seconds,
+                gap_threshold_seconds=gap_threshold,
+                gaps_over_threshold=1 if session_seconds else 0,
+                missing_seconds=session_seconds,
+                coverage_fraction=0.0,
+            )
+
+        clipped_first = min(max(first, session_open_ns), session_close_ns)
+        clipped_last = min(max(last, session_open_ns), session_close_ns)
+        opening_gap = max((clipped_first - session_open_ns) / 1e9, 0.0)
+        closing_gap = max((session_close_ns - clipped_last) / 1e9, 0.0)
+        if opening_gap > gap_threshold:
+            over += 1
+            max_gap = max(max_gap, opening_gap)
+        if closing_gap > gap_threshold:
+            over += 1
+            max_gap = max(max_gap, closing_gap)
+        missing = opening_gap + closing_gap + internal_missing
+        coverage = 1.0 - (missing / session_seconds) if session_seconds else 0.0
+        return StreamHealth(
+            stream=stream,
+            rows=rows,
+            first_utc=datetime.fromtimestamp(first / 1e9, timezone.utc).isoformat(),
+            last_utc=datetime.fromtimestamp(last / 1e9, timezone.utc).isoformat(),
+            max_gap_seconds=max_gap,
+            gap_threshold_seconds=gap_threshold,
+            gaps_over_threshold=over,
+            missing_seconds=missing,
+            coverage_fraction=max(0.0, min(1.0, coverage)),
+        )
+
+    def _cross_stream(
+        self,
+        bar_seconds: float = 5.0,
+        progress: Optional[Callable[[], None]] = None,
+    ) -> CrossStreamDiagnostics:
+        diag = CrossStreamDiagnostics()
+        volume_ratios: list[float] = []
+        count_ratios: list[float] = []
+        contained = 0
+        considered = 0
+        bars = self.connection.execute(
+            """SELECT broker_ts, volume, trade_count, low, high
+               FROM bars ORDER BY broker_ts, input_sequence"""
+        )
+        for start, volume, trade_count, low, high in bars:
+            self._notify_progress(progress)
+            diag.bars += 1
+            bucket_count = 0
+            tick_volume = 0.0
+            bucket_contained = 0
+            trades = self.connection.execute(
+                """SELECT size, price FROM trades
+                   WHERE broker_ts >= ? AND broker_ts < ?
+                   ORDER BY broker_ts, size, price""",
+                (float(start), float(start) + bar_seconds),
+            )
+            for size, price in trades:
+                bucket_count += 1
+                tick_volume += float(size)
+                if (
+                    low is not None
+                    and high is not None
+                    and float(low) <= float(price) <= float(high)
+                ):
+                    bucket_contained += 1
+
+            bar_volume = float(volume or 0.0)
+            bar_count = float(trade_count or 0.0)
+            if bucket_count:
+                diag.bars_with_trades += 1
+            if bar_volume > 0 and not bucket_count:
+                diag.bars_with_volume_but_no_ticks += 1
+            if bucket_count and bar_volume <= 0:
+                diag.bars_with_ticks_but_no_volume += 1
+            if tick_volume > 0 and bar_volume > 0:
+                volume_ratios.append(bar_volume / tick_volume)
+            if bucket_count and bar_count > 0:
+                count_ratios.append(bar_count / bucket_count)
+            if bucket_count and low is not None and high is not None:
+                considered += bucket_count
+                contained += bucket_contained
+
+        if volume_ratios:
+            ordered = sorted(volume_ratios)
+            diag.volume_ratio_median = statistics.median(ordered)
+            diag.volume_ratio_p10 = _quantile(ordered, 0.10)
+            diag.volume_ratio_p90 = _quantile(ordered, 0.90)
+        if count_ratios:
+            diag.count_ratio_median = statistics.median(sorted(count_ratios))
+        if considered:
+            diag.price_containment_fraction = contained / considered
+        return diag
+
+    def build_health(
+        self,
+        *,
+        session: date,
+        session_open: datetime,
+        session_close: datetime,
+        clock_skew_samples: Iterable[float],
+        required_streams: tuple[str, ...],
+        gap_thresholds: Optional[dict[str, float]],
+        salvaged_segments: list[str],
+        segment_integrity: list[dict[str, Any]],
+        progress: Optional[Callable[[], None]] = None,
+    ) -> DailyHealth:
+        self._progress_failure = None
+        self.connection.set_progress_handler(
+            self._sql_progress_handler(progress), 100_000
+        )
+        try:
+            self._notify_progress(progress, force=True)
+            self._prepare(progress)
+            thresholds = {**DEFAULT_GAP_THRESHOLDS, **(gap_thresholds or {})}
+            open_ns = int(session_open.timestamp() * 1e9)
+            close_ns = int(session_close.timestamp() * 1e9)
+            observed = [
+                str(row[0])
+                for row in self.connection.execute(
+                    "SELECT DISTINCT stream FROM stream_times ORDER BY stream"
+                )
+            ]
+            stream_names = list(dict.fromkeys([*required_streams, *observed]))
+            streams = {}
+            for name in stream_names:
+                self._notify_progress(progress, force=True)
+                streams[name] = self._stream_health(
+                    name, open_ns, close_ns, thresholds.get(name, 30.0)
+                )
+                self._raise_progress_failure()
+            if self.data_types == {"LIVE"}:
+                market_data_type = "LIVE"
+            elif not self.data_types:
+                market_data_type = "UNKNOWN"
+            else:
+                market_data_type = "MIXED:" + ",".join(sorted(self.data_types))
+            result = DailyHealth(
+                session=session.isoformat(),
+                events=self.events,
+                market_data_type=market_data_type,
+                clock_skew=ClockSkew.from_samples(clock_skew_samples),
+                disconnects=self.disconnects,
+                recorder_run_ids=sorted(self.run_ids),
+                streams=streams,
+                cross_stream=self._cross_stream(progress=progress),
+                required_streams=required_streams,
+                fatal_errors=self.fatal_errors,
+                salvaged_segments=salvaged_segments,
+                segment_integrity=segment_integrity,
+            )
+            self._raise_progress_failure()
+            return result
+        except sqlite3.OperationalError:
+            self._raise_progress_failure()
+            raise
+        finally:
+            self.connection.set_progress_handler(None, 0)
+
+    def close(self) -> None:
+        self.connection.close()
+
+
+def _batched_rows(rows: Iterable[dict[str, Any]]) -> Iterator[list[dict[str, Any]]]:
+    batch: list[dict[str, Any]] = []
+    for row in rows:
+        batch.append(row)
+        if len(batch) >= FINALIZE_BATCH_ROWS:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
+def _snapshot_segments(log: Any) -> Optional[list[Path]]:
+    segments = getattr(log, "segments", None)
+    return list(segments()) if segments is not None else None
+
+
+def _rows_from_snapshot(
+    log: Any,
+    segments: Optional[list[Path]],
+    integrity_report: Optional[list[dict[str, Any]]] = None,
+) -> Iterator[dict[str, Any]]:
+    if isinstance(log, RawEventLog) and segments is not None:
+        return log.read_all(segments, integrity_report=integrity_report)
+    return log.read_all()
+
+
+def _segment_integrity_from_snapshot(
+    log: Any, segments: Optional[list[Path]]
+) -> list[dict[str, Any]]:
+    integrity = getattr(log, "segment_integrity", None)
+    if integrity is None:
+        return []
+    if isinstance(log, RawEventLog) and segments is not None:
+        return integrity(segments)
+    return integrity()
+
+
 def compute_health(
     log: RawEventLog,
     session_open: datetime,
@@ -1037,72 +1474,37 @@ def compute_health(
     required_streams: tuple[str, ...] = MARKET_STREAMS,
     gap_thresholds: Optional[dict[str, float]] = None,
 ) -> DailyHealth:
-    """Compute health from market events only; SYSTEM heartbeats cannot mask gaps."""
-    thresholds = {**DEFAULT_GAP_THRESHOLDS, **(gap_thresholds or {})}
-    events = 0
-    disconnects = 0
-    data_types: set[str] = set()
-    fatal_errors: list[str] = []
-    run_ids: set[str] = set()
-    per_stream: dict[str, list[int]] = {name: [] for name in required_streams}
-    rows: list[dict[str, Any]] = []
+    """Compute exact health in one pass without retaining session rows."""
 
-    for row in log.read_all():
-        events += 1
-        run_id = row.get("recorder_run_id")
-        if run_id:
-            run_ids.add(str(run_id))
-        event_type = str(row.get("event_type"))
-        if event_type == "SYSTEM":
-            # Only explicit disconnect-like system events count. Generic
-            # heartbeat rows must not fabricate availability.
-            condition = str(row.get("special_conditions") or "").upper()
-            if any(token in condition for token in ("DISCONNECT", "1100", "1101")):
-                disconnects += 1
-            if condition.startswith("RECORDER_ERROR:"):
-                fatal_errors.append(str(row.get("special_conditions")))
-            continue
-        rows.append(row)
-        per_stream.setdefault(event_type, []).append(int(row["local_wall_ns"]))
-        data_types.add(str(row.get("market_data_type", "UNKNOWN")))
-
-    if data_types == {"LIVE"}:
-        mdt = "LIVE"
-    elif not data_types:
-        mdt = "UNKNOWN"
-    else:
-        mdt = "MIXED:" + ",".join(sorted(data_types))
-
-    open_ns = int(session_open.timestamp() * 1e9)
-    close_ns = int(session_close.timestamp() * 1e9)
-    streams = {
-        name: _stream_health(
-            stamps, name, open_ns, close_ns, thresholds.get(name, 30.0)
-        )
-        for name, stamps in per_stream.items()
-    }
-
-    return DailyHealth(
-        session=log.session.isoformat(),
-        events=events,
-        market_data_type=mdt,
-        clock_skew=ClockSkew.from_samples(clock_skew_samples),
-        disconnects=disconnects,
-        recorder_run_ids=sorted(run_ids),
-        streams=streams,
-        cross_stream=compute_cross_stream_diagnostics(rows),
-        required_streams=required_streams,
-        fatal_errors=fatal_errors,
-        # The health maths is also driven by in-memory row sources in tests,
-        # which have no segments at all; absent segments means nothing was
-        # salvaged, not that the question is unanswerable.
-        salvaged_segments=[
-            path.name
-            for path in (getattr(log, "segments", None) or (lambda: []))()
-            if path.name.startswith("crashed-")
-        ],
-        segment_integrity=(getattr(log, "segment_integrity", None) or (lambda: []))(),
-    )
+    segments = _snapshot_segments(log)
+    work_parent = getattr(log, "dir", None)
+    with tempfile.TemporaryDirectory(prefix=".health-", dir=work_parent) as work:
+        staging = _HealthStaging(Path(work) / "health.sqlite")
+        integrity_report: list[dict[str, Any]] = []
+        try:
+            for batch in _batched_rows(
+                _rows_from_snapshot(log, segments, integrity_report)
+            ):
+                staging.add_batch(batch)
+            salvaged = [
+                path.name for path in (segments or []) if path.name.startswith("crashed-")
+            ]
+            return staging.build_health(
+                session=log.session,
+                session_open=session_open,
+                session_close=session_close,
+                clock_skew_samples=clock_skew_samples,
+                required_streams=required_streams,
+                gap_thresholds=gap_thresholds,
+                salvaged_segments=salvaged,
+                segment_integrity=(
+                    integrity_report
+                    if isinstance(log, RawEventLog)
+                    else _segment_integrity_from_snapshot(log, segments)
+                ),
+            )
+        finally:
+            staging.close()
 
 
 def _same_halt_state(previous: float, current: float) -> bool:
@@ -1126,6 +1528,237 @@ class ParquetVerificationError(RuntimeError):
     """The Parquet file on disk does not match the rows we meant to write."""
 
 
+def _finalize_day(
+    log: RawEventLog,
+    *,
+    session_open: datetime,
+    session_close: datetime,
+    clock_skew_samples: Iterable[float] = (),
+    handler_counts: Optional[dict[str, int]] = None,
+    selected_counts: Optional[dict[str, int]] = None,
+    filtered_counts: Optional[dict[str, int]] = None,
+    capture_policy: Optional[dict[str, Any]] = None,
+    liveness: Optional[dict[str, Any]] = None,
+    progress: Optional[Callable[[str, int, int], None]] = None,
+) -> dict[str, Any]:
+    """Bounded implementation behind the stable :func:`finalize_day` API.
+
+    One immutable segment snapshot is consumed once. Candidate Parquet, health,
+    and manifest files are fully built and verified before the first published
+    file is replaced; the manifest remains the last completion marker.
+    """
+    log.close()
+    write_accounting = log.write_stats()
+    if (
+        write_accounting["accepted"] != write_accounting["persisted"]
+        or write_accounting["dropped"]
+        or write_accounting["writer_error"] is not None
+        or write_accounting["accepted_by_stream"]
+        != write_accounting["persisted_by_stream"]
+    ):
+        raise RecorderWriteFailed(f"raw writer accounting mismatch: {write_accounting}")
+
+    finalize_lock = ProcessLock(log.dir / ".finalize.lock")
+    with finalize_lock.acquire(note=f"session={log.session.isoformat()}"):
+        segments = log.segments()
+        segment_count = len(segments)
+        if progress is not None:
+            progress("READING_RAW", 0, segment_count)
+
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+        except ImportError as exc:  # pragma: no cover - packaging/preflight failure
+            raise RuntimeError("pyarrow is required to finalize recorder output") from exc
+
+        token = uuid4().hex
+        parquet = log.dir / "events.parquet"
+        health_path = log.dir / "health.json"
+        manifest_path = log.dir / "manifest.json"
+        with ExitStack() as stack:
+            work = stack.enter_context(
+                tempfile.TemporaryDirectory(prefix=f".finalize-{token}-", dir=log.dir)
+            )
+            work_dir = Path(work)
+            parquet_candidate = work_dir / "events.parquet"
+            health_candidate = work_dir / "health.json"
+            manifest_candidate = work_dir / "manifest.json"
+            staging = _HealthStaging(work_dir / "health.sqlite")
+            stack.callback(staging.close)
+            schema = parquet_schema()
+            writer = pq.ParquetWriter(parquet_candidate, schema, compression="zstd")
+            session_rows = 0
+            current_run_rows = 0
+            current_run_ids = set(write_accounting["persisted_by_run_id"])
+            readback_by_stream_counts: dict[str, int] = defaultdict(int)
+            readback_by_run_id_counts: dict[str, int] = defaultdict(int)
+            integrity_report: list[dict[str, Any]] = []
+            try:
+                for batch in _batched_rows(
+                    log.read_all(segments, integrity_report=integrity_report)
+                ):
+                    session_rows += len(batch)
+                    for row in batch:
+                        run_id = row["recorder_run_id"]
+                        if run_id in current_run_ids:
+                            current_run_rows += 1
+                            readback_by_stream_counts[row["event_type"]] += 1
+                            readback_by_run_id_counts[run_id] += 1
+                    staging.add_batch(batch)
+                    table = pa.Table.from_pylist(batch, schema=schema)
+                    writer.write_table(table, row_group_size=len(batch))
+                    del table
+                    if progress is not None:
+                        progress("READING_RAW", session_rows, segment_count)
+            finally:
+                writer.close()
+
+            readback_by_stream = dict(sorted(readback_by_stream_counts.items()))
+            readback_by_run_id = dict(sorted(readback_by_run_id_counts.items()))
+            if write_accounting["persisted"] != current_run_rows:
+                raise RecorderWriteFailed(
+                    "raw writer/readback count mismatch: "
+                    f"persisted={write_accounting['persisted']} "
+                    f"readback={current_run_rows}"
+                )
+            if write_accounting["persisted_by_stream"] != readback_by_stream:
+                raise RecorderWriteFailed(
+                    "raw writer/readback stream mismatch: "
+                    f"persisted={write_accounting['persisted_by_stream']} "
+                    f"readback={readback_by_stream}"
+                )
+            if write_accounting["persisted_by_run_id"] != readback_by_run_id:
+                raise RecorderWriteFailed(
+                    "raw writer/readback run mismatch: "
+                    f"persisted={write_accounting['persisted_by_run_id']} "
+                    f"readback={readback_by_run_id}"
+                )
+
+            handled = dict(sorted((handler_counts or {}).items()))
+            selected = dict(sorted((selected_counts or {}).items()))
+            filtered = dict(sorted((filtered_counts or {}).items()))
+            if handled or selected or filtered:
+                market_enqueued = {
+                    stream: write_accounting["accepted_by_stream"].get(stream, 0)
+                    for stream in MARKET_STREAMS
+                    if write_accounting["accepted_by_stream"].get(stream, 0)
+                }
+                if selected != market_enqueued:
+                    raise RecorderWriteFailed(
+                        f"callback selection/enqueue mismatch: selected={selected} "
+                        f"enqueued={market_enqueued}"
+                    )
+                for stream in MARKET_STREAMS:
+                    if handled.get(stream, 0) != selected.get(stream, 0) + filtered.get(
+                        stream, 0
+                    ):
+                        raise RecorderWriteFailed(
+                            f"callback accounting mismatch for {stream}: "
+                            f"handled={handled.get(stream, 0)} "
+                            f"selected={selected.get(stream, 0)} "
+                            f"filtered={filtered.get(stream, 0)}"
+                        )
+
+            write_accounting.update(
+                {
+                    "handled_count": sum(handled.values()),
+                    "handled_by_stream": handled,
+                    "selected_count": sum(selected.values()),
+                    "selected_by_stream": selected,
+                    "filtered_count": sum(filtered.values()),
+                    "filtered_by_stream": filtered,
+                    "readback_count": current_run_rows,
+                    "readback_by_stream": readback_by_stream,
+                    "readback_by_run_id": readback_by_run_id,
+                    "session_readback_count": session_rows,
+                }
+            )
+
+            if progress is not None:
+                progress("VERIFYING_PARQUET", session_rows, segment_count)
+            parquet_file = pq.ParquetFile(parquet_candidate)
+            try:
+                if parquet_file.schema_arrow != schema:
+                    raise ParquetVerificationError(
+                        f"{parquet_candidate} schema differs from the declared schema"
+                    )
+                verified_rows = 0
+                for record_batch in parquet_file.iter_batches(
+                    batch_size=FINALIZE_BATCH_ROWS
+                ):
+                    verified_rows += record_batch.num_rows
+                    if progress is not None:
+                        progress("VERIFYING_PARQUET", verified_rows, segment_count)
+                record_batch = None
+            finally:
+                parquet_file.close()
+            if verified_rows != session_rows:
+                raise ParquetVerificationError(
+                    f"{parquet_candidate} holds {verified_rows} rows, "
+                    f"expected {session_rows}"
+                )
+
+            if progress is not None:
+                progress("COMPUTING_HEALTH", session_rows, segment_count)
+            health = staging.build_health(
+                session=log.session,
+                session_open=session_open,
+                session_close=session_close,
+                clock_skew_samples=clock_skew_samples,
+                required_streams=MARKET_STREAMS,
+                gap_thresholds=None,
+                salvaged_segments=[
+                    path.name for path in segments if path.name.startswith("crashed-")
+                ],
+                segment_integrity=integrity_report,
+                progress=(
+                    None
+                    if progress is None
+                    else lambda: progress(
+                        "COMPUTING_HEALTH", session_rows, segment_count
+                    )
+                ),
+            )
+            health.liveness_incidents = (liveness or {}).get("incidents")
+
+            if progress is not None:
+                progress("HASHING", session_rows, segment_count)
+            hashes = {path.name: _sha256(path) for path in segments}
+            hashes[parquet.name] = _sha256(parquet_candidate)
+            health.file_hashes = hashes
+            durable_atomic_write(
+                health_candidate,
+                json.dumps(health.as_dict(), indent=2, sort_keys=True).encode("utf-8"),
+            )
+            manifest = {
+                "schema_version": 3,
+                "session": log.session.isoformat(),
+                "rows": session_rows,
+                "parquet_rows_verified": verified_rows,
+                "recorder_run_ids": sorted(health.recorder_run_ids),
+                "health_ok": health.ok(),
+                "problems": health.problems(),
+                "write_accounting": write_accounting,
+                "capture_policy": capture_policy,
+                "liveness": liveness,
+                "files": {**hashes, health_path.name: _sha256(health_candidate)},
+            }
+            durable_atomic_write(
+                manifest_candidate,
+                json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8"),
+            )
+
+            # Everything above is candidate construction. No published output
+            # is replaced until every row, schema, health result, and hash is
+            # available. The manifest is the final completion marker.
+            if progress is not None:
+                progress("PUBLISHING", session_rows, segment_count)
+            durable_replace(parquet_candidate, parquet)
+            durable_replace(health_candidate, health_path)
+            durable_replace(manifest_candidate, manifest_path)
+            return manifest
+
+
 def finalize_day(
     log: RawEventLog,
     *,
@@ -1138,147 +1771,19 @@ def finalize_day(
     capture_policy: Optional[dict[str, Any]] = None,
     liveness: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
-    """Close raw capture, write atomic Parquet, health JSON and a hash manifest.
+    """Close raw capture and publish a bounded, verified daily dataset."""
 
-    Reads every segment in the session directory, including ones written by an
-    earlier run of the same day. That is intended -- one session is one Parquet
-    file -- and it is only correct because ``recorder_run_id`` makes rows from
-    different runs distinguishable.
-    """
-    log.close()
-    write_accounting = log.write_stats()
-    if (
-        write_accounting["accepted"] != write_accounting["persisted"]
-        or write_accounting["dropped"]
-        or write_accounting["writer_error"] is not None
-        or write_accounting["accepted_by_stream"]
-        != write_accounting["persisted_by_stream"]
-    ):
-        raise RecorderWriteFailed(
-            f"raw writer accounting mismatch: {write_accounting}"
-        )
-    rows = list(log.read_all())
-    current_run_ids = set(write_accounting["persisted_by_run_id"])
-    current_run_rows = [row for row in rows if row["recorder_run_id"] in current_run_ids]
-    readback_by_stream: dict[str, int] = defaultdict(int)
-    for row in current_run_rows:
-        readback_by_stream[row["event_type"]] += 1
-    readback_by_stream = dict(sorted(readback_by_stream.items()))
-    if write_accounting["persisted"] != len(current_run_rows):
-        raise RecorderWriteFailed(
-            "raw writer/readback count mismatch: "
-            f"persisted={write_accounting['persisted']} readback={len(current_run_rows)}"
-        )
-    if write_accounting["persisted_by_stream"] != readback_by_stream:
-        raise RecorderWriteFailed(
-            "raw writer/readback stream mismatch: "
-            f"persisted={write_accounting['persisted_by_stream']} "
-            f"readback={readback_by_stream}"
-        )
-    readback_by_run_id: dict[str, int] = defaultdict(int)
-    for row in current_run_rows:
-        readback_by_run_id[row["recorder_run_id"]] += 1
-    readback_by_run_id = dict(sorted(readback_by_run_id.items()))
-    if write_accounting["persisted_by_run_id"] != readback_by_run_id:
-        raise RecorderWriteFailed(
-            "raw writer/readback run mismatch: "
-            f"persisted={write_accounting['persisted_by_run_id']} "
-            f"readback={readback_by_run_id}"
-        )
-
-    handled = dict(sorted((handler_counts or {}).items()))
-    selected = dict(sorted((selected_counts or {}).items()))
-    filtered = dict(sorted((filtered_counts or {}).items()))
-    if handled or selected or filtered:
-        market_enqueued = {
-            stream: write_accounting["accepted_by_stream"].get(stream, 0)
-            for stream in MARKET_STREAMS
-            if write_accounting["accepted_by_stream"].get(stream, 0)
-        }
-        if selected != market_enqueued:
-            raise RecorderWriteFailed(
-                f"callback selection/enqueue mismatch: selected={selected} "
-                f"enqueued={market_enqueued}"
-            )
-        for stream in MARKET_STREAMS:
-            if handled.get(stream, 0) != selected.get(stream, 0) + filtered.get(stream, 0):
-                raise RecorderWriteFailed(
-                    f"callback accounting mismatch for {stream}: handled={handled.get(stream, 0)} "
-                    f"selected={selected.get(stream, 0)} filtered={filtered.get(stream, 0)}"
-                )
-
-    write_accounting.update(
-        {
-            "handled_count": sum(handled.values()),
-            "handled_by_stream": handled,
-            "selected_count": sum(selected.values()),
-            "selected_by_stream": selected,
-            "filtered_count": sum(filtered.values()),
-            "filtered_by_stream": filtered,
-            "readback_count": len(current_run_rows),
-            "readback_by_stream": readback_by_stream,
-            "readback_by_run_id": readback_by_run_id,
-            "session_readback_count": len(rows),
-        }
-    )
-    parquet = log.dir / "events.parquet"
-    parquet_tmp = log.dir / ".events.parquet.tmp"
-    try:
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-    except ImportError as exc:  # pragma: no cover - packaging/preflight failure
-        raise RuntimeError("pyarrow is required to finalize recorder output") from exc
-
-    schema = parquet_schema()
-    table = pa.Table.from_pylist(rows, schema=schema)
-    pq.write_table(table, parquet_tmp, compression="zstd")
-    durable_replace(parquet_tmp, parquet)
-
-    # Verify what is on disk, not what we handed to the writer. The point of
-    # this whole subsystem is a dataset someone will trust months from now.
-    readback = pq.read_table(parquet)
-    if readback.num_rows != len(rows):
-        raise ParquetVerificationError(
-            f"{parquet} holds {readback.num_rows} rows, expected {len(rows)}"
-        )
-    if readback.schema != schema:
-        raise ParquetVerificationError(f"{parquet} schema differs from the declared schema")
-
-    hashes = {p.name: _sha256(p) for p in [*log.segments(), parquet]}
-    health = compute_health(
+    return _finalize_day(
         log,
         session_open=session_open,
         session_close=session_close,
         clock_skew_samples=clock_skew_samples,
-        required_streams=MARKET_STREAMS,
+        handler_counts=handler_counts,
+        selected_counts=selected_counts,
+        filtered_counts=filtered_counts,
+        capture_policy=capture_policy,
+        liveness=liveness,
     )
-    health.file_hashes = hashes
-    health.liveness_incidents = (liveness or {}).get("incidents")
-    health_path = log.dir / "health.json"
-    durable_atomic_write(
-        health_path,
-        json.dumps(health.as_dict(), indent=2, sort_keys=True).encode("utf-8"),
-    )
-
-    manifest = {
-        "schema_version": 3,
-        "session": log.session.isoformat(),
-        "rows": len(rows),
-        "parquet_rows_verified": readback.num_rows,
-        "recorder_run_ids": sorted(health.recorder_run_ids),
-        "health_ok": health.ok(),
-        "problems": health.problems(),
-        "write_accounting": write_accounting,
-        "capture_policy": capture_policy,
-        "liveness": liveness,
-        "files": {**hashes, health_path.name: _sha256(health_path)},
-    }
-    manifest_path = log.dir / "manifest.json"
-    durable_atomic_write(
-        manifest_path,
-        json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8"),
-    )
-    return manifest
 
 
 # ----------------------------------------------------------------------------
@@ -2095,7 +2600,7 @@ class QuoteRecorder:
         liveness_manifest = self.liveness.manifest()
         liveness_manifest["incidents"] = self._liveness_incidents.manifest()
         liveness_manifest["recovery"] = self.recovery.manifest()
-        return finalize_day(
+        return _finalize_day(
             self.log,
             session_open=session.start,
             session_close=session.end,
@@ -2105,6 +2610,16 @@ class QuoteRecorder:
             filtered_counts=self.filtered_events,
             capture_policy=self.capture_policy.manifest(),
             liveness=liveness_manifest,
+            progress=self._finalize_progress,
+        )
+
+    def _finalize_progress(self, stage: str, rows: int, segments: int) -> None:
+        if self._heartbeat is None:
+            return
+        self._heartbeat.finalize_progress(
+            stage=stage,
+            rows_processed=rows,
+            segments_total=segments,
         )
 
     def run(self) -> dict[str, Any]:  # pragma: no cover - requires a real Gateway/session

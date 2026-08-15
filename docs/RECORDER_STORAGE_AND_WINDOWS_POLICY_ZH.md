@@ -1,6 +1,6 @@
 # Recorder 写入、测试与 Windows 部署边界
 
-更新：2026-08-12。
+更新：2026-08-15。
 
 本文回答三个容易被混在一起的问题：实际交易必须持久化什么、研究型 Recorder 如何避免阻塞行情 callback、以及 Windows 测试通过是否等于允许发单。
 
@@ -43,6 +43,16 @@ IB callback 不再执行 JSON 编码、gzip flush 或 `fsync`。`RawEventLog.app
 - callback handler 异常。
 
 manifest 保存完整链路：`handled → selected → enqueued → persisted → readback`、`filtered`、`dropped`、逐 stream/逐 run 计数、`queue_high_water`、`max_writer_lag_ms` 和 `fsync_latency_ms`。任何不等都失败。`research_full` 必须 `filtered=0`；`evidence_sampled` 必须满足 `handled=selected+filtered`，且 manifest 必须携带采样规则。
+
+## 收盘 finalization 的资源边界
+
+2026-08-14 Full-RTH 直接暴露了一个与日内有界 writer 不同的收盘缺陷：2,645,388 行、约 40.4 MB gzip / 23.5 MB Parquet 的一天，在旧 `finalize_day()` 中先执行整日 `list(log.read_all())`，再建立 Arrow table、整表 Parquet readback，随后 `compute_health()` 又重读并保留第二套整日 Python dict。Windows 直接观察到 private commit 至少 16.23 GB、工作集峰值约 8.24 GB、整机内存 93%，从 04:00 session close 到 05:17 `STOPPED` 约 77 分钟。该日最后成功生成 manifest，但资源表现不合格；成功退出不把这个边界变成 PASS。
+
+当前实现冻结一次 immutable segment snapshot，以固定 50,000 行批次同时完成 current-run/session 对账、Arrow row-group 写入和健康 staging；Parquet 用 `iter_batches()` 解码所有数据页验证，不再整表读回。乱序 wall-clock gap 和跨流诊断写入 session 目录内可重建的 SQLite staging，cache 固定为 64 MB，并保持原来的排序、`[bar_start, bar_start+5s)` 和空值语义。所有候选产物验证完成后才按 `events.parquet → health.json → manifest.json` 发布，manifest 仍是最后完成标记。独立 `.finalize.lock` 防止两个 publisher 竞争；收尾进度使用 `finalize_progress_mono`，不得刷新 IB event-loop 的 `heartbeat_mono`。
+
+每周/手动 soak 现在另行执行完整 capture→finalize→Parquet readback，并在 Windows/Linux 隔离子进程上比较 250,000 与 1,000,000 行：事件数放大 4 倍时，finalize 峰值 native memory 比不得超过 1.5 倍。该门槛约束增长斜率，不把某台机器的绝对 GB 当作跨平台规格。
+
+**OPEN（与本次内存修复分离）**：同一 Full-RTH manifest 记录 `fsync_latency_ms.max=4750ms`、`p95=78ms`、`max_writer_lag_ms=5250ms`，虽有 `dropped=0` 且 queue high-water 仅 `492/100000`，但 writer lag 已略高于现有 5 秒 soak 预算。当前证据不能把它归因于磁盘、换页或安全扫描；在不改变 1 秒 durability cadence 前，需用可复现存储 probe 定位并以 `max_writer_lag_ms <= 5000` 关闭。
 
 ## Event-loop watchdog
 
@@ -123,7 +133,7 @@ route 下的行为。**未测就当作 pass 条件，等于重犯它所替换的
 
 另外覆盖 60 秒虚拟 session 的开收盘/gap 边界、writer drain timeout 不释放仍在工作的 session lock、Recorder 进程强杀后的 gzip prefix salvage，以及 event-loop pulse 停止时外部 watchdog 判定 stale。现有强杀测试证明可读前缀能够恢复并保留 `crashed-*` 段。**该段现在必须被披露**：`compute_health` 收集所有 `crashed-*` 段名进 `salvaged_segments`，写入 `health.json`，并产生一条 `capture truncated: ...` problem，使 `health_ok=false`。此前唯一痕迹是 `file_hashes` 里的一个文件名，读者必须自己注意到，而 `health_ok` 仍为 true —— 一个丢了尾巴的交易日和一个完整交易日在 manifest 里长得一样。salvage 出来的行是真的，值得恢复；但该段在内核停下 writer 的地方结束，任何从它得到的计数都不完整，因此不能报成干净的一天。仍待补的是**段级**（而非整段丢弃）完整性判定：明示尾部被丢弃了多少字节。
 
-重型吞吐验证已移到 `.github/workflows/recorder-soak.yml`：Windows/Linux 每周或手动写入并 readback 一百万事件，输出吞吐、字节数、队列水位、writer lag、fsync latency 和零丢失对账。普通 PR CI 不重复写一整天数据。
+重型验证已移到 `.github/workflows/recorder-soak.yml`：Windows/Linux 每周或手动运行一百万事件 writer/readback soak，并运行 250,000→1,000,000 行完整 finalize 内存斜率 soak，输出吞吐、字节数、队列水位、writer lag、fsync latency、finalize 耗时、临时磁盘峰值、native memory 峰值和零丢失对账。普通 PR CI 不重复写一整天数据。
 
 2026-08-11 本机 million-event soak 已在目标 10,000 events/s 下通过：1,000,000 accepted/persisted/readback、dropped=0，100 秒完成，gzip 共 7,190,604 bytes，queue high-water 2,329，max writer lag 234ms，98 次 fsync 的 p95/max 为 63/125ms。按“实测峰值 10,000 events/s × 可容忍磁盘停顿 10 秒”得到推荐 queue capacity 100,000，与默认值一致；未来峰值或停顿预算变化必须重跑校准。
 

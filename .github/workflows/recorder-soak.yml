@@ -36,10 +36,21 @@ jobs:
           --target-rate 10000
           --max-writer-lag-ms 5000
 
+      - name: Run bounded full-finalization memory slope soak
+        run: >-
+          uv run python scripts/run_recorder_finalize_soak.py
+          --root artifacts/recorder_finalize_soak
+          --small-events 250000
+          --large-events 1000000
+          --max-peak-ratio 1.5
+          --target-rate 10000
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: recorder-soak-${{ matrix.os }}-${{ github.sha }}
-          path: artifacts/recorder_soak/**
+          path: |
+            artifacts/recorder_soak/**
+            artifacts/recorder_finalize_soak/**
           if-no-files-found: error
           retention-days: 30

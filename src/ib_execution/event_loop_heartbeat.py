@@ -56,6 +56,35 @@ class EventLoopHeartbeat:
             self._pulse_wall = time.time()
             self._state.update(state)
 
+    def update_state(self, **state: Any) -> None:
+        """Publish state without inventing evidence of event-loop liveness."""
+
+        self.raise_if_failed()
+        with self._lock:
+            self._state.update(state)
+
+    def finalize_progress(
+        self, *, stage: str, rows_processed: int, segments_total: int
+    ) -> None:
+        """Advance the separate post-session progress clock.
+
+        Finalization runs after IB has disconnected. Refreshing
+        ``heartbeat_mono`` here would make disk/CPU progress look like a live
+        broker event loop, so the watchdog receives a distinct monotonic clock.
+        """
+
+        self.raise_if_failed()
+        with self._lock:
+            self._state.update(
+                {
+                    "phase": "FINALIZING",
+                    "finalize_stage": str(stage),
+                    "finalize_rows_processed": int(rows_processed),
+                    "finalize_segments_total": int(segments_total),
+                    "finalize_progress_mono": time.monotonic(),
+                }
+            )
+
     def _payload(self) -> dict[str, Any]:
         with self._lock:
             payload = dict(self._state)

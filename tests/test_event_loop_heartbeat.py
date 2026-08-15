@@ -51,6 +51,30 @@ def test_event_loop_pulse_refreshes_the_observed_timestamp(tmp_path):
     heartbeat.close()
 
 
+def test_finalize_progress_has_its_own_clock_and_does_not_fake_event_loop_liveness(
+    tmp_path,
+):
+    path = tmp_path / "recorder-status.json"
+    heartbeat = EventLoopHeartbeat(path, component="test-recorder", publish_seconds=0.02)
+    heartbeat.start()
+    heartbeat.pulse(phase="CAPTURING")
+    _wait_until(lambda: json.loads(path.read_text())["phase"] == "CAPTURING")
+    event_loop_pulse = json.loads(path.read_text())["heartbeat_mono"]
+
+    time.sleep(0.02)
+    heartbeat.finalize_progress(
+        stage="READING_RAW", rows_processed=50_000, segments_total=91
+    )
+    _wait_until(lambda: json.loads(path.read_text())["phase"] == "FINALIZING")
+    status = json.loads(path.read_text())
+    assert status["heartbeat_mono"] == event_loop_pulse
+    assert status["finalize_progress_mono"] > event_loop_pulse
+    assert status["finalize_stage"] == "READING_RAW"
+    assert status["finalize_rows_processed"] == 50_000
+    assert status["finalize_segments_total"] == 91
+    heartbeat.close()
+
+
 def test_publisher_failure_is_visible_to_the_event_loop(tmp_path, monkeypatch):
     path = tmp_path / "recorder-status.json"
     heartbeat = EventLoopHeartbeat(path, component="test-recorder", publish_seconds=0.01)

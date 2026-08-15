@@ -63,6 +63,39 @@ def test_recovery_resets_the_grace_clock(wd):
     assert not v.should_kill, "a recovery must reset the unhealthy timer"
 
 
+def test_finalizer_uses_progress_clock_not_stale_event_loop_clock(wd):
+    status = {
+        "phase": "FINALIZING",
+        "heartbeat_mono": 100.0,
+        "finalize_progress_mono": 995.0,
+        "finalize_stage": "VERIFYING_PARQUET",
+        "finalize_rows_processed": 1_000_000,
+    }
+    verdict = wd.evaluate(1000.0, status)
+    assert verdict.healthy and not verdict.should_kill
+    assert "VERIFYING_PARQUET" in verdict.reason
+
+
+def test_stale_finalizer_progress_uses_the_normal_alert_then_kill_grace(wd):
+    status = {
+        "phase": "FINALIZING",
+        "heartbeat_mono": 999.0,
+        "finalize_progress_mono": 900.0,
+        "finalize_stage": "COMPUTING_HEALTH",
+    }
+    first = wd.evaluate(1000.0, status)
+    assert first.should_alert and not first.should_kill
+    final = wd.evaluate(1040.0, status)
+    assert final.should_kill
+    assert "finalizer progress stale" in final.reason
+
+
+@pytest.mark.parametrize("phase", ["FINALIZED", "STOPPED"])
+def test_recorder_terminal_phases_do_not_age_into_watchdog_failures(wd, phase):
+    verdict = wd.evaluate(1000.0, {"phase": phase, "heartbeat_mono": 1.0})
+    assert verdict.healthy and not verdict.should_alert and not verdict.should_kill
+
+
 def test_watchdog_never_proposes_trading():
     """
     The whole design rests on this. The Verdict type has no order field, no
