@@ -81,6 +81,38 @@ def _process(pid: int) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+def _descendant_processes(pid: int) -> list[dict[str, Any]]:
+    value = _powershell_json(
+        "Get-CimInstance Win32_Process | "
+        "Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine"
+    )
+    if value is None:
+        return []
+    processes = [value] if isinstance(value, dict) else value
+    if not isinstance(processes, list) or not all(isinstance(item, dict) for item in processes):
+        raise RuntimeError(f"unexpected Win32_Process inventory: {value!r}")
+    by_parent: dict[int, list[dict[str, Any]]] = {}
+    for item in processes:
+        try:
+            parent = int(item.get("ParentProcessId"))
+        except (TypeError, ValueError):
+            continue
+        by_parent.setdefault(parent, []).append(item)
+    descendants: list[dict[str, Any]] = []
+    pending = [int(pid)]
+    seen = {int(pid)}
+    while pending:
+        parent = pending.pop()
+        for child in by_parent.get(parent, []):
+            child_pid = int(child["ProcessId"])
+            if child_pid in seen:
+                continue
+            seen.add(child_pid)
+            pending.append(child_pid)
+            descendants.append(child)
+    return descendants
+
+
 def _wait_for_status(
     path: Path,
     phases: set[str],
@@ -131,6 +163,37 @@ def _wait_process_gone(pid: int, *, timeout_seconds: float) -> None:
 
 def _delete_task(task_name: str) -> None:
     _run(["schtasks.exe", "/Delete", "/TN", task_name, "/F"], check=False)
+
+
+def _end_task(task_name: str) -> None:
+    _run(["schtasks.exe", "/End", "/TN", task_name], check=False)
+
+
+def _cleanup_task(task_name: str, artifact: Path, *, timeout_seconds: float) -> None:
+    runtime = artifact / "task-runtime-status.json"
+    owned_pids: set[int] = set()
+    try:
+        state = json.loads(runtime.read_text(encoding="utf-8"))
+        pid = int(state["task_action_pid"])
+        process = _process(pid)
+        if process is not None and HOST.name in str(process.get("CommandLine") or ""):
+            owned_pids.add(pid)
+        owned_pids.update(int(item["ProcessId"]) for item in _descendant_processes(pid))
+    except (FileNotFoundError, KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        pass
+
+    _end_task(task_name)
+    failures: list[str] = []
+    for pid in sorted(owned_pids, reverse=True):
+        try:
+            _wait_process_gone(pid, timeout_seconds=timeout_seconds)
+        except TimeoutError as exc:
+            failures.append(str(exc))
+    _delete_task(task_name)
+    if failures:
+        raise RuntimeError(
+            f"probe cleanup left Task-owned process alive for {task_name}: {failures}"
+        )
 
 
 def _launch_probe(
@@ -219,11 +282,13 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
     suffix = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     results: dict[str, Any] = {}
     task_names: list[str] = []
+    task_artifacts: dict[str, Path] = {}
     try:
         for offset, mode in enumerate(("pass", "fail"), 1):
             task_name = f"{args.task_prefix}-{mode}-{suffix}"
             task_names.append(task_name)
             artifact = artifact_parent / mode
+            task_artifacts[task_name] = artifact
             plan = _launch_probe(
                 python=python,
                 task_name=task_name,
@@ -253,6 +318,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
         task_name = f"{args.task_prefix}-hold-{suffix}"
         task_names.append(task_name)
         artifact = artifact_parent / "hold"
+        task_artifacts[task_name] = artifact
         plan = _launch_probe(
             python=python,
             task_name=task_name,
@@ -270,6 +336,11 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
         )
         process_before = _assert_owned_process(state)
         pid = int(state["task_action_pid"])
+        descendants_before = _descendant_processes(pid)
+        if descendants_before:
+            raise RuntimeError(
+                f"Task-owned Recorder host unexpectedly created child processes: {descendants_before}"
+            )
         ended = _run(["schtasks.exe", "/End", "/TN", task_name], check=False)
         if ended.returncode != 0:
             raise RuntimeError(
@@ -282,7 +353,9 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
             "plan": plan,
             "runtime_status_before_stop": state,
             "process_before_stop": process_before,
+            "descendant_processes_before_stop": descendants_before,
             "pid_gone_after_scheduler_stop": True,
+            "no_descendant_processes": True,
             "launcher_already_exited_while_task_alive": True,
             "stdout_bytes": stdout.stat().st_size,
             "stderr_bytes": stderr.stat().st_size,
@@ -299,8 +372,18 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
             "passed": True,
         }
     finally:
-        for task_name in task_names:
-            _delete_task(task_name)
+        cleanup_failures: list[str] = []
+        for task_name in reversed(task_names):
+            try:
+                _cleanup_task(
+                    task_name,
+                    task_artifacts[task_name],
+                    timeout_seconds=args.timeout_seconds,
+                )
+            except (OSError, RuntimeError, subprocess.SubprocessError, TimeoutError) as exc:
+                cleanup_failures.append(f"{task_name}: {type(exc).__name__}: {exc}")
+        if cleanup_failures:
+            raise RuntimeError(f"Windows lifecycle probe cleanup failed: {cleanup_failures}")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

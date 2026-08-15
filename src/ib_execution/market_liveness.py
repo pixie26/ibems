@@ -57,6 +57,7 @@ halt state is unknown, never assumed.
 from __future__ import annotations
 
 import math
+import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -96,6 +97,13 @@ FARM_ADVISORY_CODES = HISTORICAL_FARM_CODES | SECDEF_FARM_CODES
 
 # "inactive but should be available upon demand" -- never an outage.
 FARM_INACTIVE_CODE = 2108
+_FARM_ID_RE = re.compile(r":(?P<farm>[A-Za-z0-9_.-]+)\s*$")
+
+
+def realtime_farm_identity(message: str) -> str:
+    """Return the IB farm suffix, or one fail-closed unspecified bucket."""
+    match = _FARM_ID_RE.search(message.strip())
+    return match.group("farm").lower() if match is not None else "__unspecified__"
 
 
 class LivenessAction(Enum):
@@ -353,7 +361,7 @@ class MarketLiveness:
         # warning is held separately until a missing BAR independently confirms
         # that the market-data path is not producing its time-driven heartbeat.
         self._outages: dict[int, str] = {}
-        self._realtime_farm_degraded: str | None = None
+        self._realtime_farms_degraded: dict[str, str] = {}
         self._farm_advisories: dict[str, str] = {}
         self._calendar_silence: Optional[str] = None
         self._pending_recover: tuple[
@@ -434,11 +442,11 @@ class MarketLiveness:
                 RecoveryHint.BARS_ONLY,
             )
         elif code == REALTIME_FARM_BROKEN:
-            self._realtime_farm_degraded = (
+            self._realtime_farms_degraded[realtime_farm_identity(detail)] = (
                 f"real-time market data farm down ({code}): {detail}".strip()
             )
         elif code == REALTIME_FARM_OK:
-            self._realtime_farm_degraded = None
+            self._realtime_farms_degraded.pop(realtime_farm_identity(detail), None)
         elif code in HISTORICAL_FARM_CODES:
             self._farm_advisories["historical"] = (
                 f"historical data farm status ({code}): {detail}".strip()
@@ -563,7 +571,7 @@ class MarketLiveness:
 
         if age is not None and age > self.bar_timeout_seconds:
             self.heartbeat_losses += 1
-            if self._realtime_farm_degraded is not None:
+            if self._realtime_farms_degraded:
                 # 2103 alone is not an outage. Missing BAR is the independent
                 # corroboration that upgrades the interval to FEED_OUTAGE.
                 self.suppressed_assessments += 1
@@ -572,7 +580,10 @@ class MarketLiveness:
                     reason="BAR heartbeat lost while real-time market data farm is degraded",
                     heartbeat_age=age,
                     heartbeat_lost=True,
-                    expected_silence=self._realtime_farm_degraded,
+                    expected_silence=" | ".join(
+                        self._realtime_farms_degraded[name]
+                        for name in sorted(self._realtime_farms_degraded)
+                    ),
                     advisory_ages=advisory,
                     incident_kind=LivenessIncidentKind.FEED_OUTAGE,
                     heartbeat_last_mono=heartbeat_last_mono,
@@ -600,6 +611,14 @@ class MarketLiveness:
 
     def manifest(self) -> dict[str, object]:
         """Configuration and liveness evidence needed by the report."""
+        realtime_degraded = (
+            None
+            if not self._realtime_farms_degraded
+            else " | ".join(
+                self._realtime_farms_degraded[name]
+                for name in sorted(self._realtime_farms_degraded)
+            )
+        )
         return {
             "heartbeat_stream": HEARTBEAT_STREAM,
             "bar_period_seconds": BAR_PERIOD_SECONDS,
@@ -610,7 +629,10 @@ class MarketLiveness:
             "halt_state_available": self._halt_state_available,
             "halt_state_note": self._halt_state_note,
             "open_outages": [self._outages[code] for code in sorted(self._outages)],
-            "realtime_market_data_farm_degraded": self._realtime_farm_degraded,
+            "realtime_market_data_farm_degraded": realtime_degraded,
+            "realtime_market_data_farms_degraded": dict(
+                sorted(self._realtime_farms_degraded.items())
+            ),
             "farm_advisories": dict(sorted(self._farm_advisories.items())),
             "suppressed_assessments": self.suppressed_assessments,
             "suppressed_assessments_are_poll_count": True,

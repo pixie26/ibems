@@ -72,6 +72,25 @@ def test_realtime_farm_warning_plus_bar_loss_is_feed_outage() -> None:
     assert state.incident_kind is LivenessIncidentKind.FEED_OUTAGE
 
 
+def test_one_realtime_farm_recovery_does_not_clear_another_broken_farm() -> None:
+    live = _live()
+    live.note_event("BAR_5S", 5.0)
+    live.note_status(2103, "Market data farm connection is broken:usfarm")
+    live.note_status(2103, "Market data farm connection is broken:eufarm")
+    live.note_status(2104, "Market data farm connection is OK:usfarm")
+
+    state = live.assess(20.0)
+    manifest = live.manifest()
+
+    assert state.action is LivenessAction.WAIT
+    assert state.incident_kind is LivenessIncidentKind.FEED_OUTAGE
+    assert set(manifest["realtime_market_data_farms_degraded"]) == {"eufarm"}
+
+    live.note_status(2104, "Market data farm connection is OK:eufarm")
+    recovered = live.assess(20.1)
+    assert recovered.action is LivenessAction.RECOVER_SUBSCRIPTION
+
+
 def test_bar_loss_without_realtime_farm_evidence_is_gap_suspected() -> None:
     live = _live()
     live.note_event("BAR_5S", 5.0)

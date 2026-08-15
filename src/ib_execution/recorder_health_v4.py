@@ -22,6 +22,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -30,6 +31,8 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
+
+from .market_liveness import realtime_farm_identity
 
 SCHEMA_VERSION = 4
 BAR_STREAM = "BAR_5S"
@@ -62,6 +65,75 @@ FATAL_MARKET_DATA_CODES = frozenset({354, 10089, 10189, 10197})
 REALTIME_BARS_RESET = 10225
 
 _ERROR_RE = re.compile(r"^IB_ERROR:(?P<code>-?\d+):(?P<req>[^:]*):(?P<message>.*)$")
+_HEX_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+RAW_EVENT_KEYS = frozenset(
+    {
+        "event_id",
+        "recorder_run_id",
+        "connection_epoch",
+        "contract_id",
+        "event_type",
+        "broker_timestamp",
+        "local_wall_ns",
+        "local_monotonic_ns",
+        "market_data_type",
+        "receive_sequence",
+        "bid",
+        "ask",
+        "bid_size",
+        "ask_size",
+        "last",
+        "last_size",
+        "exchange",
+        "special_conditions",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "wap",
+        "trade_count",
+    }
+)
+_RAW_INTEGER_FIELDS = {
+    "event_id": 1,
+    "connection_epoch": 0,
+    "contract_id": 0,
+    "local_wall_ns": 1,
+    "local_monotonic_ns": 0,
+    "receive_sequence": 1,
+}
+_RAW_OPTIONAL_NUMBER_FIELDS = frozenset(
+    {
+        "bid",
+        "ask",
+        "bid_size",
+        "ask_size",
+        "last",
+        "last_size",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "wap",
+    }
+)
+
+
+class RawRowValidationError(ValueError):
+    """One decoded raw row does not satisfy the frozen Recorder schema."""
+
+
+@dataclass(frozen=True)
+class RawFileState:
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+    device: int
+    inode: int
+    sha256: str
 
 
 @dataclass(frozen=True)
@@ -210,27 +282,167 @@ def _combined_input_digest(file_hashes: dict[str, str]) -> str:
     return digest.hexdigest()
 
 
+def _validate_raw_row(row: Any, *, segment: str, line_number: int) -> dict[str, Any]:
+    location = f"{segment}:{line_number}"
+    if not isinstance(row, dict):
+        raise RawRowValidationError(f"{location}: raw row must be a JSON object")
+    keys = frozenset(row)
+    missing = sorted(RAW_EVENT_KEYS - keys)
+    unknown = sorted(keys - RAW_EVENT_KEYS)
+    if missing or unknown:
+        raise RawRowValidationError(
+            f"{location}: raw schema mismatch; missing={missing}; unknown={unknown}"
+        )
+
+    event_type = row["event_type"]
+    if not isinstance(event_type, str) or event_type not in {*MARKET_STREAMS, "SYSTEM"}:
+        raise RawRowValidationError(f"{location}: unknown event_type {event_type!r}")
+    run_id = row["recorder_run_id"]
+    if not isinstance(run_id, str) or not run_id.strip():
+        raise RawRowValidationError(f"{location}: recorder_run_id must be non-empty")
+    market_data_type = row["market_data_type"]
+    if not isinstance(market_data_type, str) or not market_data_type.strip():
+        raise RawRowValidationError(f"{location}: market_data_type must be non-empty")
+
+    for name, minimum in _RAW_INTEGER_FIELDS.items():
+        value = row[name]
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            raise RawRowValidationError(
+                f"{location}: {name} must be an integer >= {minimum}; got {value!r}"
+            )
+
+    broker_timestamp = row["broker_timestamp"]
+    if not isinstance(broker_timestamp, str):
+        raise RawRowValidationError(f"{location}: broker_timestamp must be a string")
+    try:
+        parsed = datetime.fromisoformat(broker_timestamp)
+    except ValueError as exc:
+        raise RawRowValidationError(
+            f"{location}: broker_timestamp is not ISO-8601: {broker_timestamp!r}"
+        ) from exc
+    if parsed.tzinfo is None:
+        raise RawRowValidationError(f"{location}: broker_timestamp must include UTC offset")
+
+    for name in _RAW_OPTIONAL_NUMBER_FIELDS:
+        value = row[name]
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise RawRowValidationError(f"{location}: {name} must be numeric or null")
+        if not math.isfinite(float(value)):
+            raise RawRowValidationError(f"{location}: {name} must be finite")
+    trade_count = row["trade_count"]
+    if trade_count is not None and (
+        isinstance(trade_count, bool) or not isinstance(trade_count, int) or trade_count < 0
+    ):
+        raise RawRowValidationError(f"{location}: trade_count must be a nonnegative integer or null")
+    for name in ("exchange", "special_conditions"):
+        value = row[name]
+        if value is not None and not isinstance(value, str):
+            raise RawRowValidationError(f"{location}: {name} must be a string or null")
+    return row
+
+
 def _raw_segments(raw_dir: Path) -> list[Path]:
     segments = sorted(raw_dir.glob("segment-*.jsonl.gz"))
     segments.extend(sorted(raw_dir.glob("crashed-*.jsonl.gz")))
     return sorted(set(segments), key=lambda path: path.name)
 
 
+def _capture_raw_state(raw_dir: Path) -> tuple[list[Path], dict[str, RawFileState]]:
+    segments = _raw_segments(raw_dir)
+    if not segments:
+        raise FileNotFoundError(f"no raw Recorder segments found under {raw_dir}")
+    states: dict[str, RawFileState] = {}
+    for path in segments:
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"raw segment must be a regular non-symlink file: {path}")
+        before = path.stat()
+        digest = _sha256(path)
+        after = path.stat()
+        before_identity = (
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+            before.st_dev,
+            before.st_ino,
+        )
+        after_identity = (
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+            after.st_dev,
+            after.st_ino,
+        )
+        if before_identity != after_identity:
+            raise ValueError(f"raw segment changed while hashing: {path.name}")
+        states[path.name] = RawFileState(
+            size=int(after.st_size),
+            mtime_ns=int(after.st_mtime_ns),
+            ctime_ns=int(after.st_ctime_ns),
+            device=int(after.st_dev),
+            inode=int(after.st_ino),
+            sha256=digest,
+        )
+    return segments, states
+
+
+def _manifest_raw_hashes(payload: dict[str, Any]) -> dict[str, str]:
+    files = payload.get("files")
+    if not isinstance(files, dict):
+        raise ValueError("original v3 manifest is missing files mapping")
+    hashes = {
+        str(name): str(value)
+        for name, value in files.items()
+        if str(name).startswith(("segment-", "crashed-"))
+        and str(name).endswith(".jsonl.gz")
+    }
+    if not hashes:
+        raise ValueError("original v3 manifest has no raw segment hashes")
+    invalid = sorted(name for name, value in hashes.items() if not _HEX_SHA256_RE.fullmatch(value))
+    if invalid:
+        raise ValueError(f"original v3 manifest has invalid raw SHA-256 values: {invalid}")
+    return dict(sorted(hashes.items()))
+
+
+def _describe_state_change(
+    before: dict[str, RawFileState], after: dict[str, RawFileState]
+) -> str:
+    before_names = set(before)
+    after_names = set(after)
+    added = sorted(after_names - before_names)
+    removed = sorted(before_names - after_names)
+    changed = sorted(name for name in before_names & after_names if before[name] != after[name])
+    return f"added={added}; removed={removed}; changed={changed}"
+
+
 def iter_raw_rows(
     raw_dir: Path,
     *,
+    segments: Sequence[Path] | None = None,
     integrity: list[dict[str, Any]] | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Read each immutable raw segment exactly once for semantic analysis."""
-    for segment in _raw_segments(raw_dir):
+    for segment in _raw_segments(raw_dir) if segments is None else segments:
         rows = 0
         error: str | None = None
         try:
             with gzip.open(segment, "rb") as handle:
                 for line in handle:
                     rows += 1
-                    yield json.loads(line)
-        except (EOFError, OSError, gzip.BadGzipFile, json.JSONDecodeError) as exc:
+                    decoded = json.loads(line)
+                    yield _validate_raw_row(
+                        decoded,
+                        segment=segment.name,
+                        line_number=rows,
+                    )
+        except (
+            EOFError,
+            OSError,
+            gzip.BadGzipFile,
+            json.JSONDecodeError,
+            RawRowValidationError,
+        ) as exc:
             error = f"{type(exc).__name__}: {exc}"
         finally:
             if integrity is not None:
@@ -299,9 +511,11 @@ def _gaps(
     )
 
 
-def _status_state_at(statuses: Sequence[StatusEvent], target_ns: int) -> tuple[bool, bool]:
+def _status_state_at(
+    statuses: Sequence[StatusEvent], target_ns: int
+) -> tuple[bool, dict[str, StatusEvent]]:
     connectivity_lost = False
-    realtime_farm_broken = False
+    realtime_farms_broken: dict[str, StatusEvent] = {}
     for status in statuses:
         if status.wall_ns > target_ns:
             break
@@ -313,22 +527,10 @@ def _status_state_at(statuses: Sequence[StatusEvent], target_ns: int) -> tuple[b
         ):
             connectivity_lost = False
         elif status.code == REALTIME_FARM_BROKEN:
-            realtime_farm_broken = True
+            realtime_farms_broken[realtime_farm_identity(status.message)] = status
         elif status.code == REALTIME_FARM_OK:
-            realtime_farm_broken = False
-    return connectivity_lost, realtime_farm_broken
-
-
-def _latest_relevant_status(
-    statuses: Sequence[StatusEvent], target_ns: int, codes: frozenset[int]
-) -> StatusEvent | None:
-    latest = None
-    for status in statuses:
-        if status.wall_ns > target_ns:
-            break
-        if status.code in codes:
-            latest = status
-    return latest
+            realtime_farms_broken.pop(realtime_farm_identity(status.message), None)
+    return connectivity_lost, realtime_farms_broken
 
 
 def _connectivity_outages(
@@ -340,7 +542,8 @@ def _connectivity_outages(
         if status.wall_ns > session_close_ns:
             break
         if status.code == CONNECTIVITY_LOST:
-            open_status = status
+            if open_status is None:
+                open_status = status
             continue
         if status.code not in (
             CONNECTIVITY_RESTORED_DATA_LOST,
@@ -407,22 +610,19 @@ def _bar_gap_findings(
     for sub_start, sub_end in zip(ordered, ordered[1:]):
         if sub_end <= sub_start:
             continue
-        connectivity_lost, realtime_farm_broken = _status_state_at(statuses, sub_start)
+        connectivity_lost, realtime_farms_broken = _status_state_at(statuses, sub_start)
         if connectivity_lost:
             # 1100 produces its own direct exact-duration hard finding.
             continue
-        if realtime_farm_broken:
-            latest = _latest_relevant_status(
-                statuses,
-                sub_start,
-                frozenset({REALTIME_FARM_BROKEN, REALTIME_FARM_OK}),
-            )
+        if realtime_farms_broken:
             evidence = [
                 f"BAR_5S gap {total_gap:.3f}s > {BAR_GAP_SECONDS:.0f}s",
                 "BAR heartbeat is absent during a real-time market-data farm degradation",
             ]
-            if latest is not None:
-                evidence.append(f"IB {latest.code}: {latest.message}")
+            evidence.extend(
+                f"IB {status.code}: {status.message}"
+                for _, status in sorted(realtime_farms_broken.items())
+            )
             classification = "FEED_OUTAGE"
         else:
             evidence = [
@@ -458,7 +658,8 @@ def _paired_auxiliary_advisories(
         if status.wall_ns > session_close_ns:
             break
         if status.code == broken_code:
-            opened = status
+            if opened is None:
+                opened = status
             continue
         if status.code != ok_code or opened is None:
             continue
@@ -730,37 +931,74 @@ def reanalyze_raw_v4(
     *,
     session_open: datetime,
     session_close: datetime,
+    expected_raw_hashes: dict[str, str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     raw_dir = raw_dir.resolve(strict=True)
-    segments = _raw_segments(raw_dir)
-    if not segments:
-        raise FileNotFoundError(f"no raw Recorder segments found under {raw_dir}")
-    file_hashes = {path.name: _sha256(path) for path in segments}
+    segments, state_before = _capture_raw_state(raw_dir)
+    file_hashes = {name: state.sha256 for name, state in state_before.items()}
+    if expected_raw_hashes is not None and file_hashes != expected_raw_hashes:
+        manifest_only = sorted(set(expected_raw_hashes) - set(file_hashes))
+        raw_only = sorted(set(file_hashes) - set(expected_raw_hashes))
+        hash_mismatch = sorted(
+            name
+            for name in set(file_hashes) & set(expected_raw_hashes)
+            if file_hashes[name] != expected_raw_hashes[name]
+        )
+        raise ValueError(
+            "raw segment inventory/hash does not match original v3 manifest; "
+            f"manifest_only={manifest_only}; raw_only={raw_only}; "
+            f"hash_mismatch={hash_mismatch}"
+        )
     integrity: list[dict[str, Any]] = []
     input_metadata = {
         "raw_dir": str(raw_dir),
         "raw_segment_count": len(segments),
         "raw_file_sha256": file_hashes,
         "raw_input_sha256": _combined_input_digest(file_hashes),
+        "original_manifest_inventory_match": expected_raw_hashes is not None,
     }
     health = analyze_rows_v4(
-        iter_raw_rows(raw_dir, integrity=integrity),
+        iter_raw_rows(raw_dir, segments=segments, integrity=integrity),
         session_open=session_open,
         session_close=session_close,
         input_metadata=input_metadata,
         integrity=integrity,
         work_parent=raw_dir,
     )
+    _, state_after = _capture_raw_state(raw_dir)
+    if state_before != state_after:
+        raise ValueError(
+            "raw evidence changed between attestation and semantic analysis; "
+            + _describe_state_change(state_before, state_after)
+        )
+    input_metadata["verification"] = {
+        "segment_inventory_stable": True,
+        "pre_and_post_sha256_match": True,
+        "compressed_sha256_scan_passes": 2,
+        "semantic_decode_passes": 1,
+    }
+    health["input"] = input_metadata
     return health, {"integrity": integrity, **input_metadata}
 
 
 def _create_durable(path: Path, payload: bytes) -> None:
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
     try:
-        os.write(fd, payload)
+        view = memoryview(payload)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError(f"short write while publishing {path}")
+            view = view[written:]
         os.fsync(fd)
     finally:
         os.close(fd)
+    if os.name != "nt":
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 
 
 def write_reanalysis_v4(
@@ -769,8 +1007,8 @@ def write_reanalysis_v4(
     *,
     session_open: datetime,
     session_close: datetime,
-    original_health: Path | None = None,
-    original_manifest: Path | None = None,
+    original_health: Path,
+    original_manifest: Path,
 ) -> tuple[Path, Path]:
     """Write v4 sidecars once; amendment is the completion marker.
 
@@ -788,19 +1026,39 @@ def write_reanalysis_v4(
             "refusing to overwrite evidence"
         )
 
+    original_health_resolved = original_health.resolve(strict=True)
+    original_manifest_resolved = original_manifest.resolve(strict=True)
+    original_health_bytes = original_health_resolved.read_bytes()
+    original_manifest_bytes = original_manifest_resolved.read_bytes()
+    try:
+        original_health_payload = json.loads(original_health_bytes)
+        original_manifest_payload = json.loads(original_manifest_bytes)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"original v3 health/manifest is not valid JSON: {exc}") from exc
+    if not isinstance(original_health_payload, dict) or not isinstance(
+        original_manifest_payload, dict
+    ):
+        raise ValueError("original v3 health and manifest must be JSON objects")
+    expected_raw_hashes = _manifest_raw_hashes(original_manifest_payload)
+
     health, input_metadata = reanalyze_raw_v4(
         raw_dir,
         session_open=session_open,
         session_close=session_close,
+        expected_raw_hashes=expected_raw_hashes,
     )
     health_bytes = (json.dumps(health, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
-    originals: dict[str, Any] = {}
-    for name, path in (("health_v3", original_health), ("manifest_v3", original_manifest)):
-        if path is None:
-            continue
-        resolved = path.resolve(strict=True)
-        originals[name] = {"path": str(resolved), "sha256": _sha256(resolved)}
+    originals: dict[str, Any] = {
+        "health_v3": {
+            "path": str(original_health_resolved),
+            "sha256": hashlib.sha256(original_health_bytes).hexdigest(),
+        },
+        "manifest_v3": {
+            "path": str(original_manifest_resolved),
+            "sha256": hashlib.sha256(original_manifest_bytes).hexdigest(),
+        },
+    }
 
     amendment = {
         "schema_version": SCHEMA_VERSION,

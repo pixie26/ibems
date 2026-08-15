@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import gc
 import gzip
 import hashlib
 import json
@@ -32,6 +33,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 from uuid import uuid4
 
+from ib_execution import quote_recorder as quote_recorder_module
 from ib_execution.quote_recorder import finalize_day, parquet_schema
 
 DEFAULT_EXPECTED_ROWS = 2_645_388
@@ -39,6 +41,9 @@ DEFAULT_MAX_WORKING_SET = 1 * 1024**3
 DEFAULT_MAX_PRIVATE_COMMIT = int(1.5 * 1024**3)
 DEFAULT_MAX_TEMP = 2 * 1024**3
 DEFAULT_MAX_FINALIZE_SECONDS = 30 * 60.0
+DEFAULT_MAX_HANDLE_DELTA = (
+    max(2, 2 * (os.cpu_count() or 1)) if os.name == "nt" else 0
+)
 FINALIZE_BATCH_ROWS = 50_000
 
 
@@ -228,6 +233,13 @@ def _clock_replay_samples(original_health: dict[str, Any]) -> list[float]:
 def _handle_count() -> int | None:
     if os.name == "nt":
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentProcess.argtypes = []
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.GetProcessHandleCount.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.GetProcessHandleCount.restype = wintypes.BOOL
         count = wintypes.DWORD()
         if not kernel32.GetProcessHandleCount(kernel32.GetCurrentProcess(), ctypes.byref(count)):
             return None
@@ -238,12 +250,133 @@ def _handle_count() -> int | None:
         return None
 
 
+class _ThreadEntry32(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ThreadID", wintypes.DWORD),
+        ("th32OwnerProcessID", wintypes.DWORD),
+        ("tpBasePri", wintypes.LONG),
+        ("tpDeltaPri", wintypes.LONG),
+        ("dwFlags", wintypes.DWORD),
+    ]
+
+
+def _thread_count() -> int | None:
+    if os.name != "nt":
+        try:
+            return len(list(Path("/proc/self/task").iterdir()))
+        except OSError:
+            return None
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Thread32First.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ThreadEntry32)]
+    kernel32.Thread32First.restype = wintypes.BOOL
+    kernel32.Thread32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ThreadEntry32)]
+    kernel32.Thread32Next.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000004, 0)
+    if snapshot == wintypes.HANDLE(-1).value:
+        return None
+    try:
+        entry = _ThreadEntry32()
+        entry.dwSize = ctypes.sizeof(entry)
+        if not kernel32.Thread32First(snapshot, ctypes.byref(entry)):
+            return None
+        pid = os.getpid()
+        count = 0
+        while True:
+            if int(entry.th32OwnerProcessID) == pid:
+                count += 1
+            if not kernel32.Thread32Next(snapshot, ctypes.byref(entry)):
+                break
+        return count
+    finally:
+        kernel32.CloseHandle(snapshot)
+
+
+def _exclusive_read_probe(paths: Sequence[Path]) -> dict[str, Any]:
+    """Prove that the live worker retains no file handle on replay files."""
+    if os.name != "nt":
+        return {"applicable": False, "passed": True, "checked": 0, "errors": {}}
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    invalid = wintypes.HANDLE(-1).value
+    errors: dict[str, int] = {}
+    for path in paths:
+        handle = kernel32.CreateFileW(
+            str(path.resolve(strict=True)),
+            0x80000000,
+            0,
+            None,
+            3,
+            0x00000080,
+            None,
+        )
+        if handle == invalid:
+            errors[str(path)] = int(ctypes.get_last_error())
+            continue
+        kernel32.CloseHandle(handle)
+    return {
+        "applicable": True,
+        "passed": not errors,
+        "checked": len(paths),
+        "errors": errors,
+    }
+
+
 def _write_stage(path: Path, phase: str) -> None:
     temporary = path.with_suffix(".tmp")
     temporary.write_text(
         json.dumps({"phase": phase, "updated": time.time()}), encoding="utf-8"
     )
     os.replace(temporary, path)
+
+
+def _warm_finalize_runtime(candidate: Path) -> None:
+    """Load lazy Arrow/codecs before taking the leak-check baseline.
+
+    Windows counts DLL/runtime initialization handles as a cold-start delta.
+    They live until this short-lived worker exits and are not per-finalize file
+    leaks.  Exercise the same Parquet+ZSTD open/write/read/close path with one
+    tiny disposable file so the measured delta starts from a stable runtime.
+    The warm-up is included in the time and memory envelope and never reads a
+    source segment.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = candidate / ".finalize-runtime-warmup.parquet"
+    schema = pa.schema([("warmup", pa.int64())])
+    writer = pq.ParquetWriter(path, schema, compression="zstd")
+    table = pa.Table.from_pylist([{"warmup": 1}], schema=schema)
+    try:
+        writer.write_table(table)
+    finally:
+        writer.close()
+    parquet = pq.ParquetFile(path)
+    try:
+        readback = parquet.read()
+        if readback.num_rows != 1:
+            raise RuntimeError("Parquet runtime warm-up readback mismatch")
+    finally:
+        parquet.close()
+    del readback, parquet, table, writer
+    path.unlink()
+    gc.collect()
 
 
 def _worker(args: argparse.Namespace) -> int:
@@ -262,6 +395,15 @@ def _worker(args: argparse.Namespace) -> int:
     if not source_segments:
         raise FileNotFoundError(f"no immutable raw segments under {source_dir}")
     source_before = _source_metadata(source_segments)
+    source_resolved = {path.resolve(strict=True): path.name for path in source_segments}
+    compressed_hash_scans: Counter[str] = Counter()
+    original_sha256 = quote_recorder_module._sha256
+
+    def counted_sha256(path: Path) -> str:
+        resolved = Path(path).resolve(strict=True)
+        if resolved in source_resolved:
+            compressed_hash_scans[source_resolved[resolved]] += 1
+        return original_sha256(path)
 
     replay = ImmutableReplayLog(
         source_dir=source_dir,
@@ -270,22 +412,40 @@ def _worker(args: argparse.Namespace) -> int:
         original_write_accounting=original_manifest["write_accounting"],
     )
     accounting = original_manifest["write_accounting"]
-    handles_before = _handle_count()
+    cold_handles_before = _handle_count()
+    cold_threads_before = _thread_count()
     _write_stage(stage_path, "FINALIZING")
     started = time.monotonic()
-    candidate_manifest = finalize_day(
-        replay,
-        session_open=args.session_open,
-        session_close=args.session_close,
-        clock_skew_samples=_clock_replay_samples(original_health),
-        handler_counts=accounting.get("handled_by_stream") or None,
-        selected_counts=accounting.get("selected_by_stream") or None,
-        filtered_counts=accounting.get("filtered_by_stream") or None,
-        capture_policy=original_manifest.get("capture_policy"),
-        liveness=original_manifest.get("liveness"),
-    )
+    _warm_finalize_runtime(candidate)
+    handles_before = _handle_count()
+    threads_before = _thread_count()
+    quote_recorder_module._sha256 = counted_sha256
+    try:
+        candidate_manifest = finalize_day(
+            replay,
+            session_open=args.session_open,
+            session_close=args.session_close,
+            clock_skew_samples=_clock_replay_samples(original_health),
+            handler_counts=accounting.get("handled_by_stream") or None,
+            selected_counts=accounting.get("selected_by_stream") or None,
+            filtered_counts=accounting.get("filtered_by_stream") or None,
+            capture_policy=original_manifest.get("capture_policy"),
+            liveness=original_manifest.get("liveness"),
+        )
+    finally:
+        quote_recorder_module._sha256 = original_sha256
     finalize_seconds = time.monotonic() - started
+    gc.collect()
+    file_handle_probe = _exclusive_read_probe(
+        [
+            *source_segments,
+            candidate / "events.parquet",
+            candidate / "health.json",
+            candidate / "manifest.json",
+        ]
+    )
     handles_after = _handle_count()
+    threads_after = _thread_count()
     _write_stage(stage_path, "VERIFYING_EQUIVALENCE")
 
     candidate_health = json.loads((candidate / "health.json").read_text(encoding="utf-8"))
@@ -337,6 +497,10 @@ def _worker(args: argparse.Namespace) -> int:
         "raw_hashes_unchanged": raw_hashes_original == raw_hashes_candidate,
         "source_metadata_unchanged": source_before == source_after,
         "single_gzip_json_decode_pass": replay.read_calls == 1,
+        "single_compressed_sha256_scan_per_segment": (
+            set(compressed_hash_scans) == set(source_resolved.values())
+            and all(count == 1 for count in compressed_hash_scans.values())
+        ),
     }
     if original_parquet is not None:
         checks["original_parquet_semantics"] = (
@@ -358,6 +522,27 @@ def _worker(args: argparse.Namespace) -> int:
         "candidate_parquet": candidate_parquet,
         "original_parquet": original_parquet,
         "finalize_seconds": finalize_seconds,
+        "handles_before_runtime_warmup": cold_handles_before,
+        "runtime_warmup_handle_delta": (
+            None
+            if cold_handles_before is None or handles_before is None
+            else handles_before - cold_handles_before
+        ),
+        "threads_before_runtime_warmup": cold_threads_before,
+        "threads_before_finalize": threads_before,
+        "threads_after_finalize": threads_after,
+        "thread_delta": (
+            None
+            if threads_before is None or threads_after is None
+            else threads_after - threads_before
+        ),
+        "runtime_thread_growth": (
+            None
+            if cold_threads_before is None or threads_after is None
+            else threads_after - cold_threads_before
+        ),
+        "runtime_thread_growth_limit": 2 * max(0, (os.cpu_count() or 1) - 1),
+        "file_handle_exclusive_read_probe": file_handle_probe,
         "handles_before_finalize": handles_before,
         "handles_after_finalize": handles_after,
         "handle_delta": (
@@ -367,7 +552,14 @@ def _worker(args: argparse.Namespace) -> int:
         ),
         "raw_access": {
             "gzip_json_decode_passes": replay.read_calls,
-            "compressed_sha256_scan_passes": 1,
+            "compressed_sha256_scans_by_segment": dict(sorted(compressed_hash_scans.items())),
+            "compressed_sha256_scan_passes": (
+                1
+                if compressed_hash_scans
+                and all(count == 1 for count in compressed_hash_scans.values())
+                else None
+            ),
+            "compressed_sha256_scan_count_is_measured": True,
             "note": (
                 "The current v3 finalizer decodes/materializes raw exactly once, then "
                 "performs one sequential compressed-byte SHA-256 scan for manifest attestation."
@@ -451,6 +643,49 @@ def _finalize_temp_bytes(candidate: Path) -> int:
     return total
 
 
+def _resource_checks(
+    *,
+    worker: dict[str, Any],
+    peak_working_set: int,
+    peak_private_commit: int,
+    peak_temp: int,
+    observed_finalize_sample: bool,
+    args: argparse.Namespace,
+) -> dict[str, bool]:
+    runtime_thread_growth = worker.get("runtime_thread_growth")
+    runtime_thread_limit = worker.get("runtime_thread_growth_limit")
+    file_probe = worker.get("file_handle_exclusive_read_probe") or {}
+    checks: dict[str, bool] = {
+        "finalize_under_time_limit": float(worker["finalize_seconds"])
+        <= args.max_finalize_seconds,
+        "temporary_space_under_limit": peak_temp <= args.max_temp_bytes,
+        "working_set_sample_observed": observed_finalize_sample and peak_working_set > 0,
+        "working_set_under_limit": 0 < peak_working_set <= args.max_working_set_bytes,
+        "handle_count_sample_observed": worker.get("handle_delta") is not None,
+        "handle_delta_under_limit": (
+            worker.get("handle_delta") is not None
+            and int(worker["handle_delta"]) <= args.max_handle_delta
+        ),
+        "runtime_thread_count_sample_observed": (
+            runtime_thread_growth is not None and runtime_thread_limit is not None
+        ),
+        "runtime_thread_growth_bounded": (
+            runtime_thread_growth is not None
+            and runtime_thread_limit is not None
+            and 0 <= int(runtime_thread_growth) <= int(runtime_thread_limit)
+        ),
+    }
+    if os.name == "nt":
+        checks["exclusive_file_handle_probe_passed"] = (
+            file_probe.get("applicable") is True and file_probe.get("passed") is True
+        )
+        checks["private_commit_sample_observed"] = peak_private_commit > 0
+        checks["private_commit_under_limit"] = (
+            0 < peak_private_commit <= args.max_private_commit_bytes
+        )
+    return checks
+
+
 def _run_parent(args: argparse.Namespace) -> int:
     raw_dir = args.raw_dir.resolve(strict=True)
     work_root = args.work_root.resolve(strict=False)
@@ -495,6 +730,8 @@ def _run_parent(args: argparse.Namespace) -> int:
         if time.monotonic() - started > timeout_seconds:
             process.kill()
             process.wait()
+            if not args.retain_failed_candidate:
+                shutil.rmtree(candidate, ignore_errors=True)
             raise TimeoutError(f"replay worker exceeded hard timeout {timeout_seconds:.0f}s")
         try:
             phase = json.loads((candidate / "worker-stage.json").read_text())["phase"]
@@ -512,24 +749,22 @@ def _run_parent(args: argparse.Namespace) -> int:
 
     stdout, stderr = process.communicate()
     if not worker_report.exists():
+        if not args.retain_failed_candidate:
+            shutil.rmtree(candidate, ignore_errors=True)
         raise RuntimeError(
             f"replay worker did not produce a report; rc={process.returncode}; "
             f"stdout={stdout[-2000:]} stderr={stderr[-6000:]}"
         )
     worker = json.loads(worker_report.read_text(encoding="utf-8"))
 
-    resource_checks: dict[str, bool] = {
-        "finalize_under_time_limit": float(worker["finalize_seconds"])
-        <= args.max_finalize_seconds,
-        "temporary_space_under_limit": peak_temp <= args.max_temp_bytes,
-        "working_set_sample_observed": observed_finalize_sample and peak_working_set > 0,
-        "working_set_under_limit": 0 < peak_working_set <= args.max_working_set_bytes,
-    }
-    if os.name == "nt":
-        resource_checks["private_commit_sample_observed"] = peak_private_commit > 0
-        resource_checks["private_commit_under_limit"] = (
-            0 < peak_private_commit <= args.max_private_commit_bytes
-        )
+    resource_checks = _resource_checks(
+        worker=worker,
+        peak_working_set=peak_working_set,
+        peak_private_commit=peak_private_commit,
+        peak_temp=peak_temp,
+        observed_finalize_sample=observed_finalize_sample,
+        args=args,
+    )
 
     report = {
         "schema_version": 1,
@@ -544,6 +779,7 @@ def _run_parent(args: argparse.Namespace) -> int:
             "max_private_commit_bytes": args.max_private_commit_bytes,
             "max_temp_bytes": args.max_temp_bytes,
             "max_finalize_seconds": args.max_finalize_seconds,
+            "max_handle_delta": args.max_handle_delta,
             "checks": resource_checks,
         },
     }
@@ -554,16 +790,21 @@ def _run_parent(args: argparse.Namespace) -> int:
     )
 
     cleanup_error = None
-    if passed:
+    cleanup_requested = passed or not args.retain_failed_candidate
+    if cleanup_requested:
         try:
             shutil.rmtree(candidate)
         except OSError as exc:
             cleanup_error = f"{type(exc).__name__}: {exc}"
             passed = False
     report["candidate_cleanup"] = {
-        "deleted_on_success": cleanup_error is None and not candidate.exists(),
+        "cleanup_requested": cleanup_requested,
+        "deleted": cleanup_error is None and not candidate.exists(),
         "error": cleanup_error,
-        "candidate_retained_for_failed_diagnosis": candidate.exists(),
+        "candidate_retained_for_failed_diagnosis": (
+            not passed and args.retain_failed_candidate and candidate.exists()
+        ),
+        "failure_evidence_is_embedded_in_report": not passed,
     }
     report["passed"] = passed
     args.report_out.parent.mkdir(parents=True, exist_ok=True)
@@ -602,7 +843,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-private-commit-bytes", type=int, default=DEFAULT_MAX_PRIVATE_COMMIT)
     parser.add_argument("--max-temp-bytes", type=int, default=DEFAULT_MAX_TEMP)
     parser.add_argument("--max-finalize-seconds", type=float, default=DEFAULT_MAX_FINALIZE_SECONDS)
+    parser.add_argument(
+        "--max-handle-delta", type=int, default=DEFAULT_MAX_HANDLE_DELTA
+    )
     parser.add_argument("--poll-seconds", type=float, default=0.05)
+    parser.add_argument(
+        "--retain-failed-candidate",
+        action="store_true",
+        help="retain rebuildable failed candidate files instead of only the small JSON report",
+    )
 
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--candidate-dir", type=Path, help=argparse.SUPPRESS)
@@ -618,6 +867,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.max_temp_bytes,
     ) <= 0 or args.max_finalize_seconds <= 0 or args.poll_seconds <= 0:
         parser.error("resource limits and polling interval must be positive")
+    if args.max_handle_delta < 0:
+        parser.error("max-handle-delta must be nonnegative")
     if args.worker and (args.candidate_dir is None or args.worker_report is None):
         parser.error("worker mode requires --candidate-dir and --worker-report")
     return args

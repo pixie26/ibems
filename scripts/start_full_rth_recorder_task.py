@@ -27,6 +27,7 @@ from xml.etree import ElementTree as ET
 TASK_NAME_RE = re.compile(r"^ibems-full-rth-[A-Za-z0-9_.-]{1,64}$")
 TASK_NS = "http://schemas.microsoft.com/windows/2004/02/mit/task"
 CREATE_NO_WINDOW = 0x08000000
+SCHEDULER_BACKSTOP = "PT24H"
 
 
 def _windows_identity() -> str:
@@ -68,9 +69,11 @@ def _task_xml(plan: dict[str, object]) -> bytes:
         "RunOnlyIfNetworkAvailable": "false",
         "Enabled": "true",
         "Hidden": "false",
-        # PT0S disables Scheduler's fixed wall-clock kill. The directly-owned
-        # Python host enforces the actual IB session close + 3h30m deadline.
-        "ExecutionTimeLimit": "PT0S",
+        # The directly-owned Python host enforces the precise IB session close
+        # + 3h30m deadline. Scheduler retains a deliberately wider independent
+        # backstop so interpreter/import/status-publication hangs that happen
+        # before the in-process watchdog starts are still bounded.
+        "ExecutionTimeLimit": SCHEDULER_BACKSTOP,
         "Priority": "7",
     }
     for name, value in values.items():
@@ -206,7 +209,8 @@ def build_plan(args: argparse.Namespace) -> dict[str, object]:
         "stdout_path": str(stdout_path),
         "stderr_path": str(stderr_path),
         "process_ownership": "TASK_SCHEDULER_DIRECT_PYTHON_SAME_PROCESS_RECORDER",
-        "scheduler_execution_time_limit": "PT0S",
+        "scheduler_execution_time_limit": SCHEDULER_BACKSTOP,
+        "scheduler_backstop_role": "INDEPENDENT_PRE_WATCHDOG_AND_PROCESS_HANG_BOUND",
         "dynamic_deadline_rule": "RTH_CLOSE_PLUS_3H_FINALIZE_PLUS_30M_SAFETY",
         "lifecycle_probe": args.lifecycle_probe,
         "allow_start_on_battery": True,

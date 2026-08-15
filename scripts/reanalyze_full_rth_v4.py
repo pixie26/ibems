@@ -23,8 +23,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--session-open", required=True, type=_aware_datetime)
     parser.add_argument("--session-close", required=True, type=_aware_datetime)
-    parser.add_argument("--original-health", type=Path)
-    parser.add_argument("--original-manifest", type=Path)
+    parser.add_argument("--original-health", required=True, type=Path)
+    parser.add_argument("--original-manifest", required=True, type=Path)
     return parser.parse_args(argv)
 
 

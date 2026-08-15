@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from ib_execution.quote_recorder import RawEventLog, RawTick, finalize_day
 
@@ -104,8 +107,53 @@ def test_replay_uses_production_finalize_without_touching_source_raw(tmp_path: P
     assert all(report["checks"].values())
     assert report["raw_access"]["gzip_json_decode_passes"] == 1
     assert report["raw_access"]["compressed_sha256_scan_passes"] == 1
+    assert report["raw_access"]["compressed_sha256_scan_count_is_measured"] is True
+    assert report["checks"]["single_compressed_sha256_scan_per_segment"] is True
     assert report["clock_skew_replay"]["exact_sample_vector_available"] is False
+    assert isinstance(report["runtime_warmup_handle_delta"], int)
+    assert report["handle_delta"] == 0
+    assert report["runtime_thread_growth"] <= report["runtime_thread_growth_limit"]
+    if os.name == "nt":
+        assert report["file_handle_exclusive_read_probe"] == {
+            "applicable": True,
+            "passed": True,
+            "checked": len(source_segments) + 3,
+            "errors": {},
+        }
     assert before == after
     assert (candidate / "events.parquet").exists()
     assert (candidate / "health.json").exists()
     assert (candidate / "manifest.json").exists()
+
+
+def test_replay_resource_acceptance_fails_on_handle_leak() -> None:
+    replay_module = _load_replay()
+    args = SimpleNamespace(
+        max_finalize_seconds=1800.0,
+        max_temp_bytes=2 * 1024**3,
+        max_working_set_bytes=1024**3,
+        max_private_commit_bytes=int(1.5 * 1024**3),
+        max_handle_delta=0,
+    )
+
+    checks = replay_module._resource_checks(
+        worker={"finalize_seconds": 10.0, "handle_delta": 1},
+        peak_working_set=128 * 1024**2,
+        peak_private_commit=256 * 1024**2,
+        peak_temp=64 * 1024**2,
+        observed_finalize_sample=True,
+        args=args,
+    )
+
+    assert checks["handle_count_sample_observed"] is True
+    assert checks["handle_delta_under_limit"] is False
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows process handle API only")
+def test_windows_handle_count_is_observable() -> None:
+    replay_module = _load_replay()
+
+    count = replay_module._handle_count()
+
+    assert isinstance(count, int)
+    assert count > 0
