@@ -19,7 +19,7 @@
 | 无 IB 依赖的执行核心 | Gate B1 已在 exact-freeze commit `117188cea539...` 完成正式 campaign、真实存储故障证据和 owner acceptance，结论为 PASS。当前 B2 工作树已有 freeze 后改动，必须单独验证，不能沿用 B1 attestation。 |
 | Hypothesis Gate campaign | B1 exact-freeze campaign 已通过；详细计数与 artifact digest 见 `docs/GATE_B1_SIGNOFF_117188cea539.md`。任何 B2 行为代码改动都需要绑定新的 tree 重新验证。 |
 | 不变量 0 + 22 条安全不变量 | B1 exact-freeze 的 Property / Runtime / Auditor 与 B1.6 journal witness 已闭环。真实 IB reconciliation、unknown broker facts 和 callback 行为明确留给 B2，不属于 B1 PASS 的证明范围。 |
-| 只读 SPY Recorder / B2 preflight | Gateway 4002、server time、SPY `conId=756733`、account summary、空状态 broker snapshot、多 client、Gateway restart / `TerminateProcess` 已有直接观测。`OVERNIGHT` 和 `RTH+SMART` bounded Recorder 已 PASS；持订阅断网已观察 1100→1102。2026-08-12 Full-RTH 尝试约 66 分钟后因错误 full reconnect 后收到 `10197` 而 FAIL；事故后同策略 120 秒 LIVE probe PASS。Full-RTH 仍未完成，1101 未观察。 |
+| 只读 SPY Recorder / B2 preflight | Gateway 4002、server time、SPY `conId=756733`、account summary、空状态 broker snapshot、多 client、Gateway restart / `TerminateProcess` 已有直接观测。`OVERNIGHT` 和 `RTH+SMART` bounded Recorder 已 PASS；持订阅断网已观察 1100→1102。2026-08-12 Full-RTH 因错误 full reconnect / `10197` 提前 FAIL。2026-08-14 已保留 2,645,388 行完整收盘产物，原 v3 health 永久保持 FAIL；同一 immutable raw 的 production-finalizer replay 已通过资源/语义验收，create-only v4 reanalysis 为 `health_ok=true`。目标 Windows lifecycle 证据与下一次端到端 Full-RTH 尚未完成，因此仍不能称为 Full-RTH PASS。1101 仍未观察。 |
 | 交易型 IB Adapter | 未授权连接下单路径。`placeOrder`、`cancelOrder`、订单身份、完整 callback/error mapping 和非空动态 reconciliation 尚未在真实 Gateway 验证。 |
 | Emergency flatten broker path | 未实现。现有代码只覆盖计划生成与人工确认边界。 |
 
@@ -131,7 +131,9 @@ Recorder 与交易路径隔离开发，只采集：
 
 原始事件通过有界内存队列交给独立 writer，按 batch 写入 append-only gzip JSONL；callback 不执行 gzip/flush/fsync。代码显式区分 `execution_minimal`、`evidence_sampled`、`research_full`，采样规则和 `handled → selected → enqueued → persisted → readback` 全链路均写入 manifest。独立 heartbeat publisher 不会替 event loop 刷新 pulse，因此 IB 请求整体卡住可以由外部 watchdog 发现。队列满、writer/heartbeat 异常、5 秒 bar heartbeat 丢失、关闭超时或任一计数不一致都会 fail-closed；BidAsk / AllLast 属于事件驱动流，其 staleness 只记录、不单独触发恢复。`execution_host` 不保存每条行情 tick，订单 Journal 的 durable-before-send 语义也没有被异步化。详细边界见 [Recorder 写入、测试与 Windows 部署边界](docs/RECORDER_STORAGE_AND_WINDOWS_POLICY_ZH.md)。
 
-收盘 compact/finalize 同样有界：冻结一次 segment snapshot 后按 50,000 行写 Parquet row groups，健康统计使用 64 MB SQLite staging 保留乱序与精确 gap 语义，Parquet 按 batch 解码验证，所有候选验证完才以 manifest 作为最后完成标记。`FINALIZING` 使用独立 progress clock，不能伪装成 IB event-loop heartbeat。该修复针对 2026-08-14 Full-RTH 直接观察到的旧实现 16.23 GB private commit / 约 77 分钟收尾问题；真实全日运行后的新资源边界仍需下一次 Windows Full-RTH 直接验证。
+收盘 compact/finalize 同样有界：冻结一次 segment snapshot 后按 50,000 行写 Parquet row groups，健康统计使用 64 MB SQLite staging 保留乱序与精确 gap 语义，Parquet 按 batch 解码验证，所有候选验证完才以 manifest 作为最后完成标记。`FINALIZING` 使用独立 progress clock，不能伪装成 IB event-loop heartbeat。该修复针对 2026-08-14 Full-RTH 直接观察到的旧实现 16.23 GB private commit / 约 77 分钟收尾问题；同一 2,645,388 行 immutable raw 的 production-finalizer replay 已在 116.234 秒完成，峰值 working set 458,805,248 bytes、private commit 678,473,728 bytes、临时空间 191,734,866 bytes。下一次 Windows Full-RTH 仍需直接验证 capture→finalize 的端到端宿主与资源边界。
+
+v4 只做不可变离线复核：原 v3 health/manifest 永不覆盖，输出是 create-only `health-v4.json` 与完成标记 `manifest-amendment-v4.json`。复核前必须匹配原 manifest 的完整 raw inventory/hash，解压结束后再次验证 segment identity/metadata/hash 未改变；raw schema 的缺字段、未知字段/type、非法 timestamp/number 都显式 FAIL。该离线双 hash verification 不改变阶段 C production finalizer 的一次 semantic decode + 一次 manifest hash scan。
 
 当前实测已在 SPY OVERNIGHT 与正式 `RTH+SMART` bounded run 中直接观察到 LIVE BidAsk、AllLast 和 5 秒 bars 三路非零。早期 sleep 后读取 `Ticker.tickByTicks` 残余缓冲得到的 `AllLast=0` 已被判定为无效测量；现有 preflight 与 Recorder 都在 callback 中累计。2026-08-11 的 RTH handler-count run 中，handler 与 raw readback 均为 `8972/1707/25`，直接证明该窗口 callback→gzip→readback 无丢失。旧 preflight 与 Recorder 位于不重叠窗口，约 40% 的 BidAsk 计数差异从来不是有效的丢包测量，现已关闭且不再安排同步 A/B；这仍不等于 IB 上游无损或 Full-RTH 全日 health。
 
@@ -151,6 +153,7 @@ Recorder 与交易路径隔离开发，只采集：
 Full-RTH 应使用 [`scripts/start_full_rth_recorder_task.py`](scripts/start_full_rth_recorder_task.py) 交给
 Task Scheduler 独立托管，事故与修复边界见
 [`docs/INCIDENT_FULL_RTH_20260813_APPX_TERMINATION_ZH.md`](docs/INCIDENT_FULL_RTH_20260813_APPX_TERMINATION_ZH.md)。
+Task action 直接执行与 Recorder 相同的 Python PID；进程内 deadline 是真实 `RTH close + 3h30m`，Scheduler 另保留 `PT24H` 独立 backstop，覆盖 watchdog 启动前卡死。两层都不自动重启。
 
 ## 本项目明确不做什么
 
@@ -216,7 +219,7 @@ python -m ib_execution.execution_host --journal D:\ibems-data\journal.db \
 
 1. **策略 Gate A 独立推进。** 在策略仓库完成真实成本、数据质量和统计不确定性判断；若结论为 `NO_GO` 或 `INSUFFICIENT_EVIDENCE`，且没有独立第二消费者，就停止投资交易型 IB Adapter。
 2. **持三路订阅的受控断网已部分闭环。** production `run()` 已直接观察 1100→1102、不重订和恢复后逐流增量；1101 仍未观察，新 incident 生命周期尚未真实 fault 复测。不得为碰取 1101 重复断网。
-3. **先封存当前部分日，再运行一次真正 Full-RTH。** 当前约 13:00 ET 起跑的运行即使到收盘也不是 Full-RTH；自然结束后先核对 writer accounting、health、manifest 和 digest。另一天从开盘前启动，验证 `finalize_day` 全日 coverage、开盘/午盘/收盘 bar 节奏，以及长期内存、磁盘和队列水位。
+3. **完成 Windows lifecycle 证据。** 2026-08-14 immutable replay 与 create-only v4 amendment 已完成且通过；原 v3 verdict 不变。下一步是在目标主机执行经 owner 确认的 no-IB PASS/FAIL/HOLD Scheduler probe，通过后再安排下一次集成 Full-RTH，不用只为阶段 C 重录一整天。
 4. **完成本地剩余小项与 B2 freeze。** 为强杀后的 gzip 段增加明确的段级完整性判定和不完整尾段处置；统一 attestation 从 Git 对象读取历史冻结事实；完成官方文档复核，并把 B2 source、tests、docs 和 evidence 绑定到新的可复查 tree。
 5. **只读阶段不下单。** `completed orders` 被 Gateway Read-Only policy 阻断；不关闭保护追测。非空 reconciliation、订单身份和 callback 保留到另行授权的 paper-order 子阶段。
 6. **paper order 必须重新授权。** 只读证据封存后，owner 才单独决定是否运行 1 股 SPY paper-order protocol；B1 PASS 或 B2 只读结果都不自动构成该授权。MOC、多策略、live capital 和自动 watchdog takeover 继续推迟；live order 继续禁止。
