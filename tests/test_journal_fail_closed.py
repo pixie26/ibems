@@ -19,7 +19,21 @@ from ib_execution.risk import RiskConfig, RiskEngine
 from conftest import SESSION_START, target
 
 
-def _system(tmp_path, *, write_timeout: float = 0.10):
+# Building the Controller commits RISK_CONFIG_LOADED, which is a real SQLite
+# write plus fsync before any test body runs. A setup budget tighter than the
+# production one therefore turns a slow disk into a fake fencing regression:
+# on a shared Windows CI runner with realtime AV scanning a single fsync can
+# exceed a hundred milliseconds, `_system()` raises JournalUnavailable, and the
+# injected fault under test is never installed. Use the same durability budget
+# production is held to (max_writer_lag_ms <= 5000). This parameter stays as
+# the seam for a test that needs a different setup budget; the one test that
+# genuinely measures timeout behaviour narrows `_write_timeout_seconds`
+# directly after setup instead -- see
+# test_fsync_timeout_fences_and_never_sends.
+SETUP_WRITE_TIMEOUT_SECONDS = 5.0
+
+
+def _system(tmp_path, *, write_timeout: float = SETUP_WRITE_TIMEOUT_SECONDS):
     clock = ManualClock(SESSION_START)
     journal = Journal(
         tmp_path / "journal.db",
@@ -72,7 +86,7 @@ def test_storage_error_fences_before_broker_write(tmp_path, storage_error):
 
 
 def test_fsync_timeout_fences_and_never_sends(tmp_path):
-    clock, journal, broker, ctl, alerts = _system(tmp_path, write_timeout=0.20)
+    clock, journal, broker, ctl, alerts = _system(tmp_path)
     journal._write_timeout_seconds = 0.03
     original = journal._apply
 
