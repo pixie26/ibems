@@ -185,4 +185,6 @@ source、tests、docs 与后续真实 Gateway 证据仍需在最终 freeze 中�
 - [`INCIDENT_FULL_RTH_20260812_ZH.md`](INCIDENT_FULL_RTH_20260812_ZH.md)：Full-RTH 提前终止、API log、恢复策略缺陷、P0 修复、CI 基线和 2026-08-13 Full-RTH 复测方案。
 - [`GATE_B2_READONLY_20260809.md`](GATE_B2_READONLY_20260809.md)：每一轮真实 Gateway 测试的详细过程与观测。
 - [`DOCUMENTED_VS_OBSERVED.md`](DOCUMENTED_VS_OBSERVED.md)：官方文档语义与真实 Gateway 直接观测的逐项矩阵。
+- [`FULL_RTH_ACCEPTANCE_20260818_REVIEW_ZH.md`](FULL_RTH_ACCEPTANCE_20260818_REVIEW_ZH.md)：2026-08-18 Full-RTH 验收报告的仓库侧复核；本文尚未把上表的 Full-RTH 一行升级为 PASS，待 exact commit / artifact digest 与 §4.2、§4.3 两项 owner 裁决补齐。
+- [`BRANCH_INVENTORY_20260819_ZH.md`](BRANCH_INVENTORY_20260819_ZH.md)：分支清点、两条活跃分支的整合方案与清理清单。
 - [`GATE_B1_SIGNOFF_117188cea539.md`](GATE_B1_SIGNOFF_117188cea539.md)：Gate B1 exact-freeze owner acceptance；其范围不包含真实 IB 行为。
