@@ -110,9 +110,9 @@ RTH close `20:00Z` → deadline `23:30Z` = `07:30 HKT`。FINALIZED 于 `04:05:40
 
 1. **取回并登记本次运行的 exact commit 与全部 artifact digest**（§3）。这是所有后续步骤的前置。
 2. **裁决 §4.2（v3/v4 判定权）与 §4.3（writer-lag OPEN 项）**，作为 owner 决定记入 `GATE_B2_STATUS_20260810_ZH.md`。
-3. **整合两条活跃分支并让交付 commit 自己变绿**（详见 `BRANCH_INVENTORY_20260819_ZH.md`）。
-   `agent/repo-hygiene-safe` 的 tip `17b3375` **从未跑过 CI**；按 `AGENTS.md`「A stale-branch run does not prove the current tree」，
-   合并前必须在交付 commit 上有一次自己的绿 CI。
+3. **让交付 commit 自己变绿。** 两条活跃分支已于 2026-08-19 整合（详见 `BRANCH_INVENTORY_20260819_ZH.md` §2.1），
+   但 `agent/repo-hygiene-safe` 的 tip `17b3375` **从未跑过 CI**；按 `AGENTS.md`
+   「A stale-branch run does not prove the current tree」，合入 `main` 前必须在交付 commit 上有一次自己的绿 CI。
 4. **更新 `GATE_B2_STATUS_20260810_ZH.md`**：把「SPY Full-RTH 全日 health」一行按裁决结果改写，
    把本轮 artifact 加入 §5 证据索引，并把 §6.4「下一次完整 RTH 必须使用新 artifact root、唯一 client id 和独立 Task Scheduler host」标注为已执行。
 5. **然后才是 §6.8**：逐项完成官方 IB 文档复核，把 B2 的 source、tests、docs、evidence 绑定成一次**覆盖当前树**的新 freeze。

@@ -4,9 +4,9 @@
 
 ## 1. 结论
 
-- **15 条可清理**，其中 14 条零风险，1 条需要先保全一个文件。
-- **2 条是活跃工作线**，且**已经分叉**，必须先整合成一条再谈合并。
-- 仓库当前**没有任何分支记录 2026-08-18 的 Full-RTH 结果**；`main` 也**不含**产生该结果的 v4 代码。
+- **15 条可清理**，其中 14 条零风险，1 条需要先保全一个文件（**尚未执行，等 owner 批准**）。
+- **2 条活跃工作线原本已分叉，现已整合**到 `claude/acceptance-report-branch-review-n2y883`（见 §2.1）。
+- `main` 仍**不含**产生 2026-08-18 Full-RTH 结果的 v4 代码；整合分支合入 `main` 属 owner 决定，本次未执行。
 
 ## 2. 活跃分支（必须处理）
 
@@ -28,15 +28,37 @@
 `scripts/validate_full_rth_finalize_replay.py`、`scripts/verify_windows_full_rth_task_lifecycle.py`，
 以及 `market_liveness.py` 的 farm ownership 重写与四组新回归测试。
 
-### 2.1 建议整合方式
+### 2.1 整合方式（2026-08-19 已执行）
 
-把 `34f3ac4` 的 `CLAUDE.md` 并入 `repo-hygiene-safe`，形成唯一交付分支，再把 PR #14 的 head 换过去
-（或另开 PR，关闭 #14 并在其中注明继任分支）。
+整合落在 `claude/acceptance-report-branch-review-n2y883` 上，做法是**真合并 + 一次 cherry-pick**：
 
 ```bash
-git checkout -B integrate/full-rth-v4 origin/agent/repo-hygiene-safe
-git cherry-pick 34f3ac4          # CLAUDE.md，一行
+git merge --no-ff origin/agent/repo-hygiene-safe   # 29 commits
+git cherry-pick 34f3ac4                            # CLAUDE.md，一行
 ```
+
+选择「合并」而不是 rebase 或 squash，是为了不重写任何既有 commit：两条源分支的 SHA 保持不变，
+`17b3375` 成为交付分支的祖先，`34f3ac4` 的作者与内容原样保留。全程无 force-push，
+未改动 `main`，未删除任何分支。
+
+**无冲突是可证明的，不是碰巧**：`repo-hygiene-safe` 相对 `main` 改动 18 个文件，
+本复核分支相对 `main` 改动 3 个文件，两个集合**完全不相交**，因此不存在需要人工裁量的合并取舍。
+
+整合后核验：
+
+| 项目 | 结果 |
+|---|---|
+| 与 `origin/agent/repo-hygiene-safe` 的差异 | 仅 `CLAUDE.md` + 本复核的 3 个文档 |
+| 与 `origin/agent/full-rth-v4-repair` 的差异 | 仅 `.gitignore`、`FINAL_EXECUTION_PLAN_ZH.md`（两者本就是 hygiene 分支更新）+ 本复核的 3 个文档 |
+| `src/`、`scripts/`、`tests/` | 与两条分支**逐文件相同**，无内容丢失 |
+| `origin/main`、`origin/agent/repo-hygiene-safe` 是否为祖先 | 是 |
+| `python -m compileall -q src tests scripts` | OK |
+| 完整测试套件（Linux） | `502 passed, 4 skipped` |
+| `pytest -m property` | 通过 |
+| `python -m ib_execution.provenance --check` | `STATE.json matches the worktree and derived gate attestation` |
+| `STATE.json` | 与 `repo-hygiene-safe` 逐字节相同；整合未改动它（provenance 只覆盖 `src`/`tests`/`scripts` 的 `*.py` 加 `pyproject.toml`，文档与 `CLAUDE.md` 不在范围内） |
+
+PR #14 的处置留给 owner：可把 head 换到本分支，或另开 PR 并关闭 #14 时注明继任分支。
 
 ### 2.2 合并前必须先绿
 
@@ -140,9 +162,15 @@ git push origin --delete \
   b1-attestation-27d027ff390b
 ```
 
-清理后剩：`main` + 一条整合分支 + 本次复核分支。
+清理后剩：`main` + 整合/复核分支 `claude/acceptance-report-branch-review-n2y883`，
+以及两条源分支 `agent/repo-hygiene-safe`、`agent/full-rth-v4-repair`——后两条在整合分支合入 `main` 之前先保留，作为可回溯的来源。
 
-## 5. 顺序建议
+## 5. 剩余顺序
 
-清理（§4）与整合（§2）互不阻塞，但**整合优先**：`main` 目前不含 v4 代码，而 2026-08-18 的
-Full-RTH 结果依赖 v4。在整合落地之前，`main` 无法解释仓库自己产出的验收报告。
+整合（§2.1）已完成。剩下三步，按此顺序：
+
+1. **让交付 commit 自己变绿**（§2.2）。这是合入 `main` 的前置：`AGENTS.md` 要求
+   「CI on the exact delivered commit」，而 `windows-verify` 目前会在那个 0.10s 计时假设上概率性变红。
+2. **合入 `main`**。属 owner 决定：`main` 目前不含 v4 代码，无法解释仓库自己产出的验收报告，
+   但合并时机与 PR #14 的处置由 owner 定。
+3. **清理 15 条陈旧分支**（§4）。与前两步互不阻塞，但删远端分支同样需 owner 批准。
