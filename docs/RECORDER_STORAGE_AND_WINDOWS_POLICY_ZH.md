@@ -54,6 +54,22 @@ manifest 保存完整链路：`handled → selected → enqueued → persisted �
 
 **OPEN（与本次内存修复分离）**：同一 Full-RTH manifest 记录 `fsync_latency_ms.max=4750ms`、`p95=78ms`、`max_writer_lag_ms=5250ms`，虽有 `dropped=0` 且 queue high-water 仅 `492/100000`，但 writer lag 已略高于现有 5 秒 soak 预算。当前证据不能把它归因于磁盘、换页或安全扫描；在不改变 1 秒 durability cadence 前，需用可复现存储 probe 定位并以 `max_writer_lag_ms <= 5000` 关闭。
 
+### Full-RTH v4 离线复核与不可变证据
+
+v4 不覆盖或改写原 `health.json` / `manifest.json`。`health-v4.json` 与 `manifest-amendment-v4.json` 只允许 create-only 发布，amendment 是完成标记；原 v3 FAIL 永久保持原结论。离线复核必须读取原 v3 manifest 的完整 raw segment inventory/hash，首次 hash 与 manifest 完全一致后才允许解压；语义读取完成后再次枚举并 hash 全部 segment，文件名、文件身份、size、mtime、ctime 或 SHA-256 任一变化都拒绝发布。因此 v4 离线流程是一次 gzip/JSON semantic decode 加前后两次 compressed hash verification；这不改变阶段 C production finalizer 的“一次 decode + 一次 manifest hash scan”。
+
+raw JSONL 使用冻结字段集合并 fail-closed 校验：缺字段、未知字段、未知 `event_type`、非法/无时区时间戳、非有限数、非法整数范围或错误类型都会产生 `RAW_SEGMENT_INCOMPLETE` hard problem，不能被静默忽略。v4 的 event-driven gap 仍只进入 advisories；BAR、1100、subscription/Recorder/raw 完整性才可进入 problems。多个 realtime farm 以 IB message 中的 farm suffix 独立跟踪，一个 farm 的 2104 不得清除另一个 farm 的 2103。
+
+Full-RTH replay 验收器直接调用 production `finalize_day()`，但在外层实际计数每个 source segment 的 gzip/JSON decode 与 compressed hash scan。Windows 的 Arrow CPU/IO pool 是延迟初始化的，不能把冷启动后的所有 handle 增长误报成文件泄漏：验收同时限制总 handle delta、以 native thread count 约束两个 pool 的增长上界，并在 worker 尚存活时对全部 source/candidate 文件执行 no-share 独占只读打开；任一文件仍被持有即 FAIL。2026-08-14 的 2,645,388 行 replay 实测为 116.234 秒、working set 峰值 458,805,248 bytes、private commit 峰值 678,473,728 bytes、临时空间峰值 191,734,866 bytes、handle delta `15/16`、runtime thread growth `14/14`，94 个文件独占探针全部通过。成功候选自动删除；原 raw 永不复制或修改。
+
+同一 immutable raw 的 create-only v4 复核已生成 14,100-byte `health-v4.json` 与 30,945-byte `manifest-amendment-v4.json`：`health_ok=true`、problems 为空，唯一 advisory 是约 0.987 秒的 security-definition farm degradation；该 auxiliary farm 状态不证明 SPY realtime feed outage。91 个 segment 的原 manifest inventory/hash、前后 identity/metadata/hash 均一致；原 v3 verdict 不变。
+
+### Windows Full-RTH 进程边界
+
+Task Scheduler 直接拥有运行 Recorder 的同一个 Python PID，不再使用 `cmd.exe → child python`。正常 deadline 由进程内 watchdog 按真实 IB session 执行 `RTH close + 3h finalize + 30m safety`；Scheduler 同时保留 `PT24H` 独立 backstop，覆盖 Python import、首个 durable status 或 watchdog 创建前卡死，以及进程内 watchdog 本身失效。两层 deadline 都是 fail-closed，且都不自动重启。
+
+no-IB lifecycle verifier 的 PASS/FAIL/HOLD task 只运行同一 Python host 的 probe mode。任何退出路径都先 `/End`、等待 runtime-status 记录的 Task-owned PID 及其已观测 descendants 消失，再 `/Delete`。Windows 可以给直接运行的 console Python 附加一个 direct-child `C:\Windows\System32\conhost.exe`；验收最多只允许这一个路径和命令行均匹配的 OS console host，任何 `cmd.exe`、第二个 Python、其他 child 或 grandchild 都 FAIL。该工具会真实注册和删除 Windows Scheduled Tasks，仍需在运行前给出精确 task/artifact 目标并取得 owner 对该次系统操作的确认。
+
 ## Event-loop watchdog
 
 Recorder 现在有独立 heartbeat publisher 线程，但该线程不会自行刷新 event-loop 时间。只有 IB event loop 调用 `pulse()` 才会推进 `heartbeat_mono`；因此 `reqCurrentTime` 或其他 IB 请求卡住时，publisher 虽仍能写状态文件，外部 watchdog 看到的 pulse 仍会持续变旧。

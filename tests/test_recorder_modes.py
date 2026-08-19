@@ -140,17 +140,17 @@ def test_liveness_detects_a_live_socket_with_a_dead_bar_subscription(tmp_path):
 def test_quote_staleness_is_reported_but_never_acts(tmp_path):
     """The mirror image: bars healthy, quotes silent. Report only.
 
-    A long BID_ASK gap on a live subscription is a fact about the tape.
-    Acting on it is what made a quiet OVERNIGHT window produce the same
-    failure text as a genuinely dead feed.
+    Event-driven streams use the common 30-second observation threshold.
+    A long BID_ASK gap stays a quality advisory and never drives recovery.
     """
     recorder = QuoteRecorder(tmp_path, mode=DataMode.RESEARCH_FULL)
     recorder.liveness.subscription_started(100.0)
-    recorder.liveness.note_event("BAR_5S", 118.0)
+    recorder.liveness.note_event("ALL_LAST", 110.0)
+    recorder.liveness.note_event("BAR_5S", 129.0)
 
-    assert recorder.stream_staleness(now_mono=120.0) == {"BID_ASK": 20.0}
-    assert "BAR_5S" not in recorder.stream_staleness(now_mono=120.0)
-    assert recorder.liveness.assess(now_mono=120.0).action is LivenessAction.CONTINUE
+    assert recorder.stream_staleness(now_mono=131.0) == {"BID_ASK": 31.0}
+    assert "BAR_5S" not in recorder.stream_staleness(now_mono=131.0)
+    assert recorder.liveness.assess(now_mono=131.0).action is LivenessAction.CONTINUE
 
 
 def test_decision_window_promotes_the_complete_predecision_bidask_ring(tmp_path):
