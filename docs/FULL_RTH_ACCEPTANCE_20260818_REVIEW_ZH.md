@@ -89,6 +89,11 @@ RTH close `20:00Z` → deadline `23:30Z` = `07:30 HKT`。FINALIZED 于 `04:05:40
 
 在该裁决落纸以前，本轮严格来说是「v4 PASS、v3 FAIL」，不是无条件 PASS。
 
+**2026-08-20 owner 决定补记：** owner 已接受 SPY/RTH 的 BID_ASK、ALL_LAST 使用 30 秒
+event-driven observation threshold，并批准 D1：§6.7 的最终 Full-RTH `health_ok` authority 从 v3 移交给 v4，
+见 `GATE_B2_STATUS_20260810_ZH.md` §3.5。原 v3 FAIL 永久保留；该决定不修复 artifact/provenance 缺口，
+也不把本轮自动升级为 Gate B2 PASS。D1 已关闭 owner 判定权问题，但其市场微结构假设必须在生产前重审。
+
 ### 4.3 `max_writer_lag_ms` OPEN 项的关闭条件只满足了一半
 
 `RECORDER_STORAGE_AND_WINDOWS_POLICY_ZH.md` 的 OPEN 项原文要求：
@@ -104,12 +109,16 @@ RTH close `20:00Z` → deadline `23:30Z` = `07:30 HKT`。FINALIZED 于 `04:05:40
 
 不接受的做法是：按原文照抄「本轮关闭」而不说明 probe 从未执行。
 
+**2026-08-20 owner 决定补记：** owner 批准 D2，选择 (b)：writer-lag 保持 OPEN，直到有界可复现
+storage probe 定位根因；若生产前仍无法定位，只能通过一次新的、明确列出残余风险的 owner amendment
+决定是否接受，不能沿用本次决定或仅凭 `1,234ms` 数值关闭。
+
 ## 5. 下一步（对齐 `GATE_B2_STATUS_20260810_ZH.md` §6）
 
 原计划 §6.7 → §6.8 → §6.9 的顺序不变。按当前状态展开为：
 
 1. **取回并登记本次运行的 exact commit 与全部 artifact digest**（§3）。这是所有后续步骤的前置。
-2. **裁决 §4.2（v3/v4 判定权）与 §4.3（writer-lag OPEN 项）**，作为 owner 决定记入 `GATE_B2_STATUS_20260810_ZH.md`。
+2. **§4.2/§4.3 owner 裁决已完成。** D1：v4 成为 Full-RTH 最终 health authority；D2：writer-lag 保持 OPEN。两项均已记入 `GATE_B2_STATUS_20260810_ZH.md`，并列为生产前强制 assumption review。
 3. **让交付 commit 自己变绿。** 两条活跃分支已于 2026-08-19 整合（详见 `BRANCH_INVENTORY_20260819_ZH.md` §2.1），
    但 `agent/repo-hygiene-safe` 的 tip `17b3375` **从未跑过 CI**；按 `AGENTS.md`
    「A stale-branch run does not prove the current tree」，合入 `main` 前必须在交付 commit 上有一次自己的绿 CI。
