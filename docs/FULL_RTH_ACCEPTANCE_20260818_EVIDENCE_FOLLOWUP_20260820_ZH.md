@@ -7,7 +7,7 @@
 - **verified**：运行由 `agent/full-rth-v4-repair@34f3ac43cc56982976e401fd519512b2462e7e35` 启动，launch record 显示工作树干净；其 source/config/dependency 摘要与该 Git 对象中的 `STATE.json` 完全一致。
 - **verified**：运行边界为 `READ_ONLY`、`order_authorization=NONE`、`trading_adapter=NOT_IMPLEMENTED`；最终 runtime phase 为 `FINALIZED`，v3 为 FAIL、v4 为 PASS，原 Gate 未改变。
 - **partially verified**：v3 health、v3 manifest 与 Parquet 文件仍存在，但当前审计进程受其 Windows ACL 限制，不能重新读取并直接计算摘要；下表保留运行时 amendment/stdout 登记值并明确标注来源。
-- **not Gate PASS**：v3/v4 判定权和 writer-lag OPEN 项仍需 owner 裁决；本文件不升级 Gate B2 或 Full-RTH 状态。
+- **not Gate PASS**：D1/D2 owner 裁决已记录，但 Windows v4 字节级摘要缺口、exact-delivery CI、writer-lag OPEN 根因和生产前 assumption review 仍是独立边界；本文件不升级 Gate B2。
 
 本次 evidence root 共 95 个文件、103,515,782 bytes，其中 82 个 gzip segment 共 57,486,838 bytes，`events.parquet` 为 45,901,319 bytes。未新增 raw 或 Parquet。
 
