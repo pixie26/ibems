@@ -118,7 +118,7 @@ storage probe 定位根因；若生产前仍无法定位，只能通过一次新
 原计划 §6.7 → §6.8 → §6.9 的顺序不变。按当前状态展开为：
 
 1. **取回并登记本次运行的 exact commit 与全部 artifact digest**（§3）。这是所有后续步骤的前置。
-2. **§4.2/§4.3 owner 裁决已完成。** D1：v4 成为 Full-RTH 最终 health authority；D2：writer-lag 保持 OPEN。两项均已记入 `GATE_B2_STATUS_20260810_ZH.md`，并列为生产前强制 assumption review。
+2. **§4.2/§4.3 owner 裁决已完成。** D1：v4 成为 Full-RTH 最终 health authority；D2：writer-lag 保持 OPEN。两项均已记入 `GATE_B2_STATUS_20260810_ZH.md`，并列为后续 assumption review；该 review 不阻塞 B2 freeze，但必须在任何 order-capable Paper/Live 或生产部署前完成。
 3. **让交付 commit 自己变绿。** 两条活跃分支已于 2026-08-19 整合（详见 `BRANCH_INVENTORY_20260819_ZH.md` §2.1），
    但 `agent/repo-hygiene-safe` 的 tip `17b3375` **从未跑过 CI**；按 `AGENTS.md`
    「A stale-branch run does not prove the current tree」，合入 `main` 前必须在交付 commit 上有一次自己的绿 CI。

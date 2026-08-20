@@ -7,7 +7,7 @@
 - **verified**：运行由 `agent/full-rth-v4-repair@34f3ac43cc56982976e401fd519512b2462e7e35` 启动，launch record 显示工作树干净；其 source/config/dependency 摘要与该 Git 对象中的 `STATE.json` 完全一致。
 - **verified**：运行边界为 `READ_ONLY`、`order_authorization=NONE`、`trading_adapter=NOT_IMPLEMENTED`；最终 runtime phase 为 `FINALIZED`，v3 为 FAIL、v4 为 PASS，原 Gate 未改变。
 - **partially verified**：v3 health、v3 manifest 与 Parquet 文件仍存在，但当前审计进程受其 Windows ACL 限制，不能重新读取并直接计算摘要；下表保留运行时 amendment/stdout 登记值并明确标注来源。
-- **not Gate PASS**：D1/D2 owner 裁决已记录，但 Windows v4 字节级摘要缺口、exact-delivery CI、writer-lag OPEN 根因和生产前 assumption review 仍是独立边界；本文件不升级 Gate B2。
+- **not Gate PASS**：本文件只记录历史运行的证据跟进，不单独升级 Gate B2。D1/D2 owner 裁决及其风险假设已登记；后续 assumption review **不阻塞 B2 freeze**，但历史 v4 字节级摘要边界、证据 provenance 和其他 Gate 条件仍须按各自状态如实收口。
 
 本次 evidence root 共 95 个文件、103,515,782 bytes，其中 82 个 gzip segment 共 57,486,838 bytes，`events.parquet` 为 45,901,319 bytes。未新增 raw 或 Parquet。
 
@@ -76,15 +76,16 @@
 2. **D2 已批准：** writer lag 本轮为 `1,233.9999999967404ms <= 5,000ms`，但可复现存储 probe 未完成，因此根因保持 OPEN，不按单轮数值关闭。
 3. 当前 GitHub `main` 未启用 branch protection；required CI 与独立 review 不是服务器端强制。任何保护规则变更需要单独批准。
 
-## 7. 可能产生问题的假设与生产前强制 review
+## 7. 可能产生问题的假设与后续 review（不阻塞 B2 freeze）
 
-| 决定 | 依赖的风险假设 | 可能的问题 | 现有补偿控制 | 生产前必须复核 |
+| 决定 | 依赖的风险假设 | 可能的问题 | 现有补偿控制 | 后续复核事项 |
 |---|---|---|---|---|
 | D1：v4 authority + 30 秒 event-driven observation | SPY/RTH 的正常微结构可能产生数秒 BID_ASK/ALL_LAST 静默，30 秒足以区分需要升级调查的事件驱动 gap | 重复但短于 30 秒的上游停滞、两路同步静默或特定市场状态下的 feed degradation 可能不被单独升级为 hard problem；阈值可能不适用于其他资产/session | BAR_5S 15 秒 time-driven hard threshold、1100、独立 realtime-farm 状态、subscription/Recorder/raw 完整性、全链路 accounting；事件驱动 gap 仍保留为 evidence/advisory | 至少复核多个独立 Full-RTH 日和不同波动/流动性状态的 gap 分布；检查两路同步静默、接近 30 秒的尾部和 BAR/farm 交叉证据；确认 Windows v4 磁盘 bytes 摘要在 exact delivered commit/CI 中自绑定；owner 重新确认适用范围只覆盖经验证的资产/session |
 | D2：writer-lag 保持 OPEN | 本轮 1,234ms 改善可能可持续，但根因未知 | 防病毒、分页、磁盘/flush stall、资源竞争或队列压力下可能再次超过 5 秒；单日低值不能证明安全裕量 | 1 秒 durability cadence 不变、bounded queue、drop/error/count mismatch 显式失败、现有 fsync/writer 指标 | 运行有界、隔离、可清理、不会制造大量废文件的 reproducible storage probe；定位或界定根因并在 exact tree 复测。若仍不能定位，必须形成新的 owner risk amendment，不能沿用 D2 |
 
-该 review 必须在任何 order-capable Paper/Live、生产部署或最终 B2 freeze 前完成。它不允许关闭 Gateway
-Read-Only、不构成订单授权，也不能用普通绿 CI 替代 Windows/存储直接证据。
+D1/D2 review 已记入后续风险清单，**不是 B2 freeze 的前置条件，也不阻塞只读 B2 的 source、tests、docs
+和 evidence 封存**。它必须在任何 order-capable Paper/Live 或生产部署前完成；它不允许关闭 Gateway
+Read-Only、不构成订单授权，也不能用普通绿 CI 替代届时所需的 Windows/存储直接证据。
 
 ## 8. 未改变事项
 
