@@ -1,6 +1,6 @@
 # Gate B2 只读证据 schema v1
 
-状态：**F1 IMPLEMENTED；F2 EVIDENCE COLLECTION NOT STARTED**
+状态：**F1 IMPLEMENTED；F2 MATERIAL VERIFIER IMPLEMENTED；CANDIDATE MANIFEST NOT YET BUILT**
 
 ## 1. 权限边界
 
@@ -81,3 +81,45 @@ capture commit 可由 Git 解析，或 CI run 可由 GitHub 复核。以上属�
 ```
 
 CLI 的 `PASS` 仅表示 `valid B2_READ_ONLY_EVIDENCE structure`，明确不是 Gate B2 PASS 或订单授权。
+
+## 6. F2 实体审计层
+
+`src/ib_execution/b2_evidence_material.py` 与
+`scripts/build_b2_read_only_candidate.py` 实现 F2 的只读实体审计。它与 F1 分层，避免把“JSON
+结构合法”和“所引用的事实确实存在”混成一个结论：
+
+- candidate commit 必须是本地可解析的 Git commit；tree、source/config/lock 摘要直接从 Git blob
+  计算，并与该 commit 内的 `STATE.json` 比较，不读取脏工作树的 source bytes；
+- 每个 material evidence path 的第一段必须是显式 controlled-root alias。root allowlist 使用独立、
+  不提交 Git 的 JSON 文件，值必须是存在的绝对目录，不展开环境变量；解析后的文件必须仍在该 root
+  内；
+- 文件以 1 MiB chunk 流式计算 SHA-256 和 byte size，不整文件载入内存、不复制 raw evidence；
+- material evidence 的 `capture_commit` 必须解析成 Git commit，capture time 不能早于该 commit，
+  也不能晚于验证时刻；完全 unbound 的 `REFERENCE_ONLY` 仅保留索引，不访问文件；
+- `gh api` 直接复核 run id、attempt、workflow、exact candidate SHA、completed/success，并至少复核
+  一个实际完成且含成功 step 的 job；不接受 manifest 自报的 CI 结论；
+- 输出前扫描 manifest 中的 authorization、token/API key 和 IB account-like 文本，并执行默认
+  256 KiB Git evidence budget。绝对 controlled-root 路径不会写入 manifest 或 report。
+
+controlled roots 例子（保存在 Git 外）：
+
+```json
+{
+  "full_rth": "D:/controlled/ibems/full-rth",
+  "ci": "D:/controlled/ibems/ci"
+}
+```
+
+对应 manifest path 必须写成 `full_rth/v4/health-v4.json` 或 `ci/windows/report.json`。构建模式
+只填充 observed candidate tree/hash 与 evidence hash/size；verdict、scope、capture commit、timestamp、
+unknown 和 D1/D2 仍须由受审 recipe 明确给出：
+
+```powershell
+.\.venv312\python.exe scripts\build_b2_read_only_candidate.py recipe.json `
+  --controlled-roots D:\controlled\b2-roots.json `
+  --github-repository pixie26/ibems `
+  --output candidate.json --report candidate-report.json
+```
+
+重放时加 `--verify-only` 且不提供 `--output`。只有实体、CI 与 F1 契约全部通过后才写小型输出；
+该 PASS 仍不是 owner acceptance、F3 freeze、Gate B2 PASS 或订单授权。

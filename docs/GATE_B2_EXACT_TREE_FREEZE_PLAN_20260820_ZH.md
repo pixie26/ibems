@@ -1,6 +1,6 @@
 # Gate B2 只读 exact-tree freeze 实施计划（2026-08-20）
 
-状态：**F1 IMPLEMENTED；F2-F3 NOT YET EXECUTED；FREEZE NOT YET EXECUTED**
+状态：**F1 IMPLEMENTED；F2 VERIFIER IMPLEMENTED / CANDIDATE NOT YET BUILT；F3 NOT EXECUTED**
 
 ## 1. 目的与非目标
 
@@ -114,8 +114,13 @@ D1/D2 不在上述 freeze blockers 中；它们保留为生产/order-capable 前
 ## 6. 当前进度与下一动作
 
 - F0 官方复核与文档收口：已完成；官方矩阵、living status、README 和本 contract 已交付，后续 CI #97 暴露的 Windows post-exit lock-release 测试边界也已在 exact code commit `6424190` 修正，并由 CI #98 / `b1-storage-fsync` #66 验证。
-- F1：schema/validator/CLI 和失败回归已实现；等待 exact delivered commit 的完整 CI 收口。
-- F2-F3：尚未实现。F2 下一步应实现从 Git objects 与受控 evidence roots 构建/复核 candidate
-  manifest；F3 才执行 owner acceptance 与 metadata-only exact-tree freeze。
+- F1：schema/validator/CLI 和失败回归已实现，并由 exact delivered commit `5711727` 的 CI #100 与
+  `b1-storage-fsync` #68 收口；独立 reviewer sign-off 仍待完成。
+- F2：Git-object candidate derivation、controlled-root/path-escape enforcement、external evidence streaming
+  hash/size、capture commit/time、live GitHub run/job identity、manifest sensitivity scan 和大小预算已实现。
+  尚未使用真实受控 roots 生成 candidate manifest，因此不能宣称真实 evidence bytes 已完成绑定。
+- 下一动作：对现有 v3/v4、事故、Windows lifecycle、官方复核和 CI sidecar 建立最小 recipe/root
+  allowlist，运行 F2 builder 并独立 review 输出；F3 才执行 owner acceptance 与 metadata-only
+  exact-tree freeze。
 - 不能凭 F1 validator PASS 或本计划宣称 evidence bytes 已验证、exact-tree freeze 已完成、Gate B2
   PASS 或存在任何订单授权。

@@ -32,6 +32,8 @@
 - [Gate B2 SPY RTH 行情与 Recorder 证据](docs/GATE_B2_RTH_20260810.md)
 - [2026-08-12 Full-RTH 提前终止事故报告](docs/INCIDENT_FULL_RTH_20260812_ZH.md)
 - [IB documented-vs-observed 矩阵](docs/DOCUMENTED_VS_OBSERVED.md)
+- [Gate B2 exact-tree freeze 实施计划](docs/GATE_B2_EXACT_TREE_FREEZE_PLAN_20260820_ZH.md)
+- [Gate B2 只读 evidence schema 与 F2 实体审计](docs/GATE_B2_READ_ONLY_EVIDENCE_SCHEMA_V1_ZH.md)
 - [实施状态](docs/IMPLEMENTATION_STATUS.md)
 - [22 条不变量覆盖矩阵](docs/INVARIANT_COVERAGE.md)
 - [审查与执行结论](docs/REVIEW_AND_EXECUTION_20260806_ZH.md)
