@@ -1,6 +1,6 @@
 # Gate B2 只读 exact-tree freeze 实施计划（2026-08-20）
 
-状态：**PLAN READY；FREEZE NOT YET EXECUTED**
+状态：**F1 IMPLEMENTED；F2-F3 NOT YET EXECUTED；FREEZE NOT YET EXECUTED**
 
 ## 1. 目的与非目标
 
@@ -67,6 +67,13 @@ schema 校验必须拒绝 unknown keys、重复 evidence id、零/非法大小�
 
 退出条件：schema、builder/validator 和回归测试经过独立 review；失败样例能证明旧的宽松行为会被拒绝。
 
+**2026-08-20 实施记录：** 已新增独立的 `ib_execution.b2_evidence` schema/validator、只读 CLI 与
+回归测试，并在 [schema v1 合同](GATE_B2_READ_ONLY_EVIDENCE_SCHEMA_V1_ZH.md) 中记录字段和权限边界。
+validator 已覆盖 unknown/duplicate key、重复 evidence ID、非法 hash/size/timestamp、路径逃逸、
+PASS/FAIL claim 冲突、REFERENCE_ONLY authority 提升、历史 FAIL 缺失、非 exact/success CI、D1/D2
+遗漏或错误阻断语义，以及 owner acceptance 越权。F1 代码仍需 exact delivered commit 的完整 CI 才算
+交付闭环；它不收集 evidence，也不使 F2/F3 或 freeze 自动完成。
+
 ### F2：生成 candidate evidence manifest
 
 1. 从 Git 对象读取 candidate tree 内的 source/tests/docs，不从脏工作树猜测历史事实。
@@ -107,5 +114,8 @@ D1/D2 不在上述 freeze blockers 中；它们保留为生产/order-capable 前
 ## 6. 当前进度与下一动作
 
 - F0 官方复核与文档收口：已完成；官方矩阵、living status、README 和本 contract 已交付，后续 CI #97 暴露的 Windows post-exit lock-release 测试边界也已在 exact code commit `6424190` 修正，并由 CI #98 / `b1-storage-fsync` #66 验证。
-- F1-F3：尚未实现。仓库当前只有 B1 attestation/finalize 工具，没有 B2 read-only evidence schema 或 machine validator。
-- 本次提交完成 F0 后，下一项应是对 F1 schema 做代码级设计审查；审查通过后才实现 builder/validator。不能仅凭一份 Markdown plan 宣称 exact-tree freeze 已完成。
+- F1：schema/validator/CLI 和失败回归已实现；等待 exact delivered commit 的完整 CI 收口。
+- F2-F3：尚未实现。F2 下一步应实现从 Git objects 与受控 evidence roots 构建/复核 candidate
+  manifest；F3 才执行 owner acceptance 与 metadata-only exact-tree freeze。
+- 不能凭 F1 validator PASS 或本计划宣称 evidence bytes 已验证、exact-tree freeze 已完成、Gate B2
+  PASS 或存在任何订单授权。
