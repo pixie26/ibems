@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping, Sequence
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 FREEZE_KIND = "B2_READ_ONLY_EVIDENCE"
 
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
@@ -32,6 +32,7 @@ TOP_LEVEL_KEYS = {
     "candidate",
     "safety_boundary",
     "ci_runs",
+    "ci_artifacts",
     "evidence",
     "authority_evidence_ids",
     "required_failures",
@@ -58,6 +59,16 @@ CI_KEYS = {
     "run_attempt",
     "commit_sha",
     "conclusion",
+}
+CI_ARTIFACT_KEYS = {
+    "run_id",
+    "job_name",
+    "artifact_id",
+    "artifact_name",
+    "archive_sha256",
+    "checkout_identity_member_path",
+    "evidence_id",
+    "evidence_member_path",
 }
 EVIDENCE_KEYS = {
     "id",
@@ -315,6 +326,68 @@ def _validate_ci_runs(value: Any, candidate_commit: str) -> None:
         identities.add(identity)
 
 
+def _validate_ci_artifacts(
+    value: Any,
+    *,
+    ci_runs: Sequence[Mapping[str, Any]],
+    evidence_by_id: Mapping[str, Mapping[str, Any]],
+) -> None:
+    artifacts = _sequence(value, "ci_artifacts")
+    run_ids = {run["run_id"] for run in ci_runs}
+    if not artifacts:
+        _fail("ci_artifacts", "must bind exact-checkout identity for every CI job")
+    artifact_ids: set[int] = set()
+    run_jobs: set[tuple[int, str]] = set()
+    evidence_bindings: set[str] = set()
+    for index, raw in enumerate(artifacts):
+        location = f"ci_artifacts[{index}]"
+        artifact = _mapping(raw, location)
+        _exact_keys(artifact, CI_ARTIFACT_KEYS, location)
+        run_id = _positive_int(artifact["run_id"], f"{location}.run_id")
+        if run_id not in run_ids:
+            _fail(f"{location}.run_id", "must reference ci_runs")
+        job_name = _text(artifact["job_name"], f"{location}.job_name", max_length=256)
+        run_job = (run_id, job_name)
+        if run_job in run_jobs:
+            _fail(location, "duplicate CI run/job artifact binding")
+        run_jobs.add(run_job)
+        artifact_id = _positive_int(artifact["artifact_id"], f"{location}.artifact_id")
+        if artifact_id in artifact_ids:
+            _fail(f"{location}.artifact_id", "duplicate artifact id")
+        artifact_ids.add(artifact_id)
+        _text(artifact["artifact_name"], f"{location}.artifact_name", max_length=256)
+        _hex(artifact["archive_sha256"], HEX64, f"{location}.archive_sha256")
+        _relative_path(
+            artifact["checkout_identity_member_path"],
+            f"{location}.checkout_identity_member_path",
+        )
+        evidence_id = artifact["evidence_id"]
+        evidence_member = artifact["evidence_member_path"]
+        if evidence_id is None or evidence_member is None:
+            if evidence_id is not None or evidence_member is not None:
+                _fail(location, "evidence_id and evidence_member_path must both be null or set")
+            continue
+        evidence_id = _identifier(evidence_id, f"{location}.evidence_id")
+        if evidence_id in evidence_bindings:
+            _fail(f"{location}.evidence_id", "duplicate CI evidence binding")
+        evidence_bindings.add(evidence_id)
+        evidence = evidence_by_id.get(evidence_id)
+        if evidence is None or evidence.get("evidence_kind") != "CI_ARTIFACT":
+            _fail(f"{location}.evidence_id", "must reference CI_ARTIFACT evidence")
+        if evidence.get("binding") != "BOUND_AUTHORITY":
+            _fail(f"{location}.evidence_id", "must reference BOUND_AUTHORITY evidence")
+        _relative_path(evidence_member, f"{location}.evidence_member_path")
+
+    required = {
+        evidence_id
+        for evidence_id, evidence in evidence_by_id.items()
+        if evidence.get("evidence_kind") == "CI_ARTIFACT"
+        and evidence.get("binding") == "BOUND_AUTHORITY"
+    }
+    if evidence_bindings != required:
+        _fail("ci_artifacts", "must bind every BOUND_AUTHORITY CI_ARTIFACT evidence exactly once")
+
+
 def _validate_evidence(value: Any) -> dict[str, Mapping[str, Any]]:
     items = _sequence(value, "evidence")
     if not items:
@@ -509,6 +582,11 @@ def validate_manifest(
     _validate_safety_boundary(manifest["safety_boundary"])
     _validate_ci_runs(manifest["ci_runs"], candidate["commit_sha"])
     evidence_by_id = _validate_evidence(manifest["evidence"])
+    _validate_ci_artifacts(
+        manifest["ci_artifacts"],
+        ci_runs=manifest["ci_runs"],
+        evidence_by_id=evidence_by_id,
+    )
     authority_ids, _ = _validate_authority_and_failures(manifest, evidence_by_id)
     unknown_ids, freeze_blockers = _validate_unknowns(manifest["unknowns"])
     risk_ids = _validate_risk_assumptions(manifest["risk_assumptions"])

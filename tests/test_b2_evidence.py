@@ -43,7 +43,7 @@ def _manifest(*, owner: bool = False) -> dict[str, object]:
     unknown_ids = ["EXECUTION_WINDOW_AMBIGUITY"]
     risk_ids = ["D1_EVENT_DRIVEN_30S", "D2_WRITER_LAG_ROOT_CAUSE"]
     payload: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "freeze_kind": "B2_READ_ONLY_EVIDENCE",
         "candidate": {
             "commit_sha": COMMIT,
@@ -65,6 +65,18 @@ def _manifest(*, owner: bool = False) -> dict[str, object]:
                 "run_attempt": 1,
                 "commit_sha": COMMIT,
                 "conclusion": "SUCCESS",
+            }
+        ],
+        "ci_artifacts": [
+            {
+                "run_id": 99,
+                "job_name": "verify",
+                "artifact_id": 456,
+                "artifact_name": f"junit-{COMMIT}",
+                "archive_sha256": "8" * 64,
+                "checkout_identity_member_path": "checkout-identity.json",
+                "evidence_id": None,
+                "evidence_member_path": None,
             }
         ],
         "evidence": [
@@ -140,10 +152,10 @@ def test_candidate_cannot_be_treated_as_final_owner_acceptance() -> None:
         b2_evidence.validate_manifest(_manifest(), require_owner_acceptance=True)
 
 
-def test_boolean_cannot_impersonate_schema_version_one() -> None:
+def test_boolean_cannot_impersonate_schema_version_two() -> None:
     payload = _manifest()
     payload["schema_version"] = True
-    with pytest.raises(b2_evidence.B2EvidenceValidationError, match="must be 1"):
+    with pytest.raises(b2_evidence.B2EvidenceValidationError, match="must be 2"):
         b2_evidence.validate_manifest(payload)
 
 
@@ -263,6 +275,19 @@ def test_ci_must_be_success_on_the_exact_candidate() -> None:
     with pytest.raises(b2_evidence.B2EvidenceValidationError, match="must be SUCCESS"):
         b2_evidence.validate_manifest(payload)
 
+
+def test_ci_artifact_must_reference_a_declared_run() -> None:
+    payload = _manifest()
+    payload["ci_artifacts"][0]["run_id"] = 1000  # type: ignore[index]
+    with pytest.raises(b2_evidence.B2EvidenceValidationError, match="must reference ci_runs"):
+        b2_evidence.validate_manifest(payload)
+
+
+def test_bound_ci_evidence_requires_exactly_one_artifact_member() -> None:
+    payload = _manifest()
+    payload["evidence"][0]["evidence_kind"] = "CI_ARTIFACT"  # type: ignore[index]
+    with pytest.raises(b2_evidence.B2EvidenceValidationError, match="must bind every"):
+        b2_evidence.validate_manifest(payload)
 
 @pytest.mark.parametrize(
     ("field", "bad_value"),

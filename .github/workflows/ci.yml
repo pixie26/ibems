@@ -16,6 +16,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          # A PR run otherwise checks out GitHub's synthetic merge ref. B2
+          # candidate evidence must exercise the exact candidate commit.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           # Gate B1 PASS validation must prove that signed_off_commit is an
           # ancestor of the metadata-only attestation commit and inspect their
           # diff. A depth-1 checkout cannot prove that relation.
@@ -42,6 +45,9 @@ jobs:
       - name: Prepare CI artifact directory
         run: mkdir -p artifacts/ci
 
+      - name: Record exact checkout identity
+        run: uv run python scripts/write_ci_checkout_identity.py --output artifacts/ci/checkout-identity.json
+
       - name: Deterministic suite
         run: uv run pytest -m "not property" --junitxml=artifacts/ci/deterministic.xml
 
@@ -54,8 +60,10 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: junit
-          path: "artifacts/ci/*.xml"
+          name: junit-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            artifacts/ci/*.xml
+            artifacts/ci/checkout-identity.json
 
   windows-verify:
     runs-on: windows-2025
@@ -63,6 +71,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
 
       - name: Install uv
@@ -76,6 +85,9 @@ jobs:
       - name: Prepare Windows CI artifact directory
         shell: powershell
         run: New-Item -ItemType Directory -Force artifacts/ci | Out-Null
+
+      - name: Record exact checkout identity
+        run: uv run python scripts/write_ci_checkout_identity.py --output artifacts/ci/checkout-identity.json
 
       # Keep native commands in separate Actions steps. Windows PowerShell does
       # not reliably stop a multiline block merely because an external process
@@ -98,7 +110,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: windows-platform-${{ github.sha }}
+          name: windows-platform-${{ github.event.pull_request.head.sha || github.sha }}
           path: |
             artifacts/ci/windows-full.xml
             artifacts/windows_ntfs_safe/**

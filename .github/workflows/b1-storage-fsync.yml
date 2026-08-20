@@ -93,6 +93,10 @@ jobs:
             --healthy-delay-ms 200 \
             --fsync-delay 45
 
+      - name: Record exact checkout identity
+        if: always()
+        run: uv run python scripts/write_ci_checkout_identity.py --output artifacts/gate_b1_storage/checkout-identity.json
+
       - name: Show B1.4 manifest
         if: always()
         shell: bash
@@ -104,8 +108,10 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: b1-fsync-stall-evidence
-          path: artifacts/gate_b1_storage/**/manifest.json
+          name: b1-fsync-stall-evidence-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            artifacts/gate_b1_storage/**/manifest.json
+            artifacts/gate_b1_storage/checkout-identity.json
           if-no-files-found: warn
 
       - name: Safe cleanup

@@ -1,5 +1,9 @@
 # Gate B2 只读证据 schema v1
 
+> **已被 v2 取代。** v1 保留为历史合同；F3 candidate 必须使用
+> [schema v2](GATE_B2_READ_ONLY_EVIDENCE_SCHEMA_V2_ZH.md)，以绑定 exact checkout 和
+> GitHub artifact provenance。
+
 状态：**F1 IMPLEMENTED；F2 MATERIAL VERIFIER IMPLEMENTED；CANDIDATE MANIFEST NOT YET BUILT**
 
 ## 1. 权限边界

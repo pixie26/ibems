@@ -9,10 +9,13 @@ copies evidence files into the repository.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import re
+import stat
 import subprocess
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -22,6 +25,8 @@ from . import b2_evidence
 
 CHUNK_BYTES = 1024 * 1024
 DEFAULT_MANIFEST_BUDGET_BYTES = 256 * 1024
+MAX_CI_ARTIFACT_ARCHIVE_BYTES = 64 * 1024 * 1024
+MAX_CI_ARTIFACT_EXPANDED_BYTES = 128 * 1024 * 1024
 ROOT_ALIAS = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 SENSITIVE_TEXT = (
@@ -44,6 +49,9 @@ class MaterialReport:
     evidence_bytes_streamed: int
     ci_runs_verified: int
     ci_jobs_verified: int
+    ci_artifacts_verified: int
+    ci_artifact_members_verified: int
+    ci_artifact_bytes_downloaded: int
     manifest_bytes: int
 
     def as_dict(self) -> dict[str, Any]:
@@ -57,6 +65,9 @@ class MaterialReport:
             "evidence_bytes_streamed": self.evidence_bytes_streamed,
             "ci_runs_verified": self.ci_runs_verified,
             "ci_jobs_verified": self.ci_jobs_verified,
+            "ci_artifacts_verified": self.ci_artifacts_verified,
+            "ci_artifact_members_verified": self.ci_artifact_members_verified,
+            "ci_artifact_bytes_downloaded": self.ci_artifact_bytes_downloaded,
             "manifest_bytes": self.manifest_bytes,
             "gate_b2": "READ_ONLY_IN_PROGRESS",
             "order_authorization": "NONE",
@@ -70,6 +81,7 @@ class MaterialReport:
 
 GitRunner = Callable[[Sequence[str]], bytes]
 GithubLookup = Callable[[str, int, int], Mapping[str, Any]]
+GithubArtifactLookup = Callable[[str, int], Mapping[str, Any]]
 
 
 def _run_git(repo_root: Path, arguments: Sequence[str]) -> bytes:
@@ -353,10 +365,40 @@ def github_lookup_with_gh(repository: str, run_id: int, attempt: int) -> Mapping
     }
 
 
+def github_artifact_lookup_with_gh(repository: str, artifact_id: int) -> Mapping[str, Any]:
+    """Read immutable artifact metadata and archive bytes without persisting the archive."""
+    if not REPOSITORY.fullmatch(repository) or any(
+        part in {".", ".."} for part in repository.split("/")
+    ):
+        raise B2MaterialVerificationError("GitHub repository must be owner/name")
+    base = f"repos/{repository}/actions/artifacts/{artifact_id}"
+    try:
+        metadata_result = subprocess.run(
+            ["gh", "api", base], capture_output=True, timeout=30
+        )
+        archive_result = subprocess.run(
+            ["gh", "api", base + "/zip"], capture_output=True, timeout=60
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise B2MaterialVerificationError(f"cannot query GitHub artifact: {exc}") from exc
+    if metadata_result.returncode != 0 or archive_result.returncode != 0:
+        raise B2MaterialVerificationError("GitHub artifact query failed")
+    if len(archive_result.stdout) > MAX_CI_ARTIFACT_ARCHIVE_BYTES:
+        raise B2MaterialVerificationError("GitHub artifact archive exceeds verification budget")
+    try:
+        metadata = json.loads(metadata_result.stdout)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise B2MaterialVerificationError("GitHub artifact metadata is invalid JSON") from exc
+    if not isinstance(metadata, dict):
+        raise B2MaterialVerificationError("GitHub artifact metadata is not an object")
+    return {"metadata": metadata, "archive": archive_result.stdout}
+
+
 def _verify_ci_runs(
     runs: Sequence[Mapping[str, Any]], repository: str, lookup: GithubLookup
-) -> tuple[int, int]:
+) -> tuple[int, int, dict[int, set[str]]]:
     job_count = 0
+    jobs_by_run: dict[int, set[str]] = {}
     for run in runs:
         observation = lookup(repository, run["run_id"], run["run_attempt"])
         observed = observation.get("run")
@@ -410,6 +452,12 @@ def _verify_ci_runs(
                     )
             if not isinstance(job.get("name"), str) or not job["name"].strip():
                 raise B2MaterialVerificationError(f"GitHub job {job_id} has no name")
+            run_jobs = jobs_by_run.setdefault(run["run_id"], set())
+            if job["name"] in run_jobs:
+                raise B2MaterialVerificationError(
+                    f"GitHub run {run['run_id']} has duplicate job name {job['name']}"
+                )
+            run_jobs.add(job["name"])
             steps = job.get("steps")
             if not isinstance(steps, list) or not any(
                 isinstance(step, Mapping) and step.get("conclusion") == "success" for step in steps
@@ -418,7 +466,161 @@ def _verify_ci_runs(
                     f"GitHub job {job_id} has no successful executed step"
                 )
             job_count += 1
-    return len(runs), job_count
+    return len(runs), job_count, jobs_by_run
+
+
+def _zip_members(raw: bytes) -> dict[str, bytes]:
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            infos = archive.infolist()
+            if sum(info.file_size for info in infos) > MAX_CI_ARTIFACT_EXPANDED_BYTES:
+                raise B2MaterialVerificationError("GitHub artifact expanded size exceeds budget")
+            members: dict[str, bytes] = {}
+            for info in infos:
+                path = PurePosixPath(info.filename)
+                if info.is_dir():
+                    continue
+                if stat.S_ISLNK(info.external_attr >> 16):
+                    raise B2MaterialVerificationError("GitHub artifact contains a symbolic link")
+                if path.is_absolute() or ".." in path.parts or not path.parts:
+                    raise B2MaterialVerificationError(
+                        "GitHub artifact contains an unsafe member path"
+                    )
+                name = path.as_posix()
+                if name in members:
+                    raise B2MaterialVerificationError("GitHub artifact contains duplicate members")
+                members[name] = archive.read(info)
+            return members
+    except (zipfile.BadZipFile, OSError, RuntimeError) as exc:
+        raise B2MaterialVerificationError(f"GitHub artifact archive is invalid: {exc}") from exc
+
+
+def _verify_ci_artifacts(
+    artifacts: Sequence[Mapping[str, Any]],
+    *,
+    runs: Sequence[Mapping[str, Any]],
+    jobs_by_run: Mapping[int, set[str]],
+    evidence_by_id: Mapping[str, Mapping[str, Any]],
+    candidate: Mapping[str, Any],
+    repository: str,
+    lookup: GithubArtifactLookup,
+) -> tuple[int, int, int]:
+    runs_by_id = {run["run_id"]: run for run in runs}
+    bound_jobs: dict[int, set[str]] = {}
+    members_verified = 0
+    bytes_downloaded = 0
+    for binding in artifacts:
+        run_id = binding["run_id"]
+        artifact_id = binding["artifact_id"]
+        observation = lookup(repository, artifact_id)
+        metadata = observation.get("metadata")
+        archive = observation.get("archive")
+        if not isinstance(metadata, Mapping) or not isinstance(archive, bytes):
+            raise B2MaterialVerificationError(
+                f"GitHub artifact {artifact_id} observation is incomplete"
+            )
+        if len(archive) > MAX_CI_ARTIFACT_ARCHIVE_BYTES:
+            raise B2MaterialVerificationError(
+                f"GitHub artifact {artifact_id} exceeds verification budget"
+            )
+        expected_digest = binding["archive_sha256"]
+        observed_digest = hashlib.sha256(archive).hexdigest()
+        workflow_run = metadata.get("workflow_run")
+        expected_metadata = {
+            "id": artifact_id,
+            "name": binding["artifact_name"],
+            "expired": False,
+            "digest": f"sha256:{expected_digest}",
+            "size_in_bytes": len(archive),
+        }
+        for key, value in expected_metadata.items():
+            if metadata.get(key) != value:
+                raise B2MaterialVerificationError(
+                    f"GitHub artifact {artifact_id} observed {key} does not match manifest/archive"
+                )
+        if observed_digest != expected_digest:
+            raise B2MaterialVerificationError(
+                f"GitHub artifact {artifact_id} archive digest does not match manifest"
+            )
+        if not isinstance(workflow_run, Mapping) or workflow_run.get("id") != run_id:
+            raise B2MaterialVerificationError(
+                f"GitHub artifact {artifact_id} does not belong to declared run"
+            )
+        run = runs_by_id[run_id]
+        if workflow_run.get("head_sha") != run["commit_sha"]:
+            raise B2MaterialVerificationError(
+                f"GitHub artifact {artifact_id} head SHA does not match candidate"
+            )
+        if candidate["commit_sha"] not in binding["artifact_name"]:
+            raise B2MaterialVerificationError(
+                f"GitHub artifact {artifact_id} name does not bind the candidate commit"
+            )
+        members = _zip_members(archive)
+        identity_name = binding["checkout_identity_member_path"]
+        identity_raw = members.get(identity_name)
+        if identity_raw is None:
+            raise B2MaterialVerificationError(
+                f"GitHub artifact {artifact_id} is missing checkout identity"
+            )
+        try:
+            identity = json.loads(identity_raw)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise B2MaterialVerificationError(
+                f"GitHub artifact {artifact_id} checkout identity is invalid"
+            ) from exc
+        expected_identity = {
+            "schema_version": 1,
+            "commit_sha": candidate["commit_sha"],
+            "tree_sha": candidate["tree_sha"],
+            "repository": repository,
+            "run_id": str(run_id),
+            "run_attempt": str(run["run_attempt"]),
+            "workflow": run["workflow"],
+            "job_name": binding["job_name"],
+        }
+        if not isinstance(identity, dict) or set(identity) != set(expected_identity) | {"event"}:
+            raise B2MaterialVerificationError(
+                f"GitHub artifact {artifact_id} checkout identity has invalid keys"
+            )
+        for key, value in expected_identity.items():
+            if identity.get(key) != value:
+                raise B2MaterialVerificationError(
+                    f"GitHub artifact {artifact_id} checkout identity {key} does not match"
+                )
+        if identity.get("event") not in {"pull_request", "push", "workflow_dispatch"}:
+            raise B2MaterialVerificationError(
+                f"GitHub artifact {artifact_id} checkout identity event is invalid"
+            )
+        job_name = binding["job_name"]
+        if job_name not in jobs_by_run.get(run_id, set()):
+            raise B2MaterialVerificationError(
+                f"GitHub artifact {artifact_id} does not bind an observed successful job"
+            )
+        bound_jobs.setdefault(run_id, set()).add(job_name)
+        members_verified += 1
+        evidence_id = binding["evidence_id"]
+        if evidence_id is not None:
+            member_name = binding["evidence_member_path"]
+            member = members.get(member_name)
+            if member is None:
+                raise B2MaterialVerificationError(
+                    f"GitHub artifact {artifact_id} is missing evidence member {member_name}"
+                )
+            evidence = evidence_by_id[evidence_id]
+            if (
+                hashlib.sha256(member).hexdigest() != evidence["sha256"]
+                or len(member) != evidence["bytes"]
+            ):
+                raise B2MaterialVerificationError(
+                    f"GitHub artifact {artifact_id} member does not match evidence {evidence_id}"
+                )
+            members_verified += 1
+        bytes_downloaded += len(archive)
+    if {run_id: set(names) for run_id, names in jobs_by_run.items()} != bound_jobs:
+        raise B2MaterialVerificationError(
+            "CI artifact bindings must cover every observed successful job exactly once"
+        )
+    return len(artifacts), members_verified, bytes_downloaded
 
 
 def _scan_manifest(payload: Mapping[str, Any]) -> bytes:
@@ -437,6 +639,7 @@ def verify_materials(
     controlled_roots: Mapping[str, Path],
     github_repository: str,
     github_lookup: GithubLookup = github_lookup_with_gh,
+    github_artifact_lookup: GithubArtifactLookup = github_artifact_lookup_with_gh,
     populate_observed: bool = False,
     manifest_budget_bytes: int = DEFAULT_MANIFEST_BUDGET_BYTES,
     now: datetime | None = None,
@@ -479,8 +682,16 @@ def verify_materials(
             item.get(key) is None for key in ("sha256", "bytes", "capture_commit")
         ):
             continue
-        path = resolve_evidence_path(str(item.get("relative_path", "")), controlled_roots)
-        digest, size = stream_file_identity(path)
+        relative_path = str(item.get("relative_path", ""))
+        if relative_path.startswith("repo/"):
+            repo_path = PurePosixPath(relative_path).relative_to("repo").as_posix()
+            capture_commit = str(item.get("capture_commit", ""))
+            run_git: GitRunner = lambda arguments: _run_git(repo_root, arguments)
+            blob = _git_blob(run_git, capture_commit, repo_path)
+            digest, size = hashlib.sha256(blob).hexdigest(), len(blob)
+        else:
+            path = resolve_evidence_path(relative_path, controlled_roots)
+            digest, size = stream_file_identity(path)
         if populate_observed:
             item["sha256"] = digest
             item["bytes"] = size
@@ -501,7 +712,19 @@ def verify_materials(
 
     b2_evidence.validate_manifest(payload)
     ci_runs = payload["ci_runs"]
-    ci_count, ci_job_count = _verify_ci_runs(ci_runs, github_repository, github_lookup)
+    ci_count, ci_job_count, jobs_by_run = _verify_ci_runs(
+        ci_runs, github_repository, github_lookup
+    )
+    ci_artifacts = payload["ci_artifacts"]
+    artifact_count, artifact_members, artifact_bytes = _verify_ci_artifacts(
+        ci_artifacts,
+        runs=ci_runs,
+        jobs_by_run=jobs_by_run,
+        evidence_by_id={item["id"]: item for item in evidence},
+        candidate=candidate,
+        repository=github_repository,
+        lookup=github_artifact_lookup,
+    )
     raw = _scan_manifest(payload)
     if len(raw) > manifest_budget_bytes:
         raise B2MaterialVerificationError(
@@ -515,5 +738,8 @@ def verify_materials(
         evidence_bytes_streamed=streamed_bytes,
         ci_runs_verified=ci_count,
         ci_jobs_verified=ci_job_count,
+        ci_artifacts_verified=artifact_count,
+        ci_artifact_members_verified=artifact_members,
+        ci_artifact_bytes_downloaded=artifact_bytes,
         manifest_bytes=len(raw),
     )

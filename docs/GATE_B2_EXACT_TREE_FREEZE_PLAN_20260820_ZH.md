@@ -1,6 +1,6 @@
 # Gate B2 只读 exact-tree freeze 实施计划（2026-08-20）
 
-状态：**F1 IMPLEMENTED；F2 VERIFIER IMPLEMENTED / CANDIDATE NOT YET BUILT；F3 NOT EXECUTED**
+状态：**F1 v2 IMPLEMENTED；candidate-v2 REJECTED；candidate-v3 PENDING；F3 NOT EXECUTED**
 
 ## 1. 目的与非目标
 
@@ -74,6 +74,11 @@ PASS/FAIL claim 冲突、REFERENCE_ONLY authority 提升、历史 FAIL 缺失、
 遗漏或错误阻断语义，以及 owner acceptance 越权。F1 代码仍需 exact delivered commit 的完整 CI 才算
 交付闭环；它不收集 evidence，也不使 F2/F3 或 freeze 自动完成。
 
+**2026-08-21 v2 amendment：** candidate-v2 独立审查发现普通 PR CI 的 synthetic-merge checkout、
+repo evidence 工作树 bytes 与 capture commit 未强绑定，以及本地 CI sidecar 与 GitHub artifact 来源未
+机器关联。schema v2 因此强制 exact checkout identity、Git-object repo evidence 和 artifact
+ID/name/archive digest/member binding。candidate-v2 永久标记 REJECTED，不得进入 F3。
+
 ### F2：生成 candidate evidence manifest
 
 1. 从 Git 对象读取 candidate tree 内的 source/tests/docs，不从脏工作树猜测历史事实。
@@ -114,13 +119,14 @@ D1/D2 不在上述 freeze blockers 中；它们保留为生产/order-capable 前
 ## 6. 当前进度与下一动作
 
 - F0 官方复核与文档收口：已完成；官方矩阵、living status、README 和本 contract 已交付，后续 CI #97 暴露的 Windows post-exit lock-release 测试边界也已在 exact code commit `6424190` 修正，并由 CI #98 / `b1-storage-fsync` #66 验证。
-- F1：schema/validator/CLI 和失败回归已实现，并由 exact delivered commit `5711727` 的 CI #100 与
-  `b1-storage-fsync` #68 收口；独立 reviewer sign-off 仍待完成。
-- F2：Git-object candidate derivation、controlled-root/path-escape enforcement、external evidence streaming
-  hash/size、capture commit/time、live GitHub run/job identity、manifest sensitivity scan 和大小预算已实现。
-  尚未使用真实受控 roots 生成 candidate manifest，因此不能宣称真实 evidence bytes 已完成绑定。
-- 下一动作：对现有 v3/v4、事故、Windows lifecycle、官方复核和 CI sidecar 建立最小 recipe/root
-  allowlist，运行 F2 builder 并独立 review 输出；F3 才执行 owner acceptance 与 metadata-only
+- F1：v1 schema/validator/CLI 由 exact commit `5711727` 的 CI #100 与 `b1-storage-fsync` #68 收口；
+  candidate-v2 独立审查随后拒绝其 provenance。v2 hardening 已实现，仍需新的 exact delivered commit、
+  CI artifact 与独立 reviewer sign-off。
+- F2：candidate-v2 的 9 个小型 evidence bytes 曾通过 material replay，但因 exact-CI、repo Git-blob 与
+  artifact provenance 三项缺口被拒绝，不得作为 freeze input。v2 verifier 已加入 exact checkout
+  identity、Git-object repo evidence 和 artifact archive/member binding。
+- 下一动作：完成 v2 exact CI，绑定每个 job 的 artifact identity 与 CI sidecar member，生成
+  candidate-v3 并独立 review；只有 reviewer 接受后，F3 才执行 owner acceptance 与 metadata-only
   exact-tree freeze。
 - 不能凭 F1 validator PASS 或本计划宣称 evidence bytes 已验证、exact-tree freeze 已完成、Gate B2
   PASS 或存在任何订单授权。
