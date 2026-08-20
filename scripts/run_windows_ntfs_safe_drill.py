@@ -18,6 +18,7 @@ import time
 from ctypes import wintypes
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 from ib_execution.durable_io import durable_atomic_write
 from ib_execution.processlock import ProcessLock, ProcessLockUnavailable
@@ -89,6 +90,42 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _read_text_with_bounded_permission_retry(
+    path: Path,
+    *,
+    timeout: float = 2.0,
+    retry_seconds: float = 0.01,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> tuple[str, dict[str, int]]:
+    """Reopen a killed publisher's target across a bounded sharing collision.
+
+    Windows can report a transient sharing/access denial after the publisher
+    process has exited while NTFS or a filter driver releases the final path.
+    Retry only that platform boundary. Corrupt content, missing files, and a
+    denial lasting through the deadline remain hard drill failures.
+    """
+
+    started = monotonic()
+    deadline = started + timeout
+    permission_denied_retries = 0
+    while True:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except PermissionError:
+            permission_denied_retries += 1
+            now = monotonic()
+            if now >= deadline:
+                raise
+            sleep(min(retry_seconds, deadline - now))
+            continue
+        elapsed_ms = max(0, round((monotonic() - started) * 1000))
+        return text, {
+            "permission_denied_retries": permission_denied_retries,
+            "release_wait_ms": elapsed_ms,
+        }
+
+
 def _run(root: Path) -> int:
     if os.name != "nt":
         raise RuntimeError("this drill must run on Windows")
@@ -142,7 +179,10 @@ def _run(root: Path) -> int:
         if publisher.poll() is None:
             publisher.kill()
             publisher.wait(timeout=5)
-    loaded = json.loads(publish_target.read_text(encoding="utf-8"))
+    published_text, publication_release = _read_text_with_bounded_permission_retry(
+        publish_target
+    )
+    loaded = json.loads(published_text)
     assert isinstance(loaded["seq"], int) and len(loaded["payload"]) == 8192
     results["publication_force_kill_leaves_complete_generation"] = "PASS"
 
@@ -157,6 +197,7 @@ def _run(root: Path) -> int:
             target.name: _sha256(target),
             publish_target.name: _sha256(publish_target),
         },
+        "observations": {"publication_path_release": publication_release},
         "passed": all(value == "PASS" for value in results.values()),
         "explicitly_not_covered": ["ntfs_disk_full", "ntfs_flush_stall"],
     }
