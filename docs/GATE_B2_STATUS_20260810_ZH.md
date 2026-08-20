@@ -16,7 +16,8 @@
 - 2026-08-12 Full-RTH 尝试约 66 分钟后出现三路静默；事故代码在 `evidence_of_life=True` 时错误 full reconnect，随后收到 `10197`，health FAIL、覆盖约 17%。事故后独立 120 秒 probe 又取得三路 LIVE，说明不是持久 entitlement/route 失败。
 - **2026-08-13 P0 recovery 修复已通过 PR #11 合并；P0.5 CI 基线已通过 PR #12 合并。** CI 基线修复后 Windows 完整测试真实执行并通过 `455 passed, 1 skipped`，provenance 与 NTFS safe drill 也通过。
 - **2026-08-13 Full-RTH 复测因 operator 手动关闭 Codex 而中断。** Owner 已明确确认该动作；Recorder 在三路仍为 LIVE、liveness 正常时于 23:35 HKT 被强制终止，Windows event 217 同时证明其父 Codex Desktop AppX container 被销毁。直接原因不是 P0 recovery 复发或 Recorder 产品故障，而是本轮长时进程依赖了交互式 Codex/AppX 生命周期。独立 Task Scheduler launcher 已实现并完成无 IB 本机探针；下一次必须用新 root/client id 从该 launcher 启动完整 RTH。详见 [`INCIDENT_FULL_RTH_20260813_APPX_TERMINATION_ZH.md`](INCIDENT_FULL_RTH_20260813_APPX_TERMINATION_ZH.md)。
-- **2026-08-18 已由独立 Task Scheduler host 完成一次全日 capture→finalize。** v3 保留历史 FAIL；v4 为 `health_ok=true`。Owner 于 2026-08-20 接受 SPY/RTH 的 30 秒 event-driven observation threshold，并批准 v4 作为 Full-RTH 最终 health authority；但 Windows v4 sidecar 的预写入摘要与磁盘 CRLF bytes 不同，且 writer-lag 根因仍 OPEN，因此该轮当前只能称为“v4 health PASS，正式证据收口未完成”，不能升级 Gate B2。
+- **2026-08-18 已由独立 Task Scheduler host 完成一次全日 capture→finalize。** v3 保留历史 FAIL；v4 为 `health_ok=true`。Owner 于 2026-08-20 接受 SPY/RTH 的 30 秒 event-driven observation threshold，并批准 v4 作为 Full-RTH 最终 health authority。Windows v4 sidecar 的历史 CRLF/预写入摘要差异已逐字节界定，未来写入修复已交付；受 ACL 限制的 v3/Parquet 仍按 `partially verified` 登记，writer-lag 根因保持 OPEN。因此该轮称为“v4 health PASS”，但不单独升级 Gate B2。
+- **2026-08-20 已完成 IBKR 官方页面逐项复核。** 所有旧待复核项已转换为明确的 documented、official ambiguity、not-guaranteed 或 out-of-scope 结论。新增硬边界包括 executions 回看窗口的官方冲突、各请求 end callback 不构成原子 snapshot、all-open-orders 可见性依赖 client/session 配置，以及 completed-orders 的 Read-Only 行为只能按真实观测登记。
 
 详细事故事实、owner“没有主动登录真实账户”的明确陈述、API log 边界、P0 修复与复测条件见
 [`INCIDENT_FULL_RTH_20260812_ZH.md`](INCIDENT_FULL_RTH_20260812_ZH.md)；2026-08-13 的 AppX 连带终止见
@@ -205,7 +206,7 @@ source、tests、docs 与后续真实 Gateway 证据仍需在最终 freeze 中�
 ```
 
 7. Full-RTH 只有在全日覆盖、**v4 `health_ok=true`**、三路 cadence/incident 正常、handler→readback accounting 平衡、`dropped_count=0`、`writer_error=null`、正常 session-end finalize 均成立时才可通过 health 判定。若中途触发 recovery，还需验证实际 plan 与当时 capture/transport evidence 相符。v3 verdict 永久保留，但不再是最终 authority；artifact integrity 或 provenance 未闭合仍可独立阻止正式 PASS。
-8. Full-RTH PASS 后，再逐项完成官方 IB 文档复核，整理 B2 source、tests、docs 和 evidence，形成新的可复查 freeze；不得借用 B1 exact-freeze 为新代码背书。
+8. 官方 IB 文档复核已完成；下一步按 [`GATE_B2_EXACT_TREE_FREEZE_PLAN_20260820_ZH.md`](GATE_B2_EXACT_TREE_FREEZE_PLAN_20260820_ZH.md) 先定义机器可验证的 B2 read-only evidence schema，再整理 source、tests、docs 和 evidence index，形成新的可复查 exact tree。仓库目前只有 B1 attestation 工具，因此不得借用 B1 freeze 为 B2 新代码背书，也不得仅凭文档把 freeze 写成已完成。
 9. 只读证据完成并封存后，由 owner **单独决定**是否授权“paper account、1 股 SPY、机械订单生命周期”的 paper-order protocol。只有进入该子阶段后，才验证非空 reconciliation、订单身份、跨 client 订单可见性、submit ambiguity、modify/cancel/fill、Gateway restart 和 late/duplicate/out-of-order callback；live order 继续禁止。
 10. **§3.5/§3.6 的问题假设进入后续 review，但不阻塞 B2 freeze。** D1 后续应复核多日/不同市场状态下 30 秒阈值是否掩盖同步静默或短时 outage；D2 后续应完成有界可复现 storage probe，或另行形成带残余风险的 owner amendment。该 review 必须在任何 order-capable Paper/Live 或生产部署前完成，不是订单授权，也不豁免其他独立 Gate 条件。
 
@@ -218,6 +219,7 @@ source、tests、docs 与后续真实 Gateway 证据仍需在最终 freeze 中�
 - [`INCIDENT_FULL_RTH_20260812_ZH.md`](INCIDENT_FULL_RTH_20260812_ZH.md)：Full-RTH 提前终止、API log、恢复策略缺陷、P0 修复、CI 基线和 2026-08-13 Full-RTH 复测方案。
 - [`GATE_B2_READONLY_20260809.md`](GATE_B2_READONLY_20260809.md)：每一轮真实 Gateway 测试的详细过程与观测。
 - [`DOCUMENTED_VS_OBSERVED.md`](DOCUMENTED_VS_OBSERVED.md)：官方文档语义与真实 Gateway 直接观测的逐项矩阵。
+- [`GATE_B2_EXACT_TREE_FREEZE_PLAN_20260820_ZH.md`](GATE_B2_EXACT_TREE_FREEZE_PLAN_20260820_ZH.md)：只读 B2 exact-tree freeze contract、证据大小/敏感性策略、分阶段实施与阻断条件。
 - [`FULL_RTH_ACCEPTANCE_20260818_REVIEW_ZH.md`](FULL_RTH_ACCEPTANCE_20260818_REVIEW_ZH.md)：2026-08-18 Full-RTH 验收报告的仓库侧复核；D1/D2 owner 裁决已完成，两项风险进入后续 review，但不阻塞 B2 freeze。
 - [`FULL_RTH_ACCEPTANCE_20260818_EVIDENCE_FOLLOWUP_20260820_ZH.md`](FULL_RTH_ACCEPTANCE_20260818_EVIDENCE_FOLLOWUP_20260820_ZH.md)：Windows 主机 evidence 跟进；已确认 exact commit `34f3ac4`、登记可读取的小型 artifact 摘要，并记录 Windows v4 sidecar 的 CRLF/摘要缺陷及修复。D1 已批准 v4 authority；D2 明确保持 writer-lag 根因 OPEN；两项均进入后续 assumption review，且按 owner 决定不阻塞 B2 freeze。
 - [`BRANCH_INVENTORY_20260819_ZH.md`](BRANCH_INVENTORY_20260819_ZH.md)：分支清点、两条活跃分支的整合方案与清理清单。

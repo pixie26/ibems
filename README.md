@@ -220,7 +220,7 @@ python -m ib_execution.execution_host --journal D:\ibems-data\journal.db \
 1. **策略 Gate A 独立推进。** 在策略仓库完成真实成本、数据质量和统计不确定性判断；若结论为 `NO_GO` 或 `INSUFFICIENT_EVIDENCE`，且没有独立第二消费者，就停止投资交易型 IB Adapter。
 2. **持三路订阅的受控断网已部分闭环。** production `run()` 已直接观察 1100→1102、不重订和恢复后逐流增量；1101 仍未观察，新 incident 生命周期尚未真实 fault 复测。不得为碰取 1101 重复断网。
 3. **Windows lifecycle 证据已完成。** 2026-08-20 在目标主机对 exact commit `6d159f8` 执行 no-IB PASS/FAIL/HOLD Scheduler probe：Task Scheduler 直接拥有同一个 Python/Recorder PID，HOLD 的 launcher 退出后 task 继续存活，`/End` 后 PID 消失，只有允许的 direct-child Windows console host，没有意外 child/grandchild。清理后测试 task `0`、probe PID `0`、raw 文件 `0`；原 v3 verdict 不变。
-4. **完成官方文档复核与 B2 freeze。** 强杀 gzip 段的段级完整性/尾段处置、attestation 从 Git 对象读取历史冻结事实及 Windows lifecycle probe 均已完成，不再列为剩余项。下一步逐项完成官方 IB 文档复核，并把 B2 source、tests、docs 和 evidence 绑定到新的可复查 exact tree。D1/D2 assumption review 已登记为后续风险事项，按 owner 决定不阻塞 B2 freeze；任何 order-capable Paper/Live 或生产部署前仍必须完成该 review。
+4. **执行只读 B2 exact-tree freeze。** 官方 IB 文档逐项复核已于 2026-08-20 完成；新增的 executions window 官方歧义、非原子 snapshot 边界、cross-client 可见性限制与 completed-orders Read-Only 观测均已登记。下一步按 [B2 exact-tree freeze 实施计划](docs/GATE_B2_EXACT_TREE_FREEZE_PLAN_20260820_ZH.md) 定义机器可验证 evidence schema，再把 source、tests、docs 和 evidence index 绑定到新的可复查 exact tree。D1/D2 assumption review 按 owner 决定不阻塞本次只读 freeze，但任何 order-capable Paper/Live 或生产部署前仍必须完成。
 5. **只读阶段不下单。** `completed orders` 被 Gateway Read-Only policy 阻断；不关闭保护追测。非空 reconciliation、订单身份和 callback 保留到另行授权的 paper-order 子阶段。
 6. **paper order 必须重新授权。** 只读证据封存后，owner 才单独决定是否运行 1 股 SPY paper-order protocol；B1 PASS 或 B2 只读结果都不自动构成该授权。MOC、多策略、live capital 和自动 watchdog takeover 继续推迟；live order 继续禁止。
 

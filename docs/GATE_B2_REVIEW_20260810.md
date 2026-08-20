@@ -185,7 +185,7 @@ production liveness 的 1100/1102 路径已对着真实 Gateway 故障运行；1
    运行一次 Full-RTH 全日 health，同时覆盖 `finalize_day`、开/午/收盘 bar cadence、长期内存、
    磁盘和队列水位，并解释 OVERNIGHT route 下 `useRTH=True` 仍有 bar 的直接行为。
 5. 完成 Recorder 强杀后 gzip 段级完整性/尾段处置，以及 attestation 统一读取 Git 对象。
-6. 完成 `PENDING DOC REVIEW` 并形成 B2 自己的 exact-freeze——不借 B1 attestation 背书。
+6. 官方文档复核已于 2026-08-20 完成；下一步形成 B2 自己的 exact-tree freeze——不借 B1 attestation 背书。见 [`GATE_B2_EXACT_TREE_FREEZE_PLAN_20260820_ZH.md`](GATE_B2_EXACT_TREE_FREEZE_PLAN_20260820_ZH.md)。
 7. 只读证据封存后，owner 单独决定是否授权 1 股 SPY paper-order 子阶段。
 
 当前没有任何 paper-order 或 live-order 授权，本复核不改变这一点。
