@@ -106,6 +106,6 @@ D1/D2 不在上述 freeze blockers 中；它们保留为生产/order-capable 前
 
 ## 6. 当前进度与下一动作
 
-- F0 官方复核与文档收口：本分支正在执行。
+- F0 官方复核与文档收口：已完成；官方矩阵、living status、README 和本 contract 已交付，后续 CI #97 暴露的 Windows post-exit lock-release 测试边界也已在 exact code commit `6424190` 修正，并由 CI #98 / `b1-storage-fsync` #66 验证。
 - F1-F3：尚未实现。仓库当前只有 B1 attestation/finalize 工具，没有 B2 read-only evidence schema 或 machine validator。
 - 本次提交完成 F0 后，下一项应是对 F1 schema 做代码级设计审查；审查通过后才实现 builder/validator。不能仅凭一份 Markdown plan 宣称 exact-tree freeze 已完成。
