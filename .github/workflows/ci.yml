@@ -113,5 +113,6 @@ jobs:
           name: windows-platform-${{ github.event.pull_request.head.sha || github.sha }}
           path: |
             artifacts/ci/windows-full.xml
+            artifacts/ci/checkout-identity.json
             artifacts/windows_ntfs_safe/**
           if-no-files-found: error
