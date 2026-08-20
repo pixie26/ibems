@@ -982,7 +982,16 @@ def reanalyze_raw_v4(
 
 
 def _create_durable(path: Path, payload: bytes) -> None:
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    # Windows defaults ``os.open`` descriptors to text mode.  ``os.write`` then
+    # expands LF to CRLF, so a digest computed over ``payload`` no longer binds
+    # the bytes actually persisted.  O_BINARY is zero/absent on POSIX and
+    # prevents that translation on Windows.
+    binary_flag = getattr(os, "O_BINARY", 0)
+    fd = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | binary_flag,
+        0o644,
+    )
     try:
         view = memoryview(payload)
         while view:

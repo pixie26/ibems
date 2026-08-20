@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from ib_execution.processlock import ProcessLock, ProcessLockUnavailable
+from process_lock_test_support import acquire_process_lock_after_known_exit
 
 HOLDER = textwrap.dedent(
     """
@@ -76,10 +77,12 @@ def test_kernel_releases_the_lock_when_the_holder_is_force_killed(tmp_path):
     holder.send_signal(signal.SIGKILL if os.name != "nt" else signal.SIGTERM)
     holder.wait(timeout=20)
 
-    successor = ProcessLock(path)
-    successor.acquire(note="successor")
+    successor, observation = acquire_process_lock_after_known_exit(
+        path, note="successor"
+    )
     try:
         assert successor.held
+        assert observation["retry_wait_ms"] <= 2_000
     finally:
         successor.release()
 

@@ -324,8 +324,13 @@ def test_v4_sidecars_are_create_only_and_reference_v3_hashes(tmp_path: Path) -> 
         original_manifest=v3_manifest,
     )
     amendment = json.loads(amendment_path.read_text(encoding="utf-8"))
+    health_bytes = health_path.read_bytes()
+    amendment_bytes = amendment_path.read_bytes()
 
     assert health_path.name == "health-v4.json"
+    assert b"\r\n" not in health_bytes
+    assert b"\r\n" not in amendment_bytes
+    assert amendment["health_v4_sha256"] == hashlib.sha256(health_bytes).hexdigest()
     assert amendment["original_gate_unchanged"] is True
     assert amendment["originals"]["health_v3"]["sha256"]
     assert amendment["originals"]["manifest_v3"]["sha256"]

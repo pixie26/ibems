@@ -32,6 +32,8 @@
 - [Gate B2 SPY RTH 行情与 Recorder 证据](docs/GATE_B2_RTH_20260810.md)
 - [2026-08-12 Full-RTH 提前终止事故报告](docs/INCIDENT_FULL_RTH_20260812_ZH.md)
 - [IB documented-vs-observed 矩阵](docs/DOCUMENTED_VS_OBSERVED.md)
+- [Gate B2 exact-tree freeze 实施计划](docs/GATE_B2_EXACT_TREE_FREEZE_PLAN_20260820_ZH.md)
+- [Gate B2 只读 evidence schema 与 F2 实体审计](docs/GATE_B2_READ_ONLY_EVIDENCE_SCHEMA_V1_ZH.md)
 - [实施状态](docs/IMPLEMENTATION_STATUS.md)
 - [22 条不变量覆盖矩阵](docs/INVARIANT_COVERAGE.md)
 - [审查与执行结论](docs/REVIEW_AND_EXECUTION_20260806_ZH.md)
@@ -219,8 +221,8 @@ python -m ib_execution.execution_host --journal D:\ibems-data\journal.db \
 
 1. **策略 Gate A 独立推进。** 在策略仓库完成真实成本、数据质量和统计不确定性判断；若结论为 `NO_GO` 或 `INSUFFICIENT_EVIDENCE`，且没有独立第二消费者，就停止投资交易型 IB Adapter。
 2. **持三路订阅的受控断网已部分闭环。** production `run()` 已直接观察 1100→1102、不重订和恢复后逐流增量；1101 仍未观察，新 incident 生命周期尚未真实 fault 复测。不得为碰取 1101 重复断网。
-3. **完成 Windows lifecycle 证据。** 2026-08-14 immutable replay 与 create-only v4 amendment 已完成且通过；原 v3 verdict 不变。下一步是在目标主机执行经 owner 确认的 no-IB PASS/FAIL/HOLD Scheduler probe，通过后再安排下一次集成 Full-RTH，不用只为阶段 C 重录一整天。
-4. **完成本地剩余小项与 B2 freeze。** 为强杀后的 gzip 段增加明确的段级完整性判定和不完整尾段处置；统一 attestation 从 Git 对象读取历史冻结事实；完成官方文档复核，并把 B2 source、tests、docs 和 evidence 绑定到新的可复查 tree。
+3. **Windows lifecycle 证据已完成。** 2026-08-20 在目标主机对 exact commit `6d159f8` 执行 no-IB PASS/FAIL/HOLD Scheduler probe：Task Scheduler 直接拥有同一个 Python/Recorder PID，HOLD 的 launcher 退出后 task 继续存活，`/End` 后 PID 消失，只有允许的 direct-child Windows console host，没有意外 child/grandchild。清理后测试 task `0`、probe PID `0`、raw 文件 `0`；原 v3 verdict 不变。
+4. **执行只读 B2 exact-tree freeze。** 官方 IB 文档逐项复核已于 2026-08-20 完成；新增的 executions window 官方歧义、非原子 snapshot 边界、cross-client 可见性限制与 completed-orders Read-Only 观测均已登记。candidate-v2 因 exact-CI、repo Git-blob 与 CI artifact provenance 缺口被独立 reviewer 拒绝；F1 [B2 evidence schema v2](docs/GATE_B2_READ_ONLY_EVIDENCE_SCHEMA_V2_ZH.md) 正在绑定 exact checkout identity、Git-object repo evidence 和 artifact archive/member。下一步按 [exact-tree freeze 实施计划](docs/GATE_B2_EXACT_TREE_FREEZE_PLAN_20260820_ZH.md) 完成 exact CI、生成并独立复核 candidate-v3，再进入 F3 metadata-only freeze。D1/D2 assumption review 按 owner 决定不阻塞本次只读 freeze，但任何 order-capable Paper/Live 或生产部署前仍必须完成。
 5. **只读阶段不下单。** `completed orders` 被 Gateway Read-Only policy 阻断；不关闭保护追测。非空 reconciliation、订单身份和 callback 保留到另行授权的 paper-order 子阶段。
 6. **paper order 必须重新授权。** 只读证据封存后，owner 才单独决定是否运行 1 股 SPY paper-order protocol；B1 PASS 或 B2 只读结果都不自动构成该授权。MOC、多策略、live capital 和自动 watchdog takeover 继续推迟；live order 继续禁止。
 

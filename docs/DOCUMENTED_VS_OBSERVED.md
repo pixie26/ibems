@@ -1,48 +1,70 @@
 # Gate B2：IB Gateway documented-vs-observed 矩阵
 
-状态：**IN PROGRESS**  
-范围：IB Gateway paper account；先只读，订单相关项目在明确进入 paper-order 子阶段前保持 `NOT TESTED`。
+状态：**OFFICIAL REVIEW COMPLETE；OBSERVATION/FREEZE IN PROGRESS**
 
-当前状态、证据索引和下一步见 [`GATE_B2_STATUS_20260810_ZH.md`](GATE_B2_STATUS_20260810_ZH.md)。
+官方页面复核日期：`2026-08-20`
 
-本文件只记录真实 Gateway 的直接观测。`FakeBroker`、单元测试或设计预期不能填入“已观测”列。官方文档依据尚未逐项复核的项目标为 `PENDING DOC REVIEW`，不得用记忆补齐。
+范围：IB Gateway paper account；当前仅只读。订单相关项目在 owner 明确授权 paper-order 子阶段前保持 `NOT TESTED`。
 
-| 项目 | 官方文档结论 | 真实 Gateway 观测 | 当前结论 | 证据 / 待办 |
-|---|---|---|---|---|
-| API TCP handshake | `PENDING DOC REVIEW` | Windows、paper port 4002、`readonly=True` 成功连接；server version 178 | `OBSERVED` | 2026-08-09 round 1 |
-| Managed accounts | `PENDING DOC REVIEW` | 返回 1 个 managed account；报告只保存数量，不保存 account id | `OBSERVED` | 脱敏报告 `connection.account_count=1` |
-| SPY contract qualification | `PENDING DOC REVIEW` | `SMART / ARCA / USD` 唯一解析，`conId=756733`，contract details 1 条 | `OBSERVED` | 2026-08-09 round 1 |
-| Market-data entitlement | `PENDING DOC REVIEW` | OVERNIGHT 与正式 `RTH+SMART` 均观察到 `marketDataType=1`；RTH v1 还观察到 competing-session 10197 | `OBSERVED` | 10197 后即使已有 ticks 也必须 fail-closed；stream coverage 分 session 判定 |
-| Overnight routing | IBKR API 要求 overnight 市场数据使用 `exchange=OVERNIGHT`；它不与普通 SMART routed data 重合 | `OVERNIGHT+SMART` 120.219 秒为 `0/0/0`；改为明确 `OVERNIGHT+OVERNIGHT` 后立即获得三路数据 | `DOCUMENTED AND OBSERVED` | 错误 label/route 组合现已在连接前机械拒绝 |
-| Overnight BidAsk / AllLast / 5s bars | overnight US stock/ETF session 从 Sunday 20:00 ET 开始；market data route 为 `OVERNIGHT` | 正确 route preflight 120.047 秒：`1620/13/25`；bounded Recorder 120.078 秒落盘：`923/16/25` | `OBSERVED - OVERNIGHT PASS` | report SHA `cda99091...fd7` / `7c97d75c...2e35`；不能替代 RTH |
-| RTH BidAsk / AllLast / 5s bars | `PENDING DOC REVIEW` | 正式 preflight 120.109 秒：`25665/3168/25`；bounded Recorder 120.360 秒落盘：`15590/2843/25`，市场数据行均为 LIVE；2026-08-11 handler-count run 120.406 秒：handler/readback 均为 `8972/1707/25` | `OBSERVED - RTH BOUNDED PASS`（只是「三路拿到 LIVE 数据」；新实验另证明该窗口 handler→raw readback 无丢失，**仍不证明 IB/交易所端到端完整性**） | 新 report SHA `0cb4c95b...e02edc`。两组旧 preflight/Recorder 来自不重叠窗口，约 40% 的 BidAsk 差异不是有效损失率测量；按测量无效关闭，不再安排同步 A/B。见 [`GATE_B2_REVIEW_20260810.md`](GATE_B2_REVIEW_20260810.md) §3 |
-| Broker clock | `PENDING DOC REVIEW` | 7 个 RTT midpoint 样本，中位偏差 `+0.517s`，最大绝对值 `0.837s` | `OBSERVED` | 低于当前 2 秒阈值 |
-| Repeated `reqCurrentTime` | `PENDING DOC REVIEW` | 0.2 秒间隔时至少一次 callback 未返回；bounded Recorder v1 也在 10 秒 hard deadline 触发 `TimeoutError`。1.1 秒 request-before pacing 后 preflight 与 Recorder 均完成 | `OBSERVED - CLIENT HARDENED` | preflight 与 Recorder 统一 pacing；preflight 18 tests、clock 相关 3 tests PASS。**该 10 秒 deadline 当时属于 probe 脚本**：`IB.RequestTimeout` 默认 0（ib_async 语义为永不超时），只有 probe 自己设过它，`QuoteRecorder.run` 没有。已改为由 recorder 自身绑定，见 [`GATE_B2_REVIEW_20260810.md`](GATE_B2_REVIEW_20260810.md) §1 |
-| Account summary | `PENDING DOC REVIEW` | `reqAccountSummary` 在 0.141 秒内完成，返回 71 项；报告只保存 count/hash | `OBSERVED` | 2026-08-10 safety-check report |
-| Positions snapshot | `PENDING DOC REVIEW` | 三轮计数 `0 / 0 / 0`，canonical hash 相同 | `STATIC CANDIDATE ONLY` | 未覆盖持仓变化并发 |
-| All-open-orders snapshot | `PENDING DOC REVIEW` | 三轮计数 `0 / 0 / 0`，canonical hash 相同 | `STATIC CANDIDATE ONLY` | 未覆盖订单 callback 并发或其他 client 的订单 |
-| Executions snapshot | `PENDING DOC REVIEW` | 三轮计数 `0 / 0 / 0`，canonical hash 相同 | `STATIC CANDIDATE ONLY` | 未覆盖当日成交、late execution 或 correction |
-| 双快照稳定屏障 | 设计候选；官方语义待复核 | 两个连续 pair 的整体及分项 hash 均相同；empty-state 下已跨 client death、Gateway restart、TerminateProcess 和 1100→1102 验证读取 completion | `STATIC CANDIDATE ONLY` | 仍不能据此恢复真实交易态 `SYNCED`；需非空动态 broker facts 实测 |
-| `orderId / permId / clientId / orderRef` | `PENDING DOC REVIEW` | 尚未产生订单事实 | `NOT TESTED` | B2 paper-order 子阶段 |
-| Completed orders | Read-Only API 开启时 order information 不可供 API 使用 | `reqCompletedOrders(False)` 10 秒无 completion；隔离最小复现稳定触发 Gateway 提示：“API客户端正在尝试发送需要API写入权限的请求”；复现代码无 `placeOrder`/`cancelOrder` | `BLOCKED BY READ-ONLY POLICY` | 截图 SHA-256 `63c4ecd5...98ddc`；证明 Gateway 的权限分类与拦截，不证明已提交订单；不得关闭 Read-Only |
-| Unknown / ambiguous broker facts | `PENDING DOC REVIEW` | `reqCompletedOrders` 无 completion，以及 Gateway 重启时 handshake 后 snapshot 仍可能超时；均未被解释为空结果或 ready | `PARTIAL - READ PROTOCOL ONLY` | 已做 deadline / UNKNOWN / retry；尚未覆盖订单身份或 submission ambiguity |
-| Clean client disconnect / reconnect | `PENDING DOC REVIEW` | 同一 clientId 正常断开后，新只读会话成功；server、account count、SPY conId 与静态 snapshot hash 一致 | `OBSERVED - CLEAN ONLY` | 不代表网络中断恢复；2026-08-09 reconnect report |
-| Concurrent read-only clients | `PENDING DOC REVIEW` | clientId 934/935 同时连接成功，读取的静态 `0/0/0` snapshot hash 相同 | `OBSERVED - EMPTY STATE ONLY` | 不证明有订单时 cross-client visibility |
-| Same client ID collision | 官方错误码 326：client ID 已被使用时拒绝连接 | 第一个 clientId 937 保持连接；第二个同 ID 连接收到 326 并失败；从未同时存活 | `OBSERVED` | 2026-08-10 client-fault v2 report |
-| Abrupt API client death / same-ID reconnect | `PENDING DOC REVIEW` | clientId 936 进程未 disconnect 即被强制终止；约 0.110 秒后第一次同 ID 重连成功，静态快照相同 | `OBSERVED - CLIENT PROCESS ONLY` | 不等于 Gateway restart 或 IB server disconnect |
-| Network disconnect / reconnect | `PENDING DOC REVIEW` | 对精确 `ibgateway.exe` 添加 45 秒 outbound block；Gateway 原 PID 存活、本地 API socket 保持连接；收到 2103/2157/1100，清理规则后收到 farm 恢复及 1102；恢复后 server time 与 `0/0/0` broker snapshot 完成且 hash 相同 | `OBSERVED - EMPTY STATE ONLY` | 2026-08-10 gateway-network-fault v2 report；规则已确认不存在；不证明动态非空 reconciliation |
-| Network disconnect with live subscriptions | `PENDING DOC REVIEW` | 真实 `QuoteRecorder.run()` 持 BidAsk/AllLast/BAR_5S 时收到 farm-down、1100→1102；connection epoch 保持 1、无 `RESUBSCRIBE_REQUIRED`；1102 后三路本地接收分别约 +0.264/+0.267/+0.896 秒 | `OBSERVED - 1102 PRODUCTION PATH` | 2026-08-12 部分日 artifact；没有 1101，不能验证 1101 重订；详见 [`GATE_B2_CONTROLLED_DISCONNECT_20260812_ZH.md`](GATE_B2_CONTROLLED_DISCONNECT_20260812_ZH.md) |
-| Windows Gateway running detection | Windows CIM/process metadata 可能因权限不可读；官方语义待复核 | 真实 PID 19060 上 `Get-CimInstance Win32_Process` 返回 Access Denied；`Get-Process` 路径、`netstat` 的 `0.0.0.0:4002` listener 和只读 IB API server version 178 均确认 Gateway 运行 | `OBSERVED - DETECTOR HARDENED` | 查询失败只能是 `INDETERMINATE`/路径 unknown，不能解释成 `NOT_RUNNING`；危险程序级动作另需 `path_status=MATCH` |
-| Gateway normal restart | `PENDING DOC REVIEW` | socket disconnect；重启期两次 10 秒 timeout 和 10141；同 clientId 第三次恢复；前后静态 `0/0/0` hash 相同 | `OBSERVED - EMPTY STATE ONLY` | 2026-08-10 gateway-restart v3 report |
-| Gateway Task Manager End task | `PENDING DOC REVIEW` | socket disconnect；第一次恢复 10 秒 timeout 和 10141；第二次连接及完整 snapshot 成功；前后静态 hash 相同；应用表现出保存/退出过程 | `OBSERVED - NOT CLAIMED AS HARD KILL` | 2026-08-10 gateway-hard-kill v2 report |
-| Gateway `TerminateProcess` | Windows `Stop-Process -Force` 对精确 PID 使用强制终止语义 | socket disconnect；前两次恢复各 10 秒 timeout，含 10141；第三次连接及完整 snapshot 成功；前后静态 hash 相同 | `OBSERVED - EMPTY STATE ONLY` | 2026-08-10 gateway-terminateprocess report |
-| `1100 / 1101 / 1102` | 1100=Gateway/TWS 丢失 IB server 连接；1101/1102=恢复且分别表示 market data lost/maintained | 空状态 probe 与持三路订阅的 production `run()` 都收到 1100→1102；后者无重订且三路自动恢复。两轮均没有 1101 | `PARTIAL - 1100/1102 OBSERVED TWICE; 1101 NOT_RUN_ACCEPTED_NON_BLOCKER` | 1101 仍未直接观察，不得由 1102 推断。production 轮已覆盖“有订阅时 1102 保持订阅”，但没有进入“1101 requests lost”分支。**owner 于 2026-08-12 决定不再专门追 1101**（45 秒阻断只能产生 1102，取得该码需要长得多的断开，收益仅是把一条已有实现和单元测试的分支从未观察改为已观察）：代码路径保留，碰上真实 1101 时被动采集，任何未来断网实验都不以取码为目的。记录见 [`GATE_B2_STATUS_20260810_ZH.md`](GATE_B2_STATUS_20260810_ZH.md) §3.3 |
-| Order submit / ack / modify / cancel / fill / commission | `PENDING DOC REVIEW` | 零订单；代码路径未运行 | `NOT TESTED` | 不属于当前只读轮次 |
+当前状态、证据索引和下一步见 [`GATE_B2_STATUS_20260810_ZH.md`](GATE_B2_STATUS_20260810_ZH.md)；只读 exact-tree freeze 的范围与执行步骤见 [`GATE_B2_EXACT_TREE_FREEZE_PLAN_20260820_ZH.md`](GATE_B2_EXACT_TREE_FREEZE_PLAN_20260820_ZH.md)。
 
-## 当前判定
+## 1. 判定方法
 
-Gate B2 已开始，但 **没有 PASS**。截至 2026-08-12，已经直接观察基础连接、静态零事实快照、SPY 合约、LIVE entitlement、明确 OVERNIGHT destination 与正式 `RTH+SMART` 的三路行情及 Recorder raw-log 写盘、broker clock、client death / ID collision、Gateway restart / `TerminateProcess`、Gateway 存活时的 1100→1102，以及持三路订阅的 production 1100→1102 与三路恢复。仍未证明 Full-RTH 全日 Recorder health、非空动态 snapshot barrier、1101、订单身份或任何订单生命周期。新 incident 去重和 Gateway 检测修正有代码/测试证据；只有 Gateway 检测已追加真实环境验证，incident 新语义尚未在下一次真实 fault run 中验证。
+- `DOCUMENTED`：当前 IBKR Campus 页面明确给出的接口或错误码语义；不是运行时证明。
+- `OBSERVED`：本项目在真实 paper Gateway 上直接观察到；只覆盖记录的版本、配置、账户状态和窗口。
+- `OFFICIAL DOC AMBIGUITY`：IBKR 当前官方页面内部存在冲突，项目不得自行选择更有利解释。
+- `DESIGN / NOT GUARANTEED`：属于本项目的安全设计；官方页面没有承诺该性质。
+- `OUT OF IB DOC SCOPE`：Windows/进程等行为，不应伪装成 IB API 官方语义。
 
-零订单、Read-Only 边界下明显具有 B2 安全价值且无需额外故障授权的主要 Gateway 实测已经完成，包括 bounded OVERNIGHT 与 RTH。其他动态项目需要另行授权 paper-order 子阶段，`completed orders` 则保持被 Read-Only policy 阻断。当前证据已保存 digest，但工作树尚未形成最终 B2 Git exact-freeze。
+官方文档、单元测试和历史上下文都不能替代直接观测；直接观测也不能外推到未覆盖状态。找不到官方保证时，结论是“未保证”，不是 `PENDING`，更不能用记忆补齐。
 
-详细轮次证据见 [`GATE_B2_READONLY_20260809.md`](GATE_B2_READONLY_20260809.md)。
+## 2. 复核发现的关键语义缺口
+
+1. `accountSummaryEnd`、`positionEnd`、`openOrderEnd`、`execDetailsEnd` 和 `contractDetailsEnd` 只分别表示对应请求/数据流结束。官方页面没有承诺这些结束点之间形成原子、同一时刻或相互一致的 broker snapshot。
+2. executions 回看窗口存在官方冲突：请求页写“当日午夜后”，接收页写“最近 24 小时”。在 IBKR 澄清或以更强 broker authority 补齐前，reconciliation 必须把边界交易视为可能缺失，不能以任一说法恢复 `SYNCED`。
+3. `reqAllOpenOrders` 是一次性请求，不是持续订阅；可见性还受 API username、client ID 和 Master/client-0 配置影响。空状态 `0/0/0` 不能证明跨 client 的非空完整性。
+4. 当前 completed-orders 页面说明请求与 callback，但没有为 Read-Only 模式给出兼容保证，接收页也未说明可依赖的 completion callback。Gateway 将该请求拦为“需要 API 写权限”属于本轮真实观测，不能改写成普遍官方规则。
+5. `reqCurrentTime` 官方页面说明返回 broker timestamp；没有给出旧异步调用的最小请求间隔或 callback deadline。项目采用的 1.1 秒 request-before pacing 是实测后的客户端加固，不是 IB 保证。
+
+## 3. 逐项矩阵
+
+| 项目 | 官方文档复核结论 | 真实 Gateway 观测 | 当前结论 / 边界 |
+|---|---|---|---|
+| API TCP handshake | 初始 TCP socket 后进行版本 handshake；连接完成时会取得 account、`nextValidId`、connection time 等初始消息。`nextValidId` 常用作连接完成信号；过早请求可能被丢弃 | Windows paper port 4002、`readonly=True` 成功；server version 178 | `DOCUMENTED AND OBSERVED`；socket connected 本身不等于 ready/synced |
+| Managed accounts | `managedAccounts` 在初始连接时自动返回该 API username 可用账户 | 返回 1 个账户；报告只保存 count | `DOCUMENTED AND OBSERVED`；数量不证明账户授权范围正确，且不落盘 account id |
+| SPY contract qualification | `reqContractDetails` 返回所有匹配合约，`contractDetailsEnd` 表示该请求结束 | `SMART/ARCA/USD` 唯一解析，`conId=756733`，1 条 details | `DOCUMENTED AND OBSERVED`；唯一性由本次响应证明，不跨时间外推 |
+| Market-data type / entitlement | `marketDataType=1` 是 regular/live；实时 bars 需要相应 L1 subscription | OVERNIGHT 与 RTH 均见 type 1；RTH v1 另见 competing-session 10197 | `DOCUMENTED AND OBSERVED`；10197 后即使已有 ticks 也 fail closed |
+| Overnight routing | 官方 overnight 课程要求 eligible US stocks/ETFs 使用 `OVERNIGHT` destination；与普通 SMART route 分开 | `OVERNIGHT+SMART` 为 `0/0/0`；明确 `OVERNIGHT+OVERNIGHT` 后取得三路数据 | `DOCUMENTED AND OBSERVED`；route/label 不匹配在连接前拒绝 |
+| BidAsk / AllLast / 5-second bars | tick-by-tick 类型包括 `Last`、`AllLast`、`BidAsk`、`MidPoint`；realtime bars 固定为 5 秒并有 subscription/pacing 约束 | OVERNIGHT 120 秒 `1620/13/25`；RTH handler/readback 均 `8972/1707/25`；Full-RTH v4 health PASS | `DOCUMENTED AND OBSERVED`；证明本地窗口接收/落盘，不证明交易所到 IB 端到端完整性 |
+| Broker clock | `reqCurrentTime` 返回当前 broker timestamp | 7 个 RTT midpoint 样本中位偏差 `+0.517s`，最大绝对值 `0.837s` | `DOCUMENTED AND OBSERVED`；只覆盖该窗口 |
+| Repeated `reqCurrentTime` | 官方未给出旧异步调用的最小间隔或 callback deadline | 0.2 秒间隔出现 callback 未返回；1.1 秒 request-before pacing 后完成 | `OBSERVED - CLIENT HARDENED`；不得称 1.1 秒为官方 pacing |
+| Account summary | `accountSummaryEnd` 表示该次 account-summary 信息已返回完毕 | 0.141 秒完成，71 项；只保存 count/hash | `DOCUMENTED AND OBSERVED`；单请求完成不等于全 broker 原子快照 |
+| Positions | initial positions stream 后以 `positionEnd` 表示传输结束 | 三轮 `0/0/0` 中 positions 均为 0，hash 相同 | `STATIC CANDIDATE ONLY`；未覆盖持仓变化并发 |
+| All open orders | `reqAllOpenOrders` 返回 associated accounts 的当前 open orders；一次性、非订阅。`reqOpenOrders` 仅同 client，client 0 绑定还会改变 order ID 且 Read-Only 下会被拒绝 | 三轮 open orders 均为 0，hash 相同 | `STATIC CANDIDATE ONLY`；未证明其他 client/username 的非空可见性 |
+| Executions | `execDetailsEnd` 表示该请求结束；官方请求页称“当日午夜后”，接收页称“最近 24 小时” | 三轮 executions 均为 0，hash 相同 | `OFFICIAL DOC AMBIGUITY / STATIC ONLY`；边界成交必须视为可能缺失 |
+| 双快照稳定屏障 | 官方没有保证 positions/open orders/executions 的结束点构成原子或互相一致 snapshot | 连续 pair 的整体/分项 hash 相同；empty-state 下跨多种 restart/death 完成 | `DESIGN CANDIDATE ONLY`；不得据此恢复真实交易态 `SYNCED` |
+| `orderId / permId / clientId / orderRef` | `orderId` 未必 account-unique；`clientId` 标识下单 client；`permId` 可为 0（外部成交）；`orderRef` 在订单生命周期关联；`execId` 每个 partial fill 不同，correction 只改最后句点后的部分 | 尚未产生订单事实 | `DOCUMENTED / NOT TESTED`；保留到另行授权的 paper-order 子阶段 |
+| Completed orders | 官方记录 `reqCompletedOrders(apiOnly)` 与 `completedOrder`；当前页面未承诺 Read-Only 兼容，也未给出本项目可依赖的 completion 语义 | 10 秒无 completion；隔离复现稳定触发“需要 API 写权限”提示；无 `placeOrder`/`cancelOrder` | `OBSERVED - BLOCKED BY READ-ONLY POLICY`；不能解释成零条，不关闭保护追测 |
+| Unknown / ambiguous broker facts | 官方没有把 timeout 或缺少 completion 定义为空集合或 ready | completed-orders/restart/current-time 均出现过无 completion | `PARTIAL - FAIL CLOSED`；deadline 后为 UNKNOWN，不恢复 `SYNCED` |
+| Clean disconnect / reconnect | 官方提供 socket 状态与 broken-connection handling；重连逻辑由 client 实现 | 正常断开后同 ID 新只读会话成功，静态 snapshot 相同 | `DOCUMENTED AND OBSERVED - CLEAN ONLY`；reconnect 不是 reconciliation |
+| Concurrent clients / Master | 每个 API connection 有 client ID；Master 可接收其他 API client 的状态，client 0 可接收 TWS/FIX 状态；一个 username 的 session/market-data 还受并发登录约束 | client 934/935 同时只读连接，空 snapshot 相同 | `DOCUMENTED AND OBSERVED - EMPTY ONLY`；非空跨 client 完整性未证 |
+| Same client ID collision | error 326 表示 client ID 已被使用 | 第二个 client 937 收 326 并失败，第一个继续存活 | `DOCUMENTED AND OBSERVED` |
+| Abrupt API client death / same-ID reconnect | 官方 broken-socket 页面未承诺 abrupt process death 后同 ID 的释放时间 | client 936 被强制终止，约 0.110 秒后首次同 ID 重连成功 | `OBSERVED ONLY`；不外推为时限保证 |
+| Network disconnect / 1100/1101/1102 | 1100=Gateway/TWS 与 IB server 失联；1101=恢复但 market-data requests 丢失、需重提；1102=恢复且 requests 保持、无需重提 | 空状态与持三路订阅均见 1100→1102；production path 未重订且三路恢复；未见 1101 | `DOCUMENTED; 1100/1102 OBSERVED`；1101 保持未观察并被动采证，不反推 |
+| Error/farm messages | 官方 error table 记录 10197 competing session、2103/2104、2105/2106、2107/2108、10225 bust 等语义 | 已见 10197、farm down/up；10225 对应代码路径已有测试 | `PARTIAL`；只把实际收到的码记为 observed |
+| Gateway restart / End task / `TerminateProcess` | 官方只描述 socket/IB connectivity；不保证 Windows restart/kill 时序 | normal restart、Task Manager End task、精确 PID `TerminateProcess` 后均可重连并完成空 snapshot | `OBSERVED - EMPTY ONLY`；End task 不声称 hard kill，重连不等于恢复 |
+| Windows Gateway running detection | 属 Windows process/CIM/listener 与本项目 detector 设计，不是 IB API 官方语义 | CIM Access Denied；`Get-Process`、4002 listener、只读 API server version 178 共同确认运行 | `OUT OF IB DOC SCOPE / OBSERVED`；查询不完整只能 `INDETERMINATE` |
+| Order submit / ack / modify / cancel / fill / commission | 官方有订单与 execution callback 语义，但不构成本项目的运行证据或授权 | 零订单；代码路径未运行 | `DOCUMENTED / NOT TESTED`；当前只读 freeze 不覆盖，不授权订单 |
+
+## 4. 官方来源索引
+
+- Connectivity：[Establishing an API Connection](https://ibkrcampus.com/docs/tws-api/doc/connectivity/establishing-an-api-connection)、[Verify API Connection](https://ibkrcampus.com/docs/tws-api/doc/connectivity/verify-api-connection)、[Broken API Socket Connection](https://ibkrcampus.com/docs/tws-api/doc/connectivity/broken-api-socket-connection)、[Logging into Multiple Applications](https://ibkrcampus.com/docs/tws-api/doc/connectivity/logging-into-multiple-applications)
+- Accounts/contracts：[Receive Managed Accounts](https://ibkrcampus.com/docs/tws-api/doc/account-portfolio-data/managed-accounts/receive-managed-accounts)、[Receiving Account Summary](https://ibkrcampus.com/docs/tws-api/doc/account-portfolio-data/account-summary/receiving-account-summary)、[Receive Positions](https://ibkrcampus.com/docs/tws-api/doc/account-portfolio-data/positions/receive-positions)、[Receive Contract Details](https://ibkrcampus.com/docs/tws-api/doc/contracts-financial-instruments/contract-details/receive-contract-details)
+- Market data：[Market Data Type Behavior](https://ibkrcampus.com/docs/tws-api/doc/market-data-delayed/market-data-type-behavior)、[Request Real Time Bars](https://ibkrcampus.com/docs/tws-api/doc/market-data-live/5-second-bars/request-real-time-bars)、[Request Tick-by-Tick Data](https://ibkrcampus.com/docs/tws-api/doc/market-data-live/tick-by-tick-data/request-tick-by-tick-data)、[API Overnight Trading](https://www.interactivebrokers.com/campus/ibkr-quant-news/api-overnight-trading/)、[Current Time](https://ibkrcampus.com/docs/tws-api/doc/synchronous-api/current-time)、[Error Codes](https://ibkrcampus.com/docs/tws-api/ref/error-codes)、[System Message Codes](https://ibkrcampus.com/docs/tws-api/ref/system-message-codes)
+- Orders/executions：[All Submitted Orders](https://ibkrcampus.com/docs/tws-api/doc/order-management/requesting-currently-active-orders/all-submitted-orders)、[API Client's Orders](https://ibkrcampus.com/docs/tws-api/doc/order-management/requesting-currently-active-orders/api-clients-orders)、[Open Orders](https://ibkrcampus.com/docs/tws-api/doc/order-management/open-orders)、[Request Execution Details](https://ibkrcampus.com/docs/tws-api/doc/order-management/execution-details/request-execution-details)、[Receive Execution Details](https://ibkrcampus.com/docs/tws-api/doc/order-management/execution-details/receive-execution-details)、[Request Completed Orders](https://ibkrcampus.com/docs/tws-api/doc/order-management/retrieving-completed-orders/requesting-completed-orders)、[Receive Completed Orders](https://ibkrcampus.com/docs/tws-api/doc/order-management/retrieving-completed-orders/receiving-completed-orders)、[Client ID 0 and Master Client ID](https://ibkrcampus.com/docs/tws-api/doc/order-management/client-id-0-and-the-master-client-id)、[Execution Object](https://ibkrcampus.com/docs/tws-api/ref/execution-class-reference/introduction)
+
+## 5. 当前判定
+
+Gate B2 已开始但**没有 PASS**。2026-08-18 Full-RTH v4 是 owner 接受的最终 health authority；原 v3 FAIL、Windows sidecar 历史 CRLF/摘要缺陷边界和 writer-lag OPEN 风险均保留。2026-08-20 已完成本矩阵的官方页面复核，并把所有旧待复核项转成明确的 documented、ambiguity、not-guaranteed 或 out-of-scope 结论。
+
+当前可以进入的是“只读 B2 source/tests/docs/evidence exact-tree freeze”，其作用是封存和复查本阶段事实，不是把 `STATE.json.gate_b2` 改为 PASS，也不创建 paper/live order authorization。非空动态 reconciliation、订单身份、cross-client order visibility、submission ambiguity 和订单生命周期仍必须等待独立 paper-order 授权。

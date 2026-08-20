@@ -15,11 +15,12 @@ from ib_execution.auditor import JournalAuditor
 from ib_execution.calendar import TradingCalendar
 from ib_execution.clock import ManualClock
 from ib_execution.controller import Controller, ExecutionPolicy
-from ib_execution.journal import Journal
+from ib_execution.journal import Journal, JournalOwnershipError
 from ib_execution.models import EventType, OperatingMode, Quote, SyncState
 from ib_execution.risk import RiskConfig, RiskEngine
 from conftest import SESSION_START
 from crash_worker import DurableBroker
+from process_lock_test_support import call_after_known_exit
 
 
 SCENARIOS = [
@@ -68,8 +69,17 @@ def test_force_kill_window_recovers_fail_closed(tmp_path, scenario):
         state_before = json.loads(truth_path.read_text(encoding="utf-8"))
         sends_before = int(state_before["place_calls"])
 
+        # Popen.wait() proves the writer process exited, but Windows may retain
+        # its byte-range lock for a few milliseconds.  Retry the exact Journal
+        # successor at this known-exit test boundary; never add waiting to the
+        # production non-blocking single-writer primitive.
         clock = ManualClock(SESSION_START)
-        journal = Journal(journal_path, clock=clock)
+        journal, lock_release = call_after_known_exit(
+            lambda: Journal(journal_path, clock=clock),
+            retry_exceptions=(JournalOwnershipError,),
+        )
+        assert lock_release["retry_wait_ms"] <= 2_000
+
         broker = DurableBroker(truth_path, clock)
         ctl = Controller(
             journal,
