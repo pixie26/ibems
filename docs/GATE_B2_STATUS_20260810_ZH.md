@@ -66,6 +66,7 @@ B2 freeze 时仍需统一机器状态、源码、文档和证据。
 | Windows WAL damage/rollback + witness crossing | 已完成 | run 31574366903，同一隔离 VHD：真实 `ntfs.sys` 上 WAL recovery 静默丢弃 26 条已提交事件（3653→3627），全部在 witness `seq=1938` 之上故引擎正确启动；强制截到 witness 之下则 exit `15` + fence RAISED | 第一次在 Windows 内核文件系统上直接观测到"已 commit 的事务被无声丢弃、DB 仍自洽只是变短"；owner 已确认 §3.1 的接受覆盖该项（见 §3.2），清单条目已解除 |
 | Windows flush / fsync stall | 已证伪可行性 | 云 Linux VM 内核无 device-mapper；FUSE 回退下 SQLite WAL 的 `-shm` mmap 直接使进程死于 signal 7，未走到超时判定 | Windows 无 dm-delay 等价物；托管 runner 上无法装过滤驱动。留 B3，不再尝试 |
 | Windows Gateway 存活检测 | 已修复并实测 | CIM Access Denied 时继续用 `Get-Process`、`netstat` listener 和只读 API；现场返回 `RUNNING_API_VERIFIED`、server version 178 | 危险程序级动作仍额外要求 `path_status=MATCH`；查询不完整只能是 `INDETERMINATE` |
+| Windows same-process Scheduler lifecycle | 已完成（目标主机 no-IB） | 2026-08-20 在 `6d159f8` 执行 PASS/FAIL/HOLD：Scheduler action PID 等于 Recorder PID；HOLD 在 launcher 退出后独立存活，`/End` 后 PID 消失；仅观察到允许的 direct-child `conhost.exe`，无意外 child/grandchild | 报告 `17,760` bytes，SHA-256 `8d1e02ac1e1b5b4f266770c54346d2adf12c1fa8600244c9e77870825b7e1077`；全部 13 个小文件共 `31,451` bytes，清理后 task `0`、probe PID `0`、raw 文件 `0`、stderr `0`；未连接 IB，不构成订单授权 |
 | Windows provenance 重新生成 | 已修复 | `STATE.json` 用 UTF-8 bytes + LF 写入；实测 `CR=0` 且 `provenance --check` 通过 | 不改变 B1 historical freeze，也不为当前 B2 worktree 提供新 attestation |
 | 非空动态 reconciliation | 未完成 | 当前没有仓位、挂单或成交事实 | 需要另行授权 paper-order 子阶段 |
 | `orderId / permId / clientId / orderRef` | 未完成 | 尚未产生真实订单身份事实 | 需要另行授权 paper-order 子阶段 |
