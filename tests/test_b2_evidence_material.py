@@ -11,7 +11,6 @@ from pathlib import Path
 import pytest
 
 from ib_execution import b2_evidence_material
-from scripts import build_b2_read_only_candidate
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -353,9 +352,9 @@ def test_github_identity_and_manifest_budget_are_enforced(tmp_path: Path) -> Non
 
 def test_create_only_output_refuses_overwrite(tmp_path: Path) -> None:
     output = tmp_path / "candidate.json"
-    build_b2_read_only_candidate._write_create_only(output, b"first\n")
+    b2_evidence_material.publish_create_only(output, b"first\n")
     with pytest.raises(
         b2_evidence_material.B2MaterialVerificationError, match="refusing to overwrite"
     ):
-        build_b2_read_only_candidate._write_create_only(output, b"second\n")
+        b2_evidence_material.publish_create_only(output, b"second\n")
     assert output.read_bytes() == b"first\n"

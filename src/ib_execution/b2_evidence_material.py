@@ -272,6 +272,31 @@ def stream_file_identity(path: Path) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
+def publish_create_only(path: Path, raw: bytes) -> None:
+    """Durably publish a small output without replacing an existing generation."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.link(temporary, path)
+    except FileExistsError as exc:
+        raise B2MaterialVerificationError(
+            f"refusing to overwrite existing output: {path}"
+        ) from exc
+    except OSError as exc:
+        raise B2MaterialVerificationError(
+            f"cannot publish create-only output {path}: {exc}"
+        ) from exc
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def _parse_manifest_time(raw: str) -> datetime:
     try:
         return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(timezone.utc)

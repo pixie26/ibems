@@ -4,37 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 
 from ib_execution import b2_evidence, b2_evidence_material
 
 ROOT = Path(__file__).resolve().parents[1]
-
-
-def _write_create_only(path: Path, raw: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        with temporary.open("xb") as handle:
-            handle.write(raw)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.link(temporary, path)
-    except FileExistsError as exc:
-        raise b2_evidence_material.B2MaterialVerificationError(
-            f"refusing to overwrite existing output: {path}"
-        ) from exc
-    except OSError as exc:
-        raise b2_evidence_material.B2MaterialVerificationError(
-            f"cannot publish create-only output {path}: {exc}"
-        ) from exc
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -80,12 +55,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         manifest_raw = b2_evidence.dumps_manifest(payload).encode("utf-8")
         if args.output:
-            _write_create_only(args.output, manifest_raw)
+            b2_evidence_material.publish_create_only(args.output, manifest_raw)
         if args.report:
             report_raw = (json.dumps(report.as_dict(), indent=2, sort_keys=True) + "\n").encode(
                 "utf-8"
             )
-            _write_create_only(args.report, report_raw)
+            b2_evidence_material.publish_create_only(args.report, report_raw)
     except (
         b2_evidence.B2EvidenceValidationError,
         b2_evidence_material.B2MaterialVerificationError,
