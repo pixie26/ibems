@@ -1,0 +1,323 @@
+{
+  "authority_evidence_ids": [
+    "V4_HEALTH_20260818",
+    "V4_AMENDMENT_BYTES_20260818",
+    "V3_FAIL_REVIEW_20260820",
+    "WINDOWS_LIFECYCLE_20260820",
+    "WINDOWS_LIFECYCLE_CLEANUP_REVIEW_20260820",
+    "DOCUMENTED_VS_OBSERVED_20260820",
+    "APPX_INCIDENT_20260813",
+    "CI_WINDOWS_NTFS_106",
+    "CI_FSYNC_74"
+  ],
+  "candidate": {
+    "commit_sha": "c88cf2463ba1a93940172e579575636f2778f457",
+    "config_tree_sha256": "2afcb80305ec6de198a911624c05f6e7681326d16d53fe0a268e60594ab26dcf",
+    "dependency_lock_sha256": "6156296dd9b10927a0700cc2dfd77d42a19a6c39c0bb2753d982b30045de1a5b",
+    "source_tree_sha256": "4a4643b93dcb691c9214911c8f7789be3abaa5a2b2070c588952afc78d025f34",
+    "tree_sha": "b31fd39d1d5f47c7bb764b683795aadb94c51116"
+  },
+  "ci_artifacts": [
+    {
+      "archive_sha256": "e000ad08b02ade669293f39a8687a35b4a4207f29a7f1e531d34d33e9dbf8f33",
+      "artifact_id": 9418089804,
+      "artifact_name": "junit-c88cf2463ba1a93940172e579575636f2778f457",
+      "checkout_identity_member_path": "checkout-identity.json",
+      "evidence_id": null,
+      "evidence_member_path": null,
+      "job_name": "verify",
+      "run_id": 32399917682
+    },
+    {
+      "archive_sha256": "16e8038d7cc020e93a7806efb8b867860168af5869517176903fa6cd5f78ba9b",
+      "artifact_id": 9418261989,
+      "artifact_name": "windows-platform-c88cf2463ba1a93940172e579575636f2778f457",
+      "checkout_identity_member_path": "ci/checkout-identity.json",
+      "evidence_id": "CI_WINDOWS_NTFS_106",
+      "evidence_member_path": "windows_ntfs_safe/manifest.json",
+      "job_name": "windows-verify",
+      "run_id": 32399917682
+    },
+    {
+      "archive_sha256": "011c8cdf5e25c4d42cc43425d8ba2646e38ad4c2dee958310a621418ce78c5a2",
+      "artifact_id": 9418247441,
+      "artifact_name": "b1-fsync-stall-evidence-c88cf2463ba1a93940172e579575636f2778f457",
+      "checkout_identity_member_path": "_temp/b1-fsync-checkout-identity.json",
+      "evidence_id": "CI_FSYNC_74",
+      "evidence_member_path": "ibems/ibems/artifacts/gate_b1_storage/20260820T175130Z/manifest.json",
+      "job_name": "fsync-stall",
+      "run_id": 32399917693
+    }
+  ],
+  "ci_runs": [
+    {
+      "commit_sha": "c88cf2463ba1a93940172e579575636f2778f457",
+      "conclusion": "SUCCESS",
+      "provider": "GITHUB_ACTIONS",
+      "run_attempt": 1,
+      "run_id": 32399917682,
+      "workflow": "ci"
+    },
+    {
+      "commit_sha": "c88cf2463ba1a93940172e579575636f2778f457",
+      "conclusion": "SUCCESS",
+      "provider": "GITHUB_ACTIONS",
+      "run_attempt": 1,
+      "run_id": 32399917693,
+      "workflow": "b1-storage-fsync"
+    }
+  ],
+  "evidence": [
+    {
+      "binding": "BOUND_AUTHORITY",
+      "bytes": 13029,
+      "capture_commit": "34f3ac43cc56982976e401fd519512b2462e7e35",
+      "captured_at_utc": "2026-08-18T20:05:40Z",
+      "claim_key": "FULL_RTH_20260818_V4_HEALTH",
+      "evidence_kind": "FULL_RTH_HEALTH",
+      "id": "V4_HEALTH_20260818",
+      "relative_path": "full_rth/health-v4.json",
+      "scope": "SPY 2026-08-18 RTH capture-to-finalize v4 health only; no Gate PASS, reconciliation proof, or order capability.",
+      "sensitivity": "CONTROLLED_EXTERNAL",
+      "sha256": "6071625b87d3e5af80467e1f3d901721fadf41b343338e2438bf44726ff73d85",
+      "verdict": "PASS"
+    },
+    {
+      "binding": "BOUND_AUTHORITY",
+      "bytes": 28114,
+      "capture_commit": "34f3ac43cc56982976e401fd519512b2462e7e35",
+      "captured_at_utc": "2026-08-18T20:05:40Z",
+      "claim_key": "FULL_RTH_20260818_V4_BYTE_BINDING",
+      "evidence_kind": "OTHER",
+      "id": "V4_AMENDMENT_BYTES_20260818",
+      "relative_path": "full_rth/manifest-amendment-v4.json",
+      "scope": "Binds immutable Windows amendment disk bytes while preserving the documented historical CRLF versus pre-write digest mismatch.",
+      "sensitivity": "CONTROLLED_EXTERNAL",
+      "sha256": "07c142224724be433148b94b42efb01d3305495878b6ca0e3ea1ec2773b13451",
+      "verdict": "PARTIALLY_VERIFIED"
+    },
+    {
+      "binding": "BOUND_AUTHORITY",
+      "bytes": 8680,
+      "capture_commit": "c88cf2463ba1a93940172e579575636f2778f457",
+      "captured_at_utc": "2026-08-20T17:57:15Z",
+      "claim_key": "FULL_RTH_20260818_V3_REVIEW",
+      "evidence_kind": "HISTORICAL_FAILURE",
+      "id": "V3_FAIL_REVIEW_20260820",
+      "relative_path": "repo/docs/FULL_RTH_ACCEPTANCE_20260818_EVIDENCE_FOLLOWUP_20260820_ZH.md",
+      "scope": "Candidate-tree review preserves v3 FAIL and explicitly labels original v3 sidecars ACL-blocked; this is secondary review evidence, not a direct v3 sidecar rehash.",
+      "sensitivity": "PUBLIC_METADATA",
+      "sha256": "ded8dd4db39343c58aa6693c1a3c0e817becc166e08d0ab7cdeb9c5046fe85cb",
+      "verdict": "FAIL"
+    },
+    {
+      "binding": "REFERENCE_ONLY",
+      "bytes": null,
+      "capture_commit": null,
+      "captured_at_utc": "2026-08-18T20:03:24Z",
+      "claim_key": "FULL_RTH_20260818_V3_ORIGINAL_HEALTH",
+      "evidence_kind": "HISTORICAL_FAILURE",
+      "id": "V3_HEALTH_ORIGINAL_REFERENCE",
+      "relative_path": "full_rth/health.json",
+      "scope": "Original v3 health sidecar remains ACL-blocked to this audit process; no current byte-level authority is claimed.",
+      "sensitivity": "SENSITIVE_EXTERNAL",
+      "sha256": null,
+      "verdict": "FAIL"
+    },
+    {
+      "binding": "REFERENCE_ONLY",
+      "bytes": null,
+      "capture_commit": null,
+      "captured_at_utc": "2026-08-18T20:03:24Z",
+      "claim_key": "FULL_RTH_20260818_V3_ORIGINAL_MANIFEST",
+      "evidence_kind": "OTHER",
+      "id": "V3_MANIFEST_ORIGINAL_REFERENCE",
+      "relative_path": "full_rth/manifest.json",
+      "scope": "Original v3 completion manifest remains ACL-blocked; its historical registered digest is not promoted to current authority.",
+      "sensitivity": "SENSITIVE_EXTERNAL",
+      "sha256": null,
+      "verdict": "PARTIALLY_VERIFIED"
+    },
+    {
+      "binding": "BOUND_AUTHORITY",
+      "bytes": 17760,
+      "capture_commit": "6d159f87e0594f28a8339ed349a62837bbed3ea6",
+      "captured_at_utc": "2026-08-20T13:30:15Z",
+      "claim_key": "WINDOWS_TASK_SCHEDULER_LIFECYCLE_20260820",
+      "evidence_kind": "WINDOWS_LIFECYCLE",
+      "id": "WINDOWS_LIFECYCLE_20260820",
+      "relative_path": "lifecycle/lifecycle-probe-report.json",
+      "scope": "Target-host no-IB and read-only PASS, FAIL, and HOLD lifecycle; HOLD survived launcher exit, PID disappeared after Scheduler stop, and no unexpected descendants were observed. Cleanup 0/0 is bound separately by candidate-tree review evidence.",
+      "sensitivity": "REDACTED",
+      "sha256": "8d1e02ac1e1b5b4f266770c54346d2adf12c1fa8600244c9e77870825b7e1077",
+      "verdict": "PASS"
+    },
+    {
+      "binding": "BOUND_AUTHORITY",
+      "bytes": 31054,
+      "capture_commit": "c88cf2463ba1a93940172e579575636f2778f457",
+      "captured_at_utc": "2026-08-20T17:57:15Z",
+      "claim_key": "WINDOWS_TASK_SCHEDULER_CLEANUP_REVIEW_20260820",
+      "evidence_kind": "WINDOWS_LIFECYCLE",
+      "id": "WINDOWS_LIFECYCLE_CLEANUP_REVIEW_20260820",
+      "relative_path": "repo/docs/GATE_B2_STATUS_20260810_ZH.md",
+      "scope": "Candidate-tree secondary review records the lifecycle report hash, size, execution tree, and post-cleanup 0 matching tasks, 0 probe PIDs, 0 raw files, and 0 stderr bytes; it does not replace the primary report.",
+      "sensitivity": "PUBLIC_METADATA",
+      "sha256": "72713f8d24c0d6c64e3cb095dbb8cc5d85c24c1da4fd79f6f2b6feaca6179526",
+      "verdict": "PASS"
+    },
+    {
+      "binding": "BOUND_AUTHORITY",
+      "bytes": 13675,
+      "capture_commit": "c88cf2463ba1a93940172e579575636f2778f457",
+      "captured_at_utc": "2026-08-20T17:57:15Z",
+      "claim_key": "IB_DOCUMENTED_VS_OBSERVED_REVIEW_20260820",
+      "evidence_kind": "DOCUMENTED_VS_OBSERVED",
+      "id": "DOCUMENTED_VS_OBSERVED_20260820",
+      "relative_path": "repo/docs/DOCUMENTED_VS_OBSERVED.md",
+      "scope": "Official review and bounded direct observations, preserving execution-window ambiguity, snapshot non-guarantees, and untested order behavior.",
+      "sensitivity": "PUBLIC_METADATA",
+      "sha256": "72ae95daa36378ec1139bde349643b8ae29501f01b2ee31d667be49de91e824d",
+      "verdict": "PARTIALLY_VERIFIED"
+    },
+    {
+      "binding": "BOUND_AUTHORITY",
+      "bytes": 9961,
+      "capture_commit": "c88cf2463ba1a93940172e579575636f2778f457",
+      "captured_at_utc": "2026-08-20T17:57:15Z",
+      "claim_key": "FULL_RTH_20260813_APPX_TERMINATION",
+      "evidence_kind": "INCIDENT",
+      "id": "APPX_INCIDENT_20260813",
+      "relative_path": "repo/docs/INCIDENT_FULL_RTH_20260813_APPX_TERMINATION_ZH.md",
+      "scope": "Preserves the unfinished Full-RTH incident and owner testimony that Codex closure caused AppX teardown; not classified as an IB or Recorder product failure.",
+      "sensitivity": "PUBLIC_METADATA",
+      "sha256": "a5b9a636608b2d71fbb4dc89ebeb6535929637b84e61547cf9487cd26fbd1ee3",
+      "verdict": "FAIL"
+    },
+    {
+      "binding": "BOUND_AUTHORITY",
+      "bytes": 1025,
+      "capture_commit": "c88cf2463ba1a93940172e579575636f2778f457",
+      "captured_at_utc": "2026-08-20T17:57:10Z",
+      "claim_key": "CI_106_WINDOWS_NTFS",
+      "evidence_kind": "CI_ARTIFACT",
+      "id": "CI_WINDOWS_NTFS_106",
+      "relative_path": "ci_windows/manifest.json",
+      "scope": "Exact-head Windows NTFS publication and ownership manifest only; ordinary CI does not substitute for B2 runtime evidence.",
+      "sensitivity": "PUBLIC_METADATA",
+      "sha256": "bc98ba2bab7c0c9ad669fa9e673f2e65e3d0c1db6e41d1d05b6c16c52f5cae1b",
+      "verdict": "PASS"
+    },
+    {
+      "binding": "BOUND_AUTHORITY",
+      "bytes": 4140,
+      "capture_commit": "c88cf2463ba1a93940172e579575636f2778f457",
+      "captured_at_utc": "2026-08-20T17:56:45Z",
+      "claim_key": "CI_74_REAL_DM_DELAY_FSYNC",
+      "evidence_kind": "CI_ARTIFACT",
+      "id": "CI_FSYNC_74",
+      "relative_path": "fsync/manifest.json",
+      "scope": "Exact-head real dm-delay fsync-stall manifest with durable fence and zero post-fault broker writes; not an IB observation.",
+      "sensitivity": "PUBLIC_METADATA",
+      "sha256": "9c4a40a67a3c6bb01e0935cfd033aa6584a12c061c1826ae89f043d8a9a8b720",
+      "verdict": "PASS"
+    }
+  ],
+  "freeze_kind": "B2_READ_ONLY_EVIDENCE",
+  "owner_acceptance": {
+    "accepted_at_utc": "2026-08-20T18:18:07Z",
+    "accepted_authority_evidence_ids": [
+      "V4_HEALTH_20260818",
+      "V4_AMENDMENT_BYTES_20260818",
+      "V3_FAIL_REVIEW_20260820",
+      "WINDOWS_LIFECYCLE_20260820",
+      "WINDOWS_LIFECYCLE_CLEANUP_REVIEW_20260820",
+      "DOCUMENTED_VS_OBSERVED_20260820",
+      "APPX_INCIDENT_20260813",
+      "CI_WINDOWS_NTFS_106",
+      "CI_FSYNC_74"
+    ],
+    "accepted_risk_assumption_ids": [
+      "D1_EVENT_DRIVEN_30S",
+      "D2_WRITER_LAG_ROOT_CAUSE"
+    ],
+    "accepted_unknown_ids": [
+      "V3_ORIGINAL_ACL_REHASH",
+      "EXECUTION_WINDOW_AMBIGUITY",
+      "SNAPSHOT_ATOMICITY_NOT_GUARANTEED",
+      "NONEMPTY_RECONCILIATION_NOT_VERIFIED",
+      "ORDER_LIFECYCLE_NOT_VERIFIED"
+    ],
+    "decision": "ACCEPT_EVIDENCE_SCOPE_AND_RESIDUAL_RISK",
+    "gate_b2_decision": "REMAIN_READ_ONLY_IN_PROGRESS",
+    "order_capability": "NOT_AUTHORIZED",
+    "owner": "Roy"
+  },
+  "required_failures": [
+    "V3_FAIL_REVIEW_20260820",
+    "APPX_INCIDENT_20260813"
+  ],
+  "risk_assumptions": [
+    {
+      "blocks_b2_read_only_freeze": false,
+      "failure_mode": "Short synchronized feed degradation or a different asset or session microstructure may evade hard escalation.",
+      "id": "D1_EVENT_DRIVEN_30S",
+      "mitigation": "Retain BAR_5S, farm state, connectivity, raw accounting, and advisory gap evidence; review multiple sessions before production.",
+      "required_review_before": "PRODUCTION_OR_ORDER_CAPABLE_PAPER_LIVE",
+      "statement": "The accepted 30-second BID_ASK and ALL_LAST event-driven threshold is limited to the reviewed SPY RTH evidence scope.",
+      "status": "OPEN_REVIEW_REQUIRED"
+    },
+    {
+      "blocks_b2_read_only_freeze": false,
+      "failure_mode": "Antivirus, paging, flush stall, resource contention, or queue pressure may reproduce unsafe lag.",
+      "id": "D2_WRITER_LAG_ROOT_CAUSE",
+      "mitigation": "Keep bounded queues and explicit lag, drop, error, and count checks; run a bounded reproducible storage probe before production review.",
+      "required_review_before": "PRODUCTION_OR_ORDER_CAPABLE_PAPER_LIVE",
+      "statement": "The observed writer lag is within threshold but its root cause and stability remain open.",
+      "status": "OPEN_REVIEW_REQUIRED"
+    }
+  ],
+  "safety_boundary": {
+    "gate_b2": "READ_ONLY_IN_PROGRESS",
+    "order_authorization": "NONE",
+    "trading_adapter": "NOT_IMPLEMENTED"
+  },
+  "schema_version": 2,
+  "unknowns": [
+    {
+      "blocks_b2_read_only_freeze": false,
+      "id": "V3_ORIGINAL_ACL_REHASH",
+      "review_before": "PRODUCTION_OR_ORDER_CAPABLE",
+      "statement": "Original v3 health and manifest sidecars return PermissionError to the current audit process; registered historical digests are not independently rehashed.",
+      "status": "NOT_VERIFIED"
+    },
+    {
+      "blocks_b2_read_only_freeze": false,
+      "id": "EXECUTION_WINDOW_AMBIGUITY",
+      "review_before": "PRODUCTION_OR_ORDER_CAPABLE",
+      "statement": "Official IB pages conflict between current-day-since-midnight and last-24-hours execution visibility.",
+      "status": "AMBIGUOUS"
+    },
+    {
+      "blocks_b2_read_only_freeze": false,
+      "id": "SNAPSHOT_ATOMICITY_NOT_GUARANTEED",
+      "review_before": "PRODUCTION_OR_ORDER_CAPABLE",
+      "statement": "Per-request completion callbacks are not an official atomic or mutually consistent broker snapshot guarantee.",
+      "status": "NOT_GUARANTEED"
+    },
+    {
+      "blocks_b2_read_only_freeze": false,
+      "id": "NONEMPTY_RECONCILIATION_NOT_VERIFIED",
+      "review_before": "PRODUCTION_OR_ORDER_CAPABLE",
+      "statement": "Nonempty positions, working orders, executions, and cross-client visibility remain unverified.",
+      "status": "NOT_VERIFIED"
+    },
+    {
+      "blocks_b2_read_only_freeze": false,
+      "id": "ORDER_LIFECYCLE_NOT_VERIFIED",
+      "review_before": "PRODUCTION_OR_ORDER_CAPABLE",
+      "statement": "Order identity, submission ambiguity, modify, cancel, fill, commission, and late callbacks are not tested or authorized.",
+      "status": "NOT_VERIFIED"
+    }
+  ]
+}
