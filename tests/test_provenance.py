@@ -226,22 +226,95 @@ GATE_PASS_CLAIMS = re.compile(
     r"|b1\s*已\s*正式通过)"
 )
 
+CURRENT_STATUS_DOCS = (
+    "README.md",
+    "docs/IMPLEMENTATION_STATUS.md",
+    "docs/GATE_B2_STATUS_20260810_ZH.md",
+)
+CURRENT_STATUS_MARKER = re.compile(
+    r"provenance-current:\s*([a-z0-9_]+)=([A-Za-z0-9_,.-]+)"
+)
+HISTORICAL_GATE_STATUS_DOCS = {
+    "docs/FINAL_EXECUTION_PLAN_ZH.md",
+    "docs/FULL_RTH_ACCEPTANCE_20260818_REVIEW_ZH.md",
+    "docs/GATE_B2_REVIEW_20260810.md",
+}
+
+
+def _current_doc_values(state: dict) -> dict[str, str]:
+    status = state["gate_status"]
+    keys = (
+        "gate_b1_attested_freeze",
+        "gate_b1_covers_worktree",
+        "gate_b2",
+        "order_authorization",
+        "trading_adapter",
+        "gate_b2_read_only_evidence_candidate",
+        "gate_b2_read_only_evidence_commit",
+        "gate_b2_read_only_evidence_code_identity_matches_current_tree",
+    )
+    values = {
+        key: str(status[key]).lower() if isinstance(status[key], bool) else str(status[key])
+        for key in keys
+    }
+    values["gate_b2_read_only_evidence_drift_components"] = (
+        ",".join(status["gate_b2_read_only_evidence_drift_components"]) or "none"
+    )
+    return values
+
+
+def test_living_docs_current_status_is_bidirectionally_guarded() -> None:
+    state = provenance.load_state(ROOT)
+    assert state is not None
+    expected = _current_doc_values(state)
+    for name in CURRENT_STATUS_DOCS:
+        lines = (ROOT / name).read_text(encoding="utf-8").splitlines()
+        markers: dict[str, str] = {}
+        for lineno, line in enumerate(lines, 1):
+            match = CURRENT_STATUS_MARKER.search(line)
+            if match is None:
+                continue
+            key, value = match.groups()
+            assert key not in markers, f"{name}:{lineno} duplicates current marker {key}"
+            markers[key] = value
+            assert f"`{value}`" in line[: match.start()], (
+                f"{name}:{lineno} marker and rendered value disagree for {key}"
+            )
+        assert markers == expected, (
+            f"{name} current-state markers drifted: "
+            f"missing={sorted(set(expected) - set(markers))}, "
+            f"unknown={sorted(set(markers) - set(expected))}, "
+            "changed="
+            + repr(
+                sorted(
+                    key for key in expected if markers.get(key) not in {None, expected[key]}
+                )
+            )
+        )
+
 
 def test_docs_do_not_restate_gate_status_by_hand():
     state = provenance.load_state(ROOT)
     assert state is not None
-    if state["gate_status"]["gate_b1_attested_freeze"] is not None:
-        return
+    freeze = state["gate_status"]["gate_b1_attested_freeze"]
+    freeze_tokens = {freeze, freeze[:12]} if freeze else set()
     offenders = []
     for path in tracked_files():
         if path.suffix != ".md" or not path.exists():
             continue
+        rel = path.relative_to(ROOT).as_posix()
         for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            if GATE_PASS_CLAIMS.search(line) and not ALLOW_MARKER.search(line):
-                offenders.append(f"{path.relative_to(ROOT).as_posix()}:{lineno}")
+            if not GATE_PASS_CLAIMS.search(line) or ALLOW_MARKER.search(line):
+                continue
+            if rel in CURRENT_STATUS_DOCS:
+                if not any(token and token in line for token in freeze_tokens):
+                    offenders.append(f"{rel}:{lineno}: living claim lacks current freeze")
+            elif rel not in HISTORICAL_GATE_STATUS_DOCS and not rel.startswith(
+                "docs/GATE_B1_SIGNOFF_"
+            ):
+                offenders.append(f"{rel}:{lineno}: historical claim is not allowlisted")
     assert not offenders, (
-        f"docs claim Gate B1 passed while STATE.json records "
-        f"no historical attested freeze: {offenders}"
+        "docs contain unguarded Gate B1 status claims: " + repr(offenders)
     )
 
 

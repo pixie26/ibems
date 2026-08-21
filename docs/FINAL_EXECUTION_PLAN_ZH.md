@@ -1,5 +1,7 @@
 # IB Execution Platform 最终设计与执行方案
 
+> **2026-08-22 amendment：** 本文是历史 dated/frozen 计划，正文中的测试计数和 Gate 标签保留原始语境，不作为当前状态。后续顺序由 [`EXECUTION_PLATFORM_IMPLEMENTATION_PLAN_20260822_ZH.md`](EXECUTION_PLATFORM_IMPLEMENTATION_PLAN_20260822_ZH.md) 接续；P0 当前实施证据见 [`EXECUTION_PLATFORM_P0_IMPLEMENTATION_AMENDMENT_20260822_ZH.md`](EXECUTION_PLATFORM_P0_IMPLEMENTATION_AMENDMENT_20260822_ZH.md)。机器状态只以根目录 `STATE.json` 为准。
+
 版本：v0.1.5.dev0 Phase 0 reviewed  
 日期：2026-08-06
 

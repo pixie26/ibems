@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, MutableMapping, Sequence
 
-from . import b2_evidence
+from . import b2_evidence, tree_identity
 
 CHUNK_BYTES = 1024 * 1024
 DEFAULT_MANIFEST_BUDGET_BYTES = 256 * 1024
@@ -144,7 +144,31 @@ def _digest_named_git_blobs(run_git: GitRunner, commit: str, paths: Sequence[str
 
 
 def derive_candidate_from_git(repo_root: Path, commit: str) -> tuple[dict[str, str], int]:
-    """Derive candidate identity without reading source bytes from the worktree."""
+    """Derive current canonical identity from exact Git-object bytes."""
+    run_git: GitRunner = lambda arguments: _run_git(repo_root, arguments)
+    tree, _ = _commit_identity(run_git, commit)
+    paths = _git_paths(run_git, commit)
+    try:
+        identity = tree_identity.derive_from_versioned_paths(
+            paths, lambda path: _git_blob(run_git, commit, path)
+        )
+    except tree_identity.TreeIdentityError as exc:
+        raise B2MaterialVerificationError(f"candidate tree identity is invalid: {exc}") from exc
+    if "STATE.json" not in paths:
+        raise B2MaterialVerificationError("candidate tree is missing STATE.json")
+    observed = {
+        "commit_sha": commit,
+        "tree_sha": tree,
+        "source_tree_sha256": identity.source_tree_sha256,
+        "config_tree_sha256": identity.config_tree_sha256,
+        "dependency_lock_sha256": identity.dependency_lock_sha256,
+    }
+    _validate_candidate_state(run_git, commit, observed)
+    return observed, len(paths)
+
+
+def derive_candidate_from_git_v2(repo_root: Path, commit: str) -> tuple[dict[str, str], int]:
+    """Preserve the exact schema-v2 identity semantics for frozen history."""
     run_git: GitRunner = lambda arguments: _run_git(repo_root, arguments)
     tree, _ = _commit_identity(run_git, commit)
     paths = _git_paths(run_git, commit)
@@ -165,13 +189,6 @@ def derive_candidate_from_git(repo_root: Path, commit: str) -> tuple[dict[str, s
         raise B2MaterialVerificationError("candidate tree is missing uv.lock")
     if "STATE.json" not in paths:
         raise B2MaterialVerificationError("candidate tree is missing STATE.json")
-    state_raw = _git_blob(run_git, commit, "STATE.json")
-    try:
-        state = json.loads(state_raw)
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise B2MaterialVerificationError("candidate STATE.json is invalid JSON") from exc
-    tree_state = state.get("tree", {})
-    gate = state.get("gate_status", {})
     observed = {
         "commit_sha": commit,
         "tree_sha": tree,
@@ -181,6 +198,20 @@ def derive_candidate_from_git(repo_root: Path, commit: str) -> tuple[dict[str, s
             _git_blob(run_git, commit, "uv.lock")
         ).hexdigest(),
     }
+    _validate_candidate_state(run_git, commit, observed)
+    return observed, len(paths)
+
+
+def _validate_candidate_state(
+    run_git: GitRunner, commit: str, observed: Mapping[str, str]
+) -> None:
+    state_raw = _git_blob(run_git, commit, "STATE.json")
+    try:
+        state = json.loads(state_raw)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise B2MaterialVerificationError("candidate STATE.json is invalid JSON") from exc
+    tree_state = state.get("tree", {})
+    gate = state.get("gate_status", {})
     for key in ("source_tree_sha256", "config_tree_sha256", "dependency_lock_sha256"):
         if tree_state.get(key) != observed[key]:
             raise B2MaterialVerificationError(
@@ -194,7 +225,6 @@ def derive_candidate_from_git(repo_root: Path, commit: str) -> tuple[dict[str, s
     for key, expected in expected_boundary.items():
         if gate.get(key) != expected:
             raise B2MaterialVerificationError(f"candidate STATE.json {key} must remain {expected}")
-    return observed, len(paths)
 
 
 def load_controlled_roots(path: Path) -> dict[str, Path]:
@@ -656,9 +686,12 @@ def verify_materials(
         str(candidate.get("commit_sha", ""))
     ):
         raise B2MaterialVerificationError("manifest must declare a full candidate commit")
-    observed_candidate, git_count = derive_candidate_from_git(
-        repo_root, candidate["commit_sha"]
+    derive_candidate = (
+        derive_candidate_from_git_v2
+        if payload.get("schema_version") == 2
+        else derive_candidate_from_git
     )
+    observed_candidate, git_count = derive_candidate(repo_root, candidate["commit_sha"])
     if populate_observed:
         candidate.update(observed_candidate)
     elif candidate != observed_candidate:

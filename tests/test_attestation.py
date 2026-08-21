@@ -29,6 +29,11 @@ def _init_repo(root: Path) -> str:
     # global Windows autocrlf setting silently rewrite the fixture on add.
     _git(root, "config", "core.autocrlf", "false")
     (root / "README.md").write_text("freeze\n", encoding="utf-8")
+    for folder in ("src", "tests", "scripts"):
+        (root / folder).mkdir()
+    (root / "src" / "fixture.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (root / "pyproject.toml").write_text("[project]\nname='gate-fixture'\n", encoding="utf-8")
+    (root / "uv.lock").write_text("version = 1\n", encoding="utf-8")
     config = root / "config" / "risk.example.yml"
     config.parent.mkdir(parents=True)
     config.write_text(
@@ -37,7 +42,8 @@ def _init_repo(root: Path) -> str:
         "max_overnight_loss: 500\n",
         encoding="utf-8",
     )
-    _git(root, "add", "README.md", "config/risk.example.yml")
+    (root / "config" / "paper.example.yml").write_text("read_only: true\n", encoding="utf-8")
+    _git(root, "add", ".")
     _git(root, "commit", "-m", "freeze")
     return _git(root, "rev-parse", "HEAD")
 
@@ -226,7 +232,7 @@ def test_any_behavior_commit_after_attestation_invalidates_old_pass(tmp_path: Pa
     )
     _git(tmp_path, "commit", "-m", "attest B1")
 
-    (tmp_path / "src").mkdir()
+    (tmp_path / "src").mkdir(exist_ok=True)
     (tmp_path / "src" / "behavior.py").write_text("CHANGED = True\n", encoding="utf-8")
     _git(tmp_path, "add", "src/behavior.py")
     _git(tmp_path, "commit", "-m", "change behavior")

@@ -1,6 +1,20 @@
-# Implementation status — v0.1.5.dev0
+# Implementation status — v0.1.5.dev0（更新至 2026-08-22）
 
-> 本文主体是 Phase 0/B1 工程过程记录，部分冻结标签和 B2 blocker 描述保留了当时语境。当前权威的人类可读状态见 [`GATE_B2_STATUS_20260810_ZH.md`](GATE_B2_STATUS_20260810_ZH.md)：Gate B1 已在 commit `117188cea539...` PASS；Gate B2 为 `READ-ONLY IN PROGRESS`，尚未 PASS，也未授权订单。
+> 本文主体是 Phase 0/B1 工程过程记录，部分冻结标签和 B2 blocker 描述保留了当时语境。2026-08-22 的当前进度见 [`EXECUTION_PLATFORM_P0_IMPLEMENTATION_AMENDMENT_20260822_ZH.md`](EXECUTION_PLATFORM_P0_IMPLEMENTATION_AMENDMENT_20260822_ZH.md)。`STATE.json` 是机器权威；Gate B2 尚未 PASS，也未授权订单。
+
+## 当前机器状态
+
+| 机器字段 | 当前派生值 |
+|---|---|
+| `gate_b1_attested_freeze` | `e90c1f4b464c83898c036055b27e17f7eb0da0eb` | <!-- provenance-current: gate_b1_attested_freeze=e90c1f4b464c83898c036055b27e17f7eb0da0eb -->
+| `gate_b1_covers_worktree` | `false` | <!-- provenance-current: gate_b1_covers_worktree=false -->
+| `gate_b2` | `READ_ONLY_IN_PROGRESS` | <!-- provenance-current: gate_b2=READ_ONLY_IN_PROGRESS -->
+| `order_authorization` | `NONE` | <!-- provenance-current: order_authorization=NONE -->
+| `trading_adapter` | `NOT_IMPLEMENTED` | <!-- provenance-current: trading_adapter=NOT_IMPLEMENTED -->
+| B2 read-only candidate | `c88cf2463ba1a93940172e579575636f2778f457` | <!-- provenance-current: gate_b2_read_only_evidence_candidate=c88cf2463ba1a93940172e579575636f2778f457 -->
+| B2 frozen manifest commit | `d679e879784e0bb45ff6a002d9b3a0de8f2bc66e` | <!-- provenance-current: gate_b2_read_only_evidence_commit=d679e879784e0bb45ff6a002d9b3a0de8f2bc66e -->
+| B2 candidate identity matches current tree | `false` | <!-- provenance-current: gate_b2_read_only_evidence_code_identity_matches_current_tree=false -->
+| B2 identity drift | `source` | <!-- provenance-current: gate_b2_read_only_evidence_drift_components=source -->
 
 ## 历史 Phase 0 冻结标签
 
@@ -14,9 +28,9 @@ DO NOT CONNECT THE TRADING ADAPTER TO IB PAPER OR LIVE
 上面的代码块是该工程记录创建时的历史标签，不是当前 Gate 判定。当前标签为：
 
 ```text
-Gate B1 PASS recorded for exact-freeze commit 117188cea539...
-STATE.json: gate_b1_attested_freeze = 117188cea539...
-STATE.json: gate_b1_covers_worktree = false for current B2 HEAD
+Historical Gate B1 attestation: e90c1f4b464c...
+STATE.json: gate_b1_attested_freeze = e90c1f4b464c...
+STATE.json: gate_b1_covers_worktree = false for current P0 candidate
 Gate B2 READ-ONLY IN PROGRESS; NOT PASS
 NO PAPER-ORDER OR LIVE-ORDER AUTHORIZATION
 ```

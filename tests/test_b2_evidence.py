@@ -159,6 +159,18 @@ def test_boolean_cannot_impersonate_schema_version_two() -> None:
         b2_evidence.validate_manifest(payload)
 
 
+def test_schema_dispatch_preserves_v2_and_fails_closed_for_unknown_versions() -> None:
+    payload = _manifest(owner=True)
+    b2_evidence.validate_manifest_v2(payload, require_owner_acceptance=True)
+    payload["schema_version"] = 3
+    with pytest.raises(b2_evidence.B2EvidenceValidationError, match="no validator registered"):
+        b2_evidence.validate_manifest(payload, require_owner_acceptance=True)
+
+    payload["schema_version"] = 1
+    with pytest.raises(b2_evidence.B2EvidenceValidationError, match="unsupported historical"):
+        b2_evidence.validate_manifest(payload)
+
+
 @pytest.mark.parametrize(
     ("location", "key"),
     [

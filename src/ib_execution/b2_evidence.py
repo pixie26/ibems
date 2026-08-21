@@ -563,10 +563,10 @@ def _validate_owner_acceptance(
             _fail(f"owner_acceptance.{key}", "must exactly accept the manifest ids")
 
 
-def validate_manifest(
+def validate_manifest_v2(
     payload: Mapping[str, Any], *, require_owner_acceptance: bool = False
 ) -> None:
-    """Validate structure and cross-field safety semantics.
+    """Validate the immutable schema-v2 structure and safety semantics.
 
     This F1 validator intentionally does not prove that referenced bytes exist
     or match Git/disk.  That is the F2 builder's job.  A valid F1 packet is a
@@ -574,7 +574,7 @@ def validate_manifest(
     """
     manifest = _mapping(payload, "manifest")
     _exact_keys(manifest, TOP_LEVEL_KEYS, "manifest")
-    if isinstance(manifest["schema_version"], bool) or manifest["schema_version"] != SCHEMA_VERSION:
+    if isinstance(manifest["schema_version"], bool) or manifest["schema_version"] != 2:
         _fail("schema_version", f"must be {SCHEMA_VERSION}")
     if manifest["freeze_kind"] != FREEZE_KIND:
         _fail("freeze_kind", f"must be {FREEZE_KIND}")
@@ -603,6 +603,39 @@ def validate_manifest(
         risk_ids=risk_ids,
         required=require_owner_acceptance,
     )
+
+
+def validate_manifest_v3_or_later(
+    payload: Mapping[str, Any], *, require_owner_acceptance: bool = False
+) -> None:
+    """Fail closed until a reviewed v3+ schema is registered."""
+    del require_owner_acceptance
+    manifest = _mapping(payload, "manifest")
+    version = manifest.get("schema_version")
+    if isinstance(version, bool) or not isinstance(version, int) or version < 3:
+        _fail("schema_version", "must be an integer >= 3")
+    _fail("schema_version", f"unsupported schema version {version}; no validator registered")
+
+
+def validate_manifest(
+    payload: Mapping[str, Any], *, require_owner_acceptance: bool = False
+) -> None:
+    """Dispatch to an exact version validator; unknown versions fail closed."""
+    manifest = _mapping(payload, "manifest")
+    version = manifest.get("schema_version")
+    if isinstance(version, bool):
+        _fail("schema_version", f"must be {SCHEMA_VERSION}")
+    if not isinstance(version, int):
+        _fail("schema_version", "must be an integer")
+    if version == 2:
+        validate_manifest_v2(payload, require_owner_acceptance=require_owner_acceptance)
+        return
+    if version >= 3:
+        validate_manifest_v3_or_later(
+            payload, require_owner_acceptance=require_owner_acceptance
+        )
+        return
+    _fail("schema_version", f"unsupported historical schema version {version}")
 
 
 def build_manifest(**fields: Any) -> dict[str, Any]:

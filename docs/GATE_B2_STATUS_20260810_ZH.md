@@ -1,10 +1,10 @@
 # Gate B2 当前状态摘要（2026-08-10）
 
-初始截止时间：`2026-08-10 23:08 HKT`；本摘要更新至 `2026-08-20`。
+初始截止时间：`2026-08-10 23:08 HKT`；本摘要更新至 `2026-08-22`。
 
 ## 1. 当前正式结论
 
-- **Gate B1：PASS**，绑定 exact-freeze commit `117188cea53906665739af3775af64d156856f41`。
+- **Gate B1 历史 attestation：有效**，最新绑定 exact-freeze commit `e90c1f4b464c83898c036055b27e17f7eb0da0eb`；当前 P0 candidate 尚未重新 campaign，coverage 为 false。
 - **Gate B2：READ-ONLY IN PROGRESS，尚未 PASS。**
 - 当前只允许 IB Gateway paper account 的只读协议验证；没有发送订单，也没有获得 paper-order 或 live-order 授权。
 - Gateway 的 Read-Only API 保护保持开启。不能为了补齐 `completed orders` 而关闭该保护。
@@ -18,6 +18,19 @@
 - **2026-08-13 Full-RTH 复测因 operator 手动关闭 Codex 而中断。** Owner 已明确确认该动作；Recorder 在三路仍为 LIVE、liveness 正常时于 23:35 HKT 被强制终止，Windows event 217 同时证明其父 Codex Desktop AppX container 被销毁。直接原因不是 P0 recovery 复发或 Recorder 产品故障，而是本轮长时进程依赖了交互式 Codex/AppX 生命周期。独立 Task Scheduler launcher 已实现并完成无 IB 本机探针；下一次必须用新 root/client id 从该 launcher 启动完整 RTH。详见 [`INCIDENT_FULL_RTH_20260813_APPX_TERMINATION_ZH.md`](INCIDENT_FULL_RTH_20260813_APPX_TERMINATION_ZH.md)。
 - **2026-08-18 已由独立 Task Scheduler host 完成一次全日 capture→finalize。** v3 保留历史 FAIL；v4 为 `health_ok=true`。Owner 于 2026-08-20 接受 SPY/RTH 的 30 秒 event-driven observation threshold，并批准 v4 作为 Full-RTH 最终 health authority。Windows v4 sidecar 的历史 CRLF/预写入摘要差异已逐字节界定，未来写入修复已交付；受 ACL 限制的 v3/Parquet 仍按 `partially verified` 登记，writer-lag 根因保持 OPEN。因此该轮称为“v4 health PASS”，但不单独升级 Gate B2。
 - **2026-08-20 已完成 IBKR 官方页面逐项复核。** 所有旧待复核项已转换为明确的 documented、official ambiguity、not-guaranteed 或 out-of-scope 结论。新增硬边界包括 executions 回看窗口的官方冲突、各请求 end callback 不构成原子 snapshot、all-open-orders 可见性依赖 client/session 配置，以及 completed-orders 的 Read-Only 行为只能按真实观测登记。
+- **2026-08-22 P0 candidate 已在本地实现。** canonical tree identity、schema-v2 历史 validator、`STATE.json` v4 派生字段和 frozen manifest Git-object 回归已落地；当前机器派生为 B2 candidate code identity mismatch，drift component=`source`。这只是结构与代码身份结论，不重新验证外部 artifact bytes，也不证明历史 Gateway 观测适用于当前树。
+
+| 机器字段 | 当前派生值 |
+|---|---|
+| `gate_b1_attested_freeze` | `e90c1f4b464c83898c036055b27e17f7eb0da0eb` | <!-- provenance-current: gate_b1_attested_freeze=e90c1f4b464c83898c036055b27e17f7eb0da0eb -->
+| `gate_b1_covers_worktree` | `false` | <!-- provenance-current: gate_b1_covers_worktree=false -->
+| `gate_b2` | `READ_ONLY_IN_PROGRESS` | <!-- provenance-current: gate_b2=READ_ONLY_IN_PROGRESS -->
+| `order_authorization` | `NONE` | <!-- provenance-current: order_authorization=NONE -->
+| `trading_adapter` | `NOT_IMPLEMENTED` | <!-- provenance-current: trading_adapter=NOT_IMPLEMENTED -->
+| B2 read-only candidate | `c88cf2463ba1a93940172e579575636f2778f457` | <!-- provenance-current: gate_b2_read_only_evidence_candidate=c88cf2463ba1a93940172e579575636f2778f457 -->
+| B2 frozen manifest commit | `d679e879784e0bb45ff6a002d9b3a0de8f2bc66e` | <!-- provenance-current: gate_b2_read_only_evidence_commit=d679e879784e0bb45ff6a002d9b3a0de8f2bc66e -->
+| B2 candidate identity matches current tree | `false` | <!-- provenance-current: gate_b2_read_only_evidence_code_identity_matches_current_tree=false -->
+| B2 identity drift | `source` | <!-- provenance-current: gate_b2_read_only_evidence_drift_components=source -->
 
 详细事故事实、owner“没有主动登录真实账户”的明确陈述、API log 边界、P0 修复与复测条件见
 [`INCIDENT_FULL_RTH_20260812_ZH.md`](INCIDENT_FULL_RTH_20260812_ZH.md)；2026-08-13 的 AppX 连带终止见
@@ -224,3 +237,4 @@ source、tests、docs 与后续真实 Gateway 证据仍需在最终 freeze 中�
 - [`FULL_RTH_ACCEPTANCE_20260818_EVIDENCE_FOLLOWUP_20260820_ZH.md`](FULL_RTH_ACCEPTANCE_20260818_EVIDENCE_FOLLOWUP_20260820_ZH.md)：Windows 主机 evidence 跟进；已确认 exact commit `34f3ac4`、登记可读取的小型 artifact 摘要，并记录 Windows v4 sidecar 的 CRLF/摘要缺陷及修复。D1 已批准 v4 authority；D2 明确保持 writer-lag 根因 OPEN；两项均进入后续 assumption review，且按 owner 决定不阻塞 B2 freeze。
 - [`BRANCH_INVENTORY_20260819_ZH.md`](BRANCH_INVENTORY_20260819_ZH.md)：分支清点、两条活跃分支的整合方案与清理清单。
 - [`GATE_B1_SIGNOFF_117188cea539.md`](GATE_B1_SIGNOFF_117188cea539.md)：Gate B1 exact-freeze owner acceptance；其范围不包含真实 IB 行为。
+- [`EXECUTION_PLATFORM_P0_IMPLEMENTATION_AMENDMENT_20260822_ZH.md`](EXECUTION_PLATFORM_P0_IMPLEMENTATION_AMENDMENT_20260822_ZH.md)：P0 当前本地实现、验证边界、coverage 结构性成因与下一步 campaign 顺序。

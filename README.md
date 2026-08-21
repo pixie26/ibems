@@ -8,16 +8,30 @@
 
 > **安全状态：禁止把交易 Adapter 连接到 IB Paper 或 Live。**
 >
-> **Gate B1 已在 exact-freeze commit `117188cea539...` 正式 PASS；这不证明真实 IB Gateway 行为，也不授权订单。Gate B2 当前为 `READ-ONLY IN PROGRESS`，尚未 PASS。** 当前工作树包含 B1 freeze 之后的 B2 只读测试改动，因此不能用 B1 attestation 为这些新改动背书。最新状态、证据边界和下一步见 [Gate B2 当前状态摘要](docs/GATE_B2_STATUS_20260810_ZH.md)。
+> **历史 Gate B1 attestation 绑定 `e90c1f4b464c...`；当前 P0 candidate 尚未经过新的 formal campaign，因此 `gate_b1_covers_worktree=false`。Gate B2 仍为 `READ_ONLY_IN_PROGRESS`，没有订单授权。** B2 frozen manifest 已进入真实 Git-object 回归，但其 code identity 与当前树不匹配；这不表示历史观测适用于当前代码。最新边界见 [Gate B2 当前状态摘要](docs/GATE_B2_STATUS_20260810_ZH.md)和 [P0 实施 amendment](docs/EXECUTION_PLATFORM_P0_IMPLEMENTATION_AMENDMENT_20260822_ZH.md)。
 
 核心原则只有一句：**安全优先于可用性；无法证明状态可信时就停止。**
 
 ## 当前状态
 
+下表由 `tests/test_provenance.py` 与 `STATE.json` 双向校验；修改机器状态后若未同步本文，CI 会失败。
+
+| 机器字段 | 当前派生值 |
+|---|---|
+| `gate_b1_attested_freeze` | `e90c1f4b464c83898c036055b27e17f7eb0da0eb` | <!-- provenance-current: gate_b1_attested_freeze=e90c1f4b464c83898c036055b27e17f7eb0da0eb -->
+| `gate_b1_covers_worktree` | `false` | <!-- provenance-current: gate_b1_covers_worktree=false -->
+| `gate_b2` | `READ_ONLY_IN_PROGRESS` | <!-- provenance-current: gate_b2=READ_ONLY_IN_PROGRESS -->
+| `order_authorization` | `NONE` | <!-- provenance-current: order_authorization=NONE -->
+| `trading_adapter` | `NOT_IMPLEMENTED` | <!-- provenance-current: trading_adapter=NOT_IMPLEMENTED -->
+| B2 read-only candidate | `c88cf2463ba1a93940172e579575636f2778f457` | <!-- provenance-current: gate_b2_read_only_evidence_candidate=c88cf2463ba1a93940172e579575636f2778f457 -->
+| B2 frozen manifest commit | `d679e879784e0bb45ff6a002d9b3a0de8f2bc66e` | <!-- provenance-current: gate_b2_read_only_evidence_commit=d679e879784e0bb45ff6a002d9b3a0de8f2bc66e -->
+| B2 candidate identity matches current tree | `false` | <!-- provenance-current: gate_b2_read_only_evidence_code_identity_matches_current_tree=false -->
+| B2 identity drift | `source` | <!-- provenance-current: gate_b2_read_only_evidence_drift_components=source -->
+
 | 模块 | 状态 |
 |---|---|
-| 无 IB 依赖的执行核心 | Gate B1 已在 exact-freeze commit `117188cea539...` 完成正式 campaign、真实存储故障证据和 owner acceptance，结论为 PASS。当前 B2 工作树已有 freeze 后改动，必须单独验证，不能沿用 B1 attestation。 |
-| Hypothesis Gate campaign | B1 exact-freeze campaign 已通过；详细计数与 artifact digest 见 `docs/GATE_B1_SIGNOFF_117188cea539.md`。任何 B2 行为代码改动都需要绑定新的 tree 重新验证。 |
+| 无 IB 依赖的执行核心 | 历史 B1 attestation `e90c1f4b464c...` 有效；当前 P0 candidate 的 coverage 为 false，不能沿用该 attestation 为新代码背书。 |
+| Hypothesis Gate campaign | 最新历史 campaign 及 owner acceptance 见 `docs/GATE_B1_SIGNOFF_e90c1f4b464c.md`；P0 candidate 尚未运行新的 formal campaign。 |
 | 不变量 0 + 22 条安全不变量 | B1 exact-freeze 的 Property / Runtime / Auditor 与 B1.6 journal witness 已闭环。真实 IB reconciliation、unknown broker facts 和 callback 行为明确留给 B2，不属于 B1 PASS 的证明范围。 |
 | 只读 SPY Recorder / B2 preflight | Gateway 4002、server time、SPY `conId=756733`、account summary、空状态 broker snapshot、多 client、Gateway restart / `TerminateProcess` 已有直接观测。`OVERNIGHT` 和 `RTH+SMART` bounded Recorder 已 PASS；持订阅断网已观察 1100→1102。2026-08-12 Full-RTH 因错误 full reconnect / `10197` 提前 FAIL。2026-08-14 已保留 2,645,388 行完整收盘产物，原 v3 health 永久保持 FAIL；同一 immutable raw 的 production-finalizer replay 已通过资源/语义验收，create-only v4 reanalysis 为 `health_ok=true`。目标 Windows lifecycle 证据与下一次端到端 Full-RTH 尚未完成，因此仍不能称为 Full-RTH PASS。1101 仍未观察。 |
 | 交易型 IB Adapter | 未授权连接下单路径。`placeOrder`、`cancelOrder`、订单身份、完整 callback/error mapping 和非空动态 reconciliation 尚未在真实 Gateway 验证。 |
@@ -35,6 +49,8 @@
 - [Gate B2 exact-tree freeze 实施计划](docs/GATE_B2_EXACT_TREE_FREEZE_PLAN_20260820_ZH.md)
 - [Gate B2 只读 evidence schema 与 F2 实体审计](docs/GATE_B2_READ_ONLY_EVIDENCE_SCHEMA_V1_ZH.md)
 - [实施状态](docs/IMPLEMENTATION_STATUS.md)
+- [执行平台 P0 实施 amendment（2026-08-22）](docs/EXECUTION_PLATFORM_P0_IMPLEMENTATION_AMENDMENT_20260822_ZH.md)
+- [执行平台后续实施计划（2026-08-22）](docs/EXECUTION_PLATFORM_IMPLEMENTATION_PLAN_20260822_ZH.md)
 - [22 条不变量覆盖矩阵](docs/INVARIANT_COVERAGE.md)
 - [审查与执行结论](docs/REVIEW_AND_EXECUTION_20260806_ZH.md)
 
@@ -222,7 +238,7 @@ python -m ib_execution.execution_host --journal D:\ibems-data\journal.db \
 1. **策略 Gate A 独立推进。** 在策略仓库完成真实成本、数据质量和统计不确定性判断；若结论为 `NO_GO` 或 `INSUFFICIENT_EVIDENCE`，且没有独立第二消费者，就停止投资交易型 IB Adapter。
 2. **持三路订阅的受控断网已部分闭环。** production `run()` 已直接观察 1100→1102、不重订和恢复后逐流增量；1101 仍未观察，新 incident 生命周期尚未真实 fault 复测。不得为碰取 1101 重复断网。
 3. **Windows lifecycle 证据已完成。** 2026-08-20 在目标主机对 exact commit `6d159f8` 执行 no-IB PASS/FAIL/HOLD Scheduler probe：Task Scheduler 直接拥有同一个 Python/Recorder PID，HOLD 的 launcher 退出后 task 继续存活，`/End` 后 PID 消失，只有允许的 direct-child Windows console host，没有意外 child/grandchild。清理后测试 task `0`、probe PID `0`、raw 文件 `0`；原 v3 verdict 不变。
-4. **执行只读 B2 exact-tree freeze。** 官方 IB 文档逐项复核已于 2026-08-20 完成；新增的 executions window 官方歧义、非原子 snapshot 边界、cross-client 可见性限制与 completed-orders Read-Only 观测均已登记。candidate-v2 因 exact-CI、repo Git-blob 与 CI artifact provenance 缺口被独立 reviewer 拒绝；F1 [B2 evidence schema v2](docs/GATE_B2_READ_ONLY_EVIDENCE_SCHEMA_V2_ZH.md) 正在绑定 exact checkout identity、Git-object repo evidence 和 artifact archive/member。下一步按 [exact-tree freeze 实施计划](docs/GATE_B2_EXACT_TREE_FREEZE_PLAN_20260820_ZH.md) 完成 exact CI、生成并独立复核 candidate-v3，再进入 F3 metadata-only freeze。D1/D2 assumption review 按 owner 决定不阻塞本次只读 freeze，但任何 order-capable Paper/Live 或生产部署前仍必须完成。
+4. **完成 P0 candidate 的验证与重新冻结。** schema v2 frozen manifest 已从其提交 Git blob 回归验证；`STATE.json` v4 动态显示当前仅有 source drift。下一步先完成本地全套验证与 exact-commit CI，再在同一 candidate 上运行正式 B1 campaign 并取得 owner acceptance；attestation 后不得补文档或代码。D1/D2 review 仍必须在任何 order-capable Paper/Live 或生产部署前完成。
 5. **只读阶段不下单。** `completed orders` 被 Gateway Read-Only policy 阻断；不关闭保护追测。非空 reconciliation、订单身份和 callback 保留到另行授权的 paper-order 子阶段。
 6. **paper order 必须重新授权。** 只读证据封存后，owner 才单独决定是否运行 1 股 SPY paper-order protocol；B1 PASS 或 B2 只读结果都不自动构成该授权。MOC、多策略、live capital 和自动 watchdog takeover 继续推迟；live order 继续禁止。
 
