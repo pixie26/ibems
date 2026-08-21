@@ -41,6 +41,29 @@ def test_state_json_matches_worktree():
     )
 
 
+def test_b1_freeze_workflow_preserves_attestation_history_and_failure_evidence_roots():
+    """The formal campaign must not lose ancestry or mask an early failure."""
+    import yaml
+
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "b1-freeze-campaign.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    steps = workflow["jobs"]["freeze-campaign"]["steps"]
+    checkout = next(step for step in steps if step["name"] == "Check out exact freeze candidate")
+    assert checkout["with"]["fetch-depth"] == 0
+
+    record = next(step for step in steps if step["name"] == "Record exact commit")
+    script = record["run"]
+    for evidence_root in (
+        "artifacts/gate_b1",
+        "artifacts/gate_b1_storage",
+        "artifacts/gate_b1_extra",
+    ):
+        assert evidence_root in script
+
+
 def test_state_writer_uses_platform_independent_lf(tmp_path, monkeypatch):
     monkeypatch.setattr(provenance, "tree_state", lambda root: {"root": str(root)})
     monkeypatch.setattr(provenance, "derived_gate_status", lambda root: {"gate": str(root)})
